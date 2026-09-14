@@ -1,0 +1,67 @@
+# ===========================================================================
+# BitArchive
+#
+# Desktop-first emulation frontend built on Rust + Slint + SQLite,
+# organized as a Cargo workspace.
+#
+# Deliberately NOT ignored:
+#   Cargo.lock  -  BitArchive builds a binary/desktop target, so the lockfile
+#                  is committed to keep builds reproducible.
+# ===========================================================================
+
+# --- Rust / Cargo build output ---------------------------------------------
+target/
+*.rs.bk
+*.pdb
+*.profraw
+
+# --- Slint -----------------------------------------------------------------
+# Slint compiles .slint sources into Rust inside Cargo's OUT_DIR (which lives
+# under target/), so no generated sources appear in the working tree.
+
+# --- Local runtime state / SQLite ------------------------------------------
+# The SQLite database is local user state, not source. Test fixtures should be
+# placed under tests/ and force-added if they genuinely need to be tracked.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# --- Environment and secrets -----------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# --- Logs and local scratch ------------------------------------------------
+*.log
+logs/
+tmp/
+scratch/
+*.local
+
+# --- Test / coverage output ------------------------------------------------
+coverage/
+
+# --- macOS -----------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# --- IDE / editor ----------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
