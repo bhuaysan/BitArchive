@@ -1,0 +1,85 @@
+name: Implementation
+description: Feature, refactor, maintenance, test, documentation, or other technical work.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for planned development work: features, refactoring, maintenance,
+        tests, documentation, and technical tasks.
+
+        Keep the Issue small enough to be implemented and reviewed on its own branch.
+        Acceptance criteria are the primary reference during implementation and review
+        (`docs/DEVELOPMENT.md` §5, §6).
+
+        Start the title with the intended Conventional Commit type, for example
+        `feat: add ROM library scanner` or `docs: document save state layout`.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why is this work needed? Describe the current situation and the problem or gap.
+      placeholder: Today the library scanner ... because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true after this Issue is completed?
+      placeholder: After this Issue, ... is possible / ... behaves like ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: Concrete required behavior or implementation constraints.
+      placeholder: |
+        - ...
+        - ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Observable completion criteria. These are verified during review.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: Things deliberately not part of this Issue. This keeps the Pull Request focused.
+      placeholder: |
+        - ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: technical_notes
+    attributes:
+      label: Technical Notes
+      description: Optional implementation context, affected components, constraints, or relevant decisions.
+      placeholder: Relevant modules, architectural boundaries, prior art, or trade-offs to consider.
+    validations:
+      required: false
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Optional references to related Issues or prerequisites.
+      placeholder: |
+        - Depends on #12
+        - Blocks #34
+    validations:
+      required: false

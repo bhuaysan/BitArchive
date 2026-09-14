@@ -1,0 +1,83 @@
+name: Bug Report
+description: Report behavior that does not match the expected behavior.
+title: "[Bug] "
+labels:
+  - "type: bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for reproducible defects. Clear acceptance criteria make it possible to
+        verify the fix during review (`docs/DEVELOPMENT.md` §5, §34).
+
+        Please do not attach or paste ROMs, ISOs, BIOS/firmware files, save files, API keys,
+        credentials, or other private content. Configuration excerpts and log output are enough.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Concise explanation of the bug.
+      placeholder: What is broken, and where?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Steps to reproduce. Precise steps make the defect verifiable.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual Behavior
+      description: What happens instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Relevant platform/runtime information when known. Fill in only what applies.
+      placeholder: |
+        BitArchive version/commit:
+        Operating system:
+        RetroArch version:
+        System / core involved:
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Logs, screenshots, or other useful information. Redact secrets and private paths.
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: What must be true for this bug to be considered fixed?
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
