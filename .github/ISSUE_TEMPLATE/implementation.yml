@@ -1,8 +1,5 @@
 name: Implementation
 description: Feature, refactor, maintenance, test, documentation, or other technical work.
-title: "[Implementation] "
-labels:
-  - "type: feature"
 body:
   - type: markdown
     attributes:
