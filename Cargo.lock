@@ -578,6 +578,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitarchive-emulation"
+version = "0.1.0"
+dependencies = [
+ "bitarchive-application",
+]
+
+[[package]]
 name = "bitarchive-ui"
 version = "0.1.0"
 dependencies = [

@@ -18,13 +18,15 @@
 //!   [`LaunchAction`]
 //! - [`LaunchReadiness`] and [`ReadinessIssue`] — the structured result of a
 //!   readiness check
+//! - [`PreparedLaunch`] — the backend-neutral description of a fully resolved
+//!   process launch
 //! - [`resolve_core`] — re-exported domain policy for deterministic core
 //!   selection
 //!
 //! Release resolution, content resolution, firmware readiness, configuration
-//! resolution, core options, prepared launches, process spawning, and session
-//! management are not implemented yet (ARCHITECTURE.md §20, §21, §22). This
-//! crate introduces no ports for them in advance.
+//! resolution, core options, process spawning, and session management are not
+//! implemented yet (ARCHITECTURE.md §20, §21, §22). This crate introduces no
+//! ports for them in advance.
 //!
 //! # Boundary
 //!
@@ -36,13 +38,24 @@
 //! - Tokio
 //! - HTTP clients such as reqwest
 //! - OS APIs
-//! - filesystem APIs
+//! - filesystem access
+//! - process creation, including [`std::process::Command`]
 //! - RetroArch process, executable, argument, or core path details
 //!
-//! There are consequently no ROM paths, core library paths, RetroArch
-//! executable paths, launch arguments, or `PathBuf` fields in any type here.
-//! A launch request names the game it wants to launch and the action to
-//! perform — nothing that only a later resolution step can know.
+//! Paths are a deliberate exception, and only at one end of the launch path. A
+//! [`LaunchRequest`] carries no release, content, core, runtime, configuration,
+//! or path at all: it names the game to launch and the action to perform,
+//! nothing that only a later resolution step can know. A [`PreparedLaunch`] is
+//! the opposite end of the same path — the later, concretely resolved process
+//! contract — so it carries an executable, separate arguments, environment
+//! overrides, and an optional working directory. Using [`PathBuf`] and
+//! [`OsString`] there is exactly what keeps a launch free of shell quoting, and
+//! it does not turn this crate into an adapter: no type here reads, writes, or
+//! starts anything.
+//!
+//! [`PathBuf`]: std::path::PathBuf
+//! [`OsString`]: std::ffi::OsString
+//! [`std::process::Command`]: std::process::Command
 //!
 //! # Readiness
 //!
@@ -64,8 +77,10 @@
 
 mod launch;
 mod launch_readiness;
+mod prepared_launch;
 
 pub use launch::{LaunchAction, LaunchRequest};
 pub use launch_readiness::{LaunchReadiness, ReadinessIssue};
+pub use prepared_launch::PreparedLaunch;
 
 pub use bitarchive_domain::core::{CoreSelectionSource, ResolvedCore, resolve_core};
