@@ -1,0 +1,80 @@
+// BitArchive theme resolution.
+//
+// `tokens.slint` owns the values. This file owns the question "which values are
+// active right now", and nothing else:
+//
+//     preference (System | Light | Dark)   product choice
+//              ↓
+//     effective scheme (Light | Dark)      resolved appearance
+//              ↓
+//     semantic roles                       what presentation consumes
+//
+// Presentation code reads `Theme.colors.*` and `Theme.motion-*`. It never reads
+// Slint's widget palette directly and never decides on its own which scheme is
+// active (ARCHITECTURE.md §40.1).
+
+import { Palette } from "std-widgets.slint";
+import { DarkColors, LightColors, Motion, SemanticColors } from "tokens.slint";
+
+export global Theme {
+    // --- Appearance preference (Settings → Appearance) ----------------------
+    //
+    // `ColorScheme.unknown` is Slint's own spelling for "let the system-wide
+    // color scheme decide", which is exactly the product preference `System`.
+    // BitArchive keeps that product vocabulary and does not invent an `auto`
+    // alias for it. Default is `System`.
+    //
+    // Persisting this value belongs to the Settings/domain layer, which does not
+    // exist yet, so it is intentionally not persisted here.
+    in-out property <ColorScheme> preference: ColorScheme.unknown;
+
+    // --- System appearance ---------------------------------------------------
+    //
+    // The scheme Slint reports for the operating system. The binding to
+    // `Palette.color-scheme` is the whole platform integration: the widget style
+    // keeps that property in sync with the OS appearance and re-evaluates it
+    // when the OS reports a change. BitArchive therefore needs no macOS or other
+    // platform-specific appearance detection of its own.
+    //
+    // `Palette.color-scheme` is deliberately never assigned by BitArchive:
+    // writing to it would replace that binding, and `Palette` is the only
+    // scheme signal Slint 1.17 exposes to application code. Keeping it untouched
+    // is what keeps `System` live. A future platform appearance boundary may
+    // still push a value in here; in-out is what makes that possible.
+    //
+    // `ColorScheme.unknown` means no appearance is known: a headless session, a
+    // platform that does not report one, or the moment before the first
+    // appearance event arrives (observed on macOS right after window creation).
+    // The documented fallback is Light; as soon as Slint reports an appearance,
+    // this binding re-evaluates and the window follows it.
+    in-out property <ColorScheme> system-scheme: Palette.color-scheme;
+
+    // --- Resolution ----------------------------------------------------------
+    //
+    // An explicit preference wins; `System` follows the reported scheme.
+    private property <ColorScheme> requested-scheme: preference == ColorScheme.unknown ? system-scheme : preference;
+
+    // The effective appearance is never `unknown`: when neither the preference
+    // nor the platform names one, BitArchive resolves Light. Components
+    // therefore only ever see a decision, never an open question.
+    out property <ColorScheme> effective-scheme: requested-scheme == ColorScheme.dark ? ColorScheme.dark : ColorScheme.light;
+    out property <bool> dark: effective-scheme == ColorScheme.dark;
+
+    // The semantic color roles for the effective scheme. Light and Dark provide
+    // the same role names, so only the selection happens here.
+    out property <SemanticColors> colors: dark ? DarkColors.semantic : LightColors.semantic;
+
+    // --- Reduced Motion ------------------------------------------------------
+    //
+    // Readiness only: the OS preference is not detected yet because no platform
+    // boundary exists for it (ARCHITECTURE.md §40.3). Until one does, this stays
+    // false and animation is enabled.
+    //
+    // Components never use `Motion.*` directly for user-visible transitions;
+    // they ask for a semantic duration here, so honoring Reduced Motion later is
+    // a change in this one place.
+    in-out property <bool> reduced-motion: false;
+    out property <duration> motion-fast: reduced-motion ? Motion.instant : Motion.fast;
+    out property <duration> motion-normal: reduced-motion ? Motion.instant : Motion.normal;
+    out property <duration> motion-slow: reduced-motion ? Motion.instant : Motion.slow;
+}
