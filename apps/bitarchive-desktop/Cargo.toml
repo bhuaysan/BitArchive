@@ -1,0 +1,9 @@
+[package]
+name = "bitarchive-desktop"
+description = "BitArchive desktop application: composition root and executable entry point"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bitarchive-ui = { path = "../../crates/bitarchive-ui" }

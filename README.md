@@ -1,7 +1,7 @@
 # BitArchive
 
-> **Status:** Planning / Pre-Implementation  
-> Die Implementierung hat noch nicht begonnen. Inhalte und Schnittstellen können sich während der Planungsphase noch ändern.
+> **Status:** Early Implementation  
+> Die Implementierung hat begonnen. Aktuell existiert ein minimales Rust-/Slint-Fundament ohne Produktfunktionen. Produkt-, Architektur- und Schnittstellenentscheidungen können sich weiter ändern.
 
 BitArchive ist ein geplantes lokales Emulation-Frontend und eine Verwaltungsbibliothek, die RetroArch als verwaltetes Emulations-Backend verwendet. Ziel ist eine moderne, nachvollziehbar konfigurierte Oberfläche für Spielebibliothek, Metadaten, Medien, Core-Zuordnung, Save States und den Start bzw. Wiedereinstieg in Spiele.
 
@@ -79,18 +79,32 @@ BitArchive indexiert und verwaltet darüber Metadaten, Kompatibilität, Timeline
 
 ## Projektstatus
 
-Das Projekt befindet sich aktuell vollständig in der **Planungsphase**.
+Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind dokumentiert. Die Implementierung hat begonnen.
 
-Es existiert noch keine produktive Implementierung. Vor Beginn der Entwicklung werden Produktanforderungen, Architektur, Entwicklungsprozess und Agentenregeln dokumentiert.
+Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-## Projektdokumentation
+- ein Cargo-Workspace mit den Crates `bitarchive-desktop` (Composition Root und Einstiegspunkt) und `bitarchive-ui` (Slint-Presentation-Layer),
+- ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
+- ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
+
+Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, RetroArch-Integration, Firmware- und Core-Verwaltung, Session-Management, Controller-Input, Localization, Packaging und CI.
+
+Weiteres wird als GitHub Issue geplant und umgesetzt.
+
+## Projektstruktur
 
 ```text
 .
+├── Cargo.toml
+├── rust-toolchain.toml
 ├── README.md
 ├── AGENTS.md
 ├── PRODUCT.md
 ├── ARCHITECTURE.md
+├── apps/
+│   └── bitarchive-desktop/
+├── crates/
+│   └── bitarchive-ui/
 └── docs/
     ├── DEVELOPMENT.md
     ├── UI_UX_CONCEPT.md
@@ -143,22 +157,42 @@ Die vollständigen Entwicklungsregeln stehen in [`docs/DEVELOPMENT.md`](./docs/D
 
 ## Repository
 
-Das GitHub-Repository wird im Rahmen der Projektvorbereitung erstellt.
+Das Projekt liegt unter <https://github.com/bhuaysan/BitArchive>.
 
-Bis dahin sind Repository-URL, Build-Anweisungen und Installationsschritte noch nicht verfügbar.
+Ein installierbares Paket existiert noch nicht. Das Fundament kann bisher nur aus dem Quellcode gebaut und gestartet werden.
 
 ## Voraussetzungen
 
-Da die Implementierung noch nicht begonnen hat, existieren noch keine vollständigen Build- oder Installationsanweisungen.
-
-Die technische Architektur ist jedoch festgelegt auf Rust + Slint + SQLite. Für den Entwicklungsworkflow werden mindestens benötigt:
+Für den Entwicklungsworkflow werden benötigt:
 
 - Git
-- GitHub-Zugang
-- GitHub CLI (`gh`)
-- Rust-Toolchain / Cargo, sobald die Implementierung startet
+- GitHub-Zugang und GitHub CLI (`gh`) für Issues und Pull Requests
+- Rust über [rustup](https://rustup.rs/). Die Toolchain wird über `rust-toolchain.toml` auf den stabilen Release-Kanal festgelegt; `rustfmt` und `clippy` sind Bestandteil der Validierung.
 
-Konkrete Plattform-, Packaging- und Build-Voraussetzungen werden mit dem initialen Repository-Setup ergänzt.
+Plattform-, Packaging- und Signing-Voraussetzungen für eine verteilbare macOS-App werden ergänzt, sobald Packaging Teil der Implementierung ist.
+
+## Build und Start
+
+Alle Befehle werden aus dem Repository-Stamm ausgeführt.
+
+Desktop-Anwendung starten:
+
+```bash
+cargo run -p bitarchive-desktop
+```
+
+Es öffnet sich ein minimales Platzhalter-Fenster. Das Schließen des Fensters beendet den Prozess.
+
+Validierung:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+```
+
+`Cargo.lock` wird bewusst versioniert, da BitArchive eine Anwendung ist.
 
 ## Beiträge
 

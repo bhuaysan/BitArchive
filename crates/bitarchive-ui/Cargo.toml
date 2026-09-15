@@ -1,0 +1,12 @@
+[package]
+name = "bitarchive-ui"
+description = "BitArchive presentation layer (Slint)"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+slint = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }
