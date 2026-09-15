@@ -83,7 +83,7 @@ Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind do
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-- ein Cargo-Workspace mit den Crates `bitarchive-desktop` (Composition Root und Einstiegspunkt) und `bitarchive-ui` (Slint-Presentation-Layer),
+- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten und Launch-Pfad-Modell), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
 
@@ -104,6 +104,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 ├── apps/
 │   └── bitarchive-desktop/
 ├── crates/
+│   ├── bitarchive-domain/
 │   └── bitarchive-ui/
 └── docs/
     ├── DEVELOPMENT.md
