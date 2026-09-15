@@ -4,9 +4,12 @@
 //! be passed where a [`ReleaseId`] is expected, even though all of them wrap the
 //! same UUID representation (ARCHITECTURE.md §7).
 //!
-//! Identities are UUIDv7. The underlying UUID is only reachable through the
-//! explicit [`from_uuid`](GameId::from_uuid) / [`as_uuid`](GameId::as_uuid)
-//! pair; there is no `Deref` and no implicit conversion.
+//! Identities are UUIDv7. [`new`](GameId::new) is the only way to create one,
+//! so an identity can never wrap an arbitrary UUID; the underlying UUID is
+//! readable through the explicit [`as_uuid`](GameId::as_uuid) accessor. There is
+//! no `Deref`, no implicit conversion, and no infallible `Uuid` conversion —
+//! reconstructing persisted identities belongs to the Issue that introduces
+//! persistence and must validate the UUIDv7 invariant there.
 //!
 //! Paths, hashes, file names, names, and slugs are never domain identities
 //! (ARCHITECTURE.md §2.3, §11).
@@ -27,22 +30,18 @@ macro_rules! strong_id {
 
         impl $name {
             /// Creates a new identity from a freshly generated UUIDv7.
+            ///
+            /// This is the only constructor: a domain identity always wraps a
+            /// UUIDv7 and can never be built from an arbitrary UUID.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
             }
 
-            /// Wraps an existing UUID.
-            ///
-            /// The explicit counterpart of [`Self::as_uuid`], so an identity can
-            /// be reconstructed from its own representation without the UUID
-            /// ever crossing the type boundary implicitly.
-            #[must_use]
-            pub const fn from_uuid(uuid: Uuid) -> Self {
-                Self(uuid)
-            }
-
             /// Returns the underlying UUID.
+            ///
+            /// Read-only on purpose. Turning a UUID back into an identity is not
+            /// part of the domain contract yet.
             #[must_use]
             pub const fn as_uuid(self) -> Uuid {
                 self.0
@@ -143,8 +142,8 @@ mod tests {
         assert_ne!(CoreId::new(), CoreId::new());
     }
 
-    /// Identities behave as values: equal UUIDs are equal identities and can be
-    /// used as keys in hashed collections.
+    /// Identities behave as values: copies are one key, and separately created
+    /// identities are distinct keys in hashed collections.
     #[test]
     fn identities_are_hashable_values() {
         let game = GameId::new();
@@ -152,27 +151,32 @@ mod tests {
 
         assert!(games.insert(game), "the first identity must be new");
         assert!(
-            !games.insert(GameId::from_uuid(game.as_uuid())),
-            "the same UUID must be the same identity"
+            !games.insert(game),
+            "a copy of an identity must be the same identity"
         );
         assert!(
             games.insert(GameId::new()),
-            "a different UUID must be a different identity"
+            "a separately created identity must be distinct"
         );
         assert_eq!(games.len(), 2);
     }
 
-    /// The underlying UUID is reachable in both directions explicitly, and the
-    /// textual form is that same UUID rather than a private re-encoding.
+    /// The underlying UUID is readable, and the textual forms show that same
+    /// UUID instead of a private re-encoding.
     #[test]
-    fn the_underlying_uuid_is_only_reachable_explicitly() {
+    fn the_underlying_uuid_is_readable() {
         let release = ReleaseId::new();
 
-        assert_eq!(ReleaseId::from_uuid(release.as_uuid()), release);
-
-        let parsed = Uuid::parse_str(&release.to_string()).expect("Display must render a UUID");
-        assert_eq!(ReleaseId::from_uuid(parsed), release);
-
+        assert_eq!(
+            release.as_uuid().get_version(),
+            Some(uuid::Version::SortRand),
+            "the readable UUID must be the UUIDv7 the identity was created with"
+        );
+        assert_eq!(
+            release.to_string(),
+            release.as_uuid().to_string(),
+            "Display must render the underlying UUID"
+        );
         assert_eq!(
             format!("{release:?}"),
             format!("ReleaseId({})", release.as_uuid()),
