@@ -3,36 +3,49 @@
 // This is a temporary bootstrap placeholder. It only signals that the
 // application foundation runs; it is NOT the Home screen.
 //
-// It deliberately contains no navigation, no product screens, no design
-// tokens, and no final layout (see docs/UI_UX_CONCEPT.md and ARCHITECTURE.md §40).
-// Window size and colors are temporary values for development and are not a
-// product minimum-size or theme decision.
+// It deliberately contains no navigation, no product screens, and no final
+// layout. All visual values come from the design tokens under `theme/`: a
+// literal color, font size, or spacing value here would defeat the token layer
+// (ARCHITECTURE.md §40.1).
+//
+// The window width and height are temporary development values, not a product
+// minimum-size or density decision (P7 in docs/UI_UX_CONCEPT.md remains OPEN).
 //
 // The placeholder labels are literal because localization is not implemented
 // yet; user-facing product text belongs behind stable message IDs once the
 // I18n layer exists (ARCHITECTURE.md §39).
 
+import { Spacing, Typography } from "theme/tokens.slint";
+import { Theme } from "theme/theme.slint";
+
+// The theme is part of this document's public Slint API, so presentation code
+// can import it from `app.slint` and the crate's own verification (see
+// `src/lib.rs`) can drive it without adding any product-facing Rust API.
+export { Theme }
+
 export component AppWindow inherits Window {
     title: "BitArchive";
     width: 960px;
     height: 600px;
-    background: #14141a;
+    background: Theme.colors.canvas;
 
     VerticalLayout {
         alignment: center;
-        spacing: 12px;
+        spacing: Spacing.md;
 
         Text {
             text: "BitArchive";
-            font-size: 30px;
-            color: #f2f2f5;
+            font-size: Typography.display.size;
+            font-weight: Typography.display.weight;
+            color: Theme.colors.text-primary;
             horizontal-alignment: center;
         }
 
         Text {
             text: "Frontend Foundation";
-            font-size: 14px;
-            color: #9a9aa6;
+            font-size: Typography.body-small.size;
+            font-weight: Typography.body-small.weight;
+            color: Theme.colors.text-secondary;
             horizontal-alignment: center;
         }
     }

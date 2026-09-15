@@ -1,0 +1,238 @@
+// BitArchive design tokens.
+//
+// This file is the single place where BitArchive visual values live. It is the
+// value layer only: it knows nothing about which theme is active — that
+// resolution lives in `theme.slint`.
+//
+// The values below are an initial, deliberately small baseline and NOT final
+// visual design (ARCHITECTURE.md §40.1, PRODUCT.md §35). Refining one value here
+// changes the whole presentation layer at once. No component may hardcode a
+// color, font size, spacing value, radius, size, duration, or focus value.
+//
+// Naming rules:
+//   * colors are semantic roles (`canvas`, `text-secondary`, `focus-ring`),
+//     never literal palette names (`gray-700`, `blue-500`);
+//   * Light and Dark fill in exactly the same roles (`SemanticColors`), so the
+//     compiler rejects a scheme that forgets one;
+//   * the token set stays small and grows only when a component genuinely needs
+//     another reusable role.
+
+// ---------------------------------------------------------------------------
+// Semantic colors
+// ---------------------------------------------------------------------------
+
+// The complete semantic color contract. Both schemes must provide every role.
+export struct SemanticColors {
+    // Backgrounds, from the window canvas up to elevated surfaces.
+    canvas: brush,
+    surface: brush,
+    surface-raised: brush,
+    surface-hover: brush,
+    surface-selected: brush,
+
+    // Foreground text roles.
+    text-primary: brush,
+    text-secondary: brush,
+    text-disabled: brush,
+
+    // Lines, separators, and interactive outlines.
+    border: brush,
+    border-strong: brush,
+
+    // Interactive accent. `accent-foreground` is the readable foreground for an
+    // `accent` fill and belongs to the same role.
+    accent: brush,
+    accent-hover: brush,
+    accent-foreground: brush,
+
+    // Focus indication. Ring geometry lives in `Focus` below.
+    focus-ring: brush,
+
+    // Status roles. They carry no meaning on their own: components must pair
+    // them with text or an icon and never communicate state by color alone
+    // (PRODUCT.md §37).
+    status-success: brush,
+    status-warning: brush,
+    status-error: brush,
+    status-info: brush,
+}
+
+// Initial Light baseline. Contrast of the text roles against the surfaces they
+// are meant for is deliberately above the WCAG AA minimum; values are baseline
+// choices, not a final brand palette.
+export global LightColors {
+    out property <SemanticColors> semantic: {
+        canvas: #F1F2F5,
+        surface: #FAFAFB,
+        surface-raised: #FFFFFF,
+        surface-hover: #E9EBEF,
+        surface-selected: #DCE6F7,
+
+        text-primary: #1A1C21,
+        text-secondary: #52585F,
+        text-disabled: #8B9099,
+
+        border: #DCE0E5,
+        border-strong: #7A828C,
+
+        accent: #2563EB,
+        accent-hover: #1D4FD8,
+        accent-foreground: #FFFFFF,
+
+        focus-ring: #0B57D0,
+
+        status-success: #1B7A4B,
+        status-warning: #8A5A00,
+        status-error: #C02B24,
+        status-info: #1B62C4,
+    };
+}
+
+// Initial Dark baseline. The same roles, with values chosen for a dark canvas
+// instead of inverted Light values.
+export global DarkColors {
+    out property <SemanticColors> semantic: {
+        canvas: #121317,
+        surface: #1A1C21,
+        surface-raised: #23262C,
+        surface-hover: #2A2E35,
+        surface-selected: #2B3550,
+
+        text-primary: #F2F3F5,
+        text-secondary: #B6BCC6,
+        text-disabled: #71777F,
+
+        border: #2E323A,
+        border-strong: #878E99,
+
+        accent: #7EAAF7,
+        accent-hover: #9CC0FF,
+        accent-foreground: #10131A,
+
+        focus-ring: #9CC2FF,
+
+        status-success: #63D39B,
+        status-warning: #E8B45C,
+        status-error: #FF8F86,
+        status-info: #8CBAFF,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Typography
+// ---------------------------------------------------------------------------
+
+// A typography role. Size and weight belong together, so they travel as one
+// value instead of two unrelated tokens.
+//
+// `size` is a `relative-font-size` on purpose. Slint cannot resolve `rem` into a
+// plain length inside a global (the window's default font size is unknown
+// there), but keeping the roles relative means they resolve against
+// `Window.default-font-size` where they are used. A later UI-scale /
+// larger-text feature can therefore scale the whole type system from one place
+// instead of editing every role (PRODUCT.md §37).
+export struct TypeStyle {
+    size: relative-font-size,
+    weight: int,
+}
+
+export global Typography {
+    out property <TypeStyle> display: {
+        size: 2rem,
+        weight: FontWeight.semi-bold,
+    };
+    out property <TypeStyle> title: {
+        size: 1.5rem,
+        weight: FontWeight.semi-bold,
+    };
+    out property <TypeStyle> heading: {
+        size: 1.125rem,
+        weight: FontWeight.semi-bold,
+    };
+    out property <TypeStyle> body: {
+        size: 1rem,
+        weight: FontWeight.normal,
+    };
+    out property <TypeStyle> body-small: {
+        size: 0.875rem,
+        weight: FontWeight.normal,
+    };
+    out property <TypeStyle> label: {
+        size: 0.875rem,
+        weight: FontWeight.medium,
+    };
+    out property <TypeStyle> caption: {
+        size: 0.75rem,
+        weight: FontWeight.normal,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Spacing
+// ---------------------------------------------------------------------------
+
+export global Spacing {
+    out property <length> xs: 4px;
+    out property <length> sm: 8px;
+    out property <length> md: 12px;
+    out property <length> lg: 16px;
+    out property <length> xl: 24px;
+    out property <length> xxl: 32px;
+}
+
+// ---------------------------------------------------------------------------
+// Sizes
+// ---------------------------------------------------------------------------
+
+export global Sizes {
+    // Reusable control heights, not a window density decision.
+    out property <length> control-height-small: 28px;
+    out property <length> control-height-medium: 36px;
+    out property <length> control-height-large: 44px;
+
+    out property <length> icon-small: 16px;
+    out property <length> icon-medium: 20px;
+    out property <length> icon-large: 24px;
+
+    // Minimum interactive target for pointer, touch, keyboard, and controller
+    // use (PRODUCT.md §37).
+    out property <length> target-min: 44px;
+}
+
+// ---------------------------------------------------------------------------
+// Radius
+// ---------------------------------------------------------------------------
+
+export global Radius {
+    out property <length> small: 4px;
+    out property <length> medium: 8px;
+    out property <length> large: 16px;
+    out property <length> pill: 999px;
+}
+
+// ---------------------------------------------------------------------------
+// Motion
+// ---------------------------------------------------------------------------
+
+export global Motion {
+    // The raw duration scale. Components ask `Theme.motion-*` for a semantic
+    // duration instead of using these directly, because that is where Reduced
+    // Motion is honored (ARCHITECTURE.md §40.3).
+    out property <duration> instant: 0ms;
+    out property <duration> fast: 100ms;
+    out property <duration> normal: 200ms;
+    out property <duration> slow: 320ms;
+}
+
+// ---------------------------------------------------------------------------
+// Focus
+// ---------------------------------------------------------------------------
+
+export global Focus {
+    // Focus geometry. Keyboard and controller focus share this one semantic
+    // model (ARCHITECTURE.md §40.2); the ring color is
+    // `SemanticColors.focus-ring`. This file defines the tokens only — focus
+    // navigation itself is a later Issue.
+    out property <length> ring-width: 2px;
+    out property <length> ring-offset: 2px;
+}
