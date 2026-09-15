@@ -1,8 +1,8 @@
 # BitArchive Cargo workspace.
 #
 # The workspace intentionally contains only the crates that currently exist.
-# Infrastructure, emulation, and platform crates are added as soon as
-# implementation work requires them (ARCHITECTURE.md §5).
+# Infrastructure and platform crates are added as soon as implementation work
+# requires them (ARCHITECTURE.md §5).
 #
 # Cargo.lock is committed on purpose: BitArchive ships an application, so the
 # dependency graph is part of the repository state.
@@ -13,6 +13,7 @@ members = [
     "apps/bitarchive-desktop",
     "crates/bitarchive-application",
     "crates/bitarchive-domain",
+    "crates/bitarchive-emulation",
     "crates/bitarchive-ui",
 ]
 

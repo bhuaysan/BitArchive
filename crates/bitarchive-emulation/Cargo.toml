@@ -1,0 +1,9 @@
+[package]
+name = "bitarchive-emulation"
+description = "BitArchive emulation layer: RetroArch launch preparation"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bitarchive-application = { path = "../bitarchive-application" }
