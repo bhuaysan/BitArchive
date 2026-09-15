@@ -1,0 +1,9 @@
+[package]
+name = "bitarchive-domain"
+description = "BitArchive domain layer: launch-path identities and Game/Release/Content model"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+uuid = { workspace = true }

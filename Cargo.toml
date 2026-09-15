@@ -11,6 +11,7 @@
 resolver = "3"
 members = [
     "apps/bitarchive-desktop",
+    "crates/bitarchive-domain",
     "crates/bitarchive-ui",
 ]
 
@@ -21,3 +22,6 @@ edition = "2024"
 [workspace.dependencies]
 slint = "1.17.1"
 slint-build = "1.17.1"
+# Domain identities are UUIDv7 (ARCHITECTURE.md §7). Only the domain crate needs
+# it, and only the `v7` feature is required to generate them.
+uuid = { version = "1.26.1", features = ["v7"] }
