@@ -1,0 +1,68 @@
+# BitArchive continuous integration.
+#
+# Scope: Rust quality gate only (Issue #5). Packaging, signing, notarization,
+# and release stages described in ARCHITECTURE.md §46 are deliberately not part
+# of this workflow yet.
+#
+# The toolchain is not configured here on purpose: rust-toolchain.toml pins the
+# stable channel with the rustfmt and clippy components, and the GitHub-hosted
+# macOS runner ships rustup with exactly those, so the repository file is the
+# single source of truth for the toolchain.
+
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Least privilege: the quality gate only reads the repository.
+permissions:
+  contents: read
+
+# Superseded runs for the same pull request (or the same ref on push) are
+# cancelled so only the newest commit is validated.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-quality:
+    name: Rust quality
+    # BitArchive is macOS-first for the MVP; this matches the primary
+    # development platform. No Linux/Windows matrix yet.
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # The quality gate never pushes; do not leave the token in the
+          # local git configuration.
+          persist-credentials: false
+
+      - name: Verify Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+          # No-op when the image already provides them, but keeps the
+          # rust-toolchain.toml component requirements explicit.
+          rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
