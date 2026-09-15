@@ -4,6 +4,9 @@
 //! launch path: [`Game`], [`Release`], and [`Content`], plus the [`SystemId`]
 //! and [`CoreId`] identities that later resolvers need.
 //!
+//! It also owns the first fully deterministic launch rule, the core selection
+//! policy in [`core`] (ARCHITECTURE.md §20.4).
+//!
 //! It is deliberately small. It carries no titles, descriptions, regions,
 //! languages, release types, hashes, paths, scanner or scraping state, save
 //! states, or configuration. Those are added by the Issues that actually need
@@ -39,11 +42,13 @@
 //! (ARCHITECTURE.md §53.1).
 
 mod content;
+pub mod core;
 mod game;
 mod id;
 mod release;
 
 pub use content::Content;
+pub use core::{CoreSelectionSource, ResolvedCore, resolve_core};
 pub use game::Game;
 pub use id::{ContentId, CoreId, GameId, ReleaseId, SystemId};
 pub use release::Release;

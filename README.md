@@ -83,9 +83,11 @@ Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind do
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten und Launch-Pfad-Modell), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
+- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell und Core-Resolution-Policy), `bitarchive-application` (Launch-Verträge und Orchestrierungsschicht), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
+
+Im Launch-Pfad existieren bisher nur die ersten fachlichen Verträge: ein Launch-Wunsch (`GameId` + `Play`/`Continue`), strukturierte Launch-Readiness-Kategorien und die deterministische Core-Resolution-Policy (`Release > Game > System`, ohne globalen Core-Default).
 
 Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, RetroArch-Integration, Firmware- und Core-Verwaltung, Session-Management, Controller-Input, Localization und Packaging.
 
@@ -104,6 +106,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 ├── apps/
 │   └── bitarchive-desktop/
 ├── crates/
+│   ├── bitarchive-application/
 │   ├── bitarchive-domain/
 │   └── bitarchive-ui/
 └── docs/
