@@ -87,7 +87,7 @@ Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
 
-Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, RetroArch-Integration, Firmware- und Core-Verwaltung, Session-Management, Controller-Input, Localization, Packaging und CI.
+Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, RetroArch-Integration, Firmware- und Core-Verwaltung, Session-Management, Controller-Input, Localization und Packaging.
 
 Weiteres wird als GitHub Issue geplant und umgesetzt.
 
