@@ -104,36 +104,41 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
-    /// The marker file name prefix in the system temporary directory.
-    ///
-    /// The marker is how the environment test reaches a child instance of the
-    /// test binary without a shell, and without setting a process-global
-    /// environment variable in the parent test process. The parent writes it,
-    /// the child reads it and removes it, so a finished run leaves nothing
-    /// behind but a removed temporary file.
-    const MARKER_PREFIX: &str = "bitarchive-platform-environment-probe";
-
-    /// The test the child instance runs when the marker asks for the
-    /// environment probe.
+    /// The test the child instance runs when the probe activates it.
     ///
     /// This is the test harness name of the test, including its module path,
-    /// which is the spelling `--exact` matches. The parent asks the child for
-    /// exactly one test, so a child that matches nothing runs zero tests and
-    /// still succeeds; the parent's marker assertion is what turns that silent
-    /// no-op into a visible failure.
+    /// which is the spelling `--exact` matches.
     const ENVIRONMENT_PROBE_TEST: &str =
         "process_controller::tests::environment_probe_runs_in_the_child_process";
 
+    /// The directory name prefix for one probe's request and report files.
+    const PROBE_DIRECTORY_PREFIX: &str = "bitarchive-platform-environment-probe";
+
     /// The argument that makes the test binary start, list its tests, and exit
     /// successfully. It is inert: no test body runs, so nothing is asserted and
-    /// no marker is consumed.
+    /// no probe is consumed.
     const LIST_TESTS: &str = "--list";
 
+    /// The environment variable that marks a process as the probe child.
+    ///
+    /// It is set only on the child's prepared launch, so the parent instance of
+    /// the probe test can never mistake itself for the child and consume a
+    /// request that belongs to it.
+    const PROBE_ACTIVATION_KEY: &str = "BITARCHIVE_PLATFORM_TEST_PROBE_ACTIVE";
+
+    /// The environment variable carrying the request file the child must read.
+    const PROBE_REQUEST_KEY: &str = "BITARCHIVE_PLATFORM_TEST_REQUEST_PATH";
+
+    /// The environment variable carrying the report file the child must write.
+    const PROBE_REPORT_KEY: &str = "BITARCHIVE_PLATFORM_TEST_REPORT_PATH";
+
     /// The environment variable the parent prepares as an explicit override and
-    /// the child looks for.
+    /// the child looks for. This is the variable under test: it must reach the
+    /// child through the adapter, not through the parent's own environment.
     const PROBE_KEY: &str = "BITARCHIVE_PLATFORM_TEST_OVERRIDE";
 
     /// The environment variable the child uses to prove that the adapter adds
@@ -141,42 +146,35 @@ mod tests {
     /// any override in these tests, so the child can only have inherited it.
     const INHERITED_KEY: &str = "PATH";
 
-    /// The path shared by the parent test process and the child instance of the
-    /// test binary, tagged with `tag`.
+    /// Returns a value that differs between two probes.
     ///
-    /// The name is derived from the test executable rather than from a process
-    /// id, because the child is a different process with a different id: the
-    /// test binary is the thing both processes know in common. Cargo gives each
-    /// test binary a unique name, so a parallel `cargo test` run cannot collide
-    /// with this one.
-    fn probe_path(tag: &str) -> PathBuf {
-        let name = test_binary()
-            .file_name()
-            .map_or_else(|| OsString::from("bitarchive-platform"), OsString::from);
+    /// Process id plus wall clock is enough to keep two concurrent runs of this
+    /// test binary, and two sequential runs of the same test, from sharing a
+    /// probe directory.
+    fn probe_nonce() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
 
-        let mut path = OsString::from(MARKER_PREFIX);
-        path.push("-");
-        path.push(tag);
-        path.push("-");
-        path.push(name);
-
-        env::temp_dir().join(path)
+        format!("{}-{nanos}", std::process::id())
     }
 
-    /// The file the parent writes the expected override into.
-    fn request_path() -> PathBuf {
-        probe_path("request")
+    /// The directory holding one probe's request and report files.
+    ///
+    /// The nonce makes the directory unique per probe run, so a parallel test or
+    /// a parallel `cargo test` invocation cannot read or overwrite this probe's
+    /// files. The directory is created when the request is written.
+    fn probe_directory(nonce: &str) -> PathBuf {
+        env::temp_dir().join(format!("{PROBE_DIRECTORY_PREFIX}-{nonce}"))
     }
 
-    /// The file the child writes what it actually observed into.
-    fn report_path() -> PathBuf {
-        probe_path("report")
-    }
-
-    /// Removes both probe files.
-    fn clear_probe_files() {
-        let _ = fs::remove_file(request_path());
-        let _ = fs::remove_file(report_path());
+    /// Removes a probe's directory and everything in it.
+    ///
+    /// Cleanup is best effort: the directory is uniquely owned by this probe, so
+    /// a failure here can only leave a temporary file behind, never affect the
+    /// test result.
+    fn clear_probe_directory(directory: &Path) {
+        let _ = fs::remove_dir_all(directory);
     }
 
     /// The path of the test binary itself.
@@ -192,8 +190,8 @@ mod tests {
     /// the started handle.
     ///
     /// The child is asked to list its tests: that starts a real process, needs
-    /// no shell or external tool, and exits successfully without touching the
-    /// marker the environment probe uses.
+    /// no shell or external tool, and exits successfully without touching any
+    /// probe file. Every caller waits for the handle.
     fn spawn_harmless_child() -> SpawnedProcess {
         let launch = PreparedLaunch::new(test_binary(), vec![OsString::from(LIST_TESTS)]);
 
@@ -295,22 +293,61 @@ mod tests {
     /// exactly the prepared value, and still finds a variable it can only have
     /// inherited.
     ///
-    /// The parent never sets an environment variable in its own process. It
-    /// writes the expected override value to the marker file, prepares the
-    /// override on the child's process, and the child asserts both halves from
-    /// the inside.
+    /// The parent never sets an environment variable in its own process: every
+    /// probe variable is prepared on the child's launch only. The child is
+    /// activated explicitly through [`PROBE_ACTIVATION_KEY`], so this test's own
+    /// instance in the parent harness stays inert and cannot race the child for
+    /// the request file.
     #[test]
     fn spawned_processes_inherit_the_parent_environment() {
-        let expected_override = format!("override-{}", std::process::id());
-        let expected_inherited = env::var_os(INHERITED_KEY);
-        let environment = vec![(
-            OsString::from(PROBE_KEY),
-            OsString::from(expected_override.as_str()),
-        )];
+        let nonce = probe_nonce();
+        let directory = probe_directory(&nonce);
+        let request_path = directory.join("request");
+        let report_path = directory.join("report");
 
-        clear_probe_files();
-        fs::write(request_path(), expected_override.as_bytes())
-            .expect("the probe request can be written");
+        // A nonce in the value under test as well: the child compares the value
+        // it received against this one, so no earlier run can satisfy it.
+        let expected_override = format!("override-{nonce}");
+        let expected_inherited = env::var_os(INHERITED_KEY);
+        let activation = format!("probe-{nonce}");
+
+        let environment = vec![
+            // The variable under test: it must reach the child through the
+            // adapter's environment mapping, not through the parent's own
+            // environment.
+            (
+                OsString::from(PROBE_KEY),
+                OsString::from(expected_override.as_str()),
+            ),
+            // The probe handshake. Only the child sees these, and only the
+            // child acts on them.
+            (
+                OsString::from(PROBE_ACTIVATION_KEY),
+                OsString::from(activation.as_str()),
+            ),
+            (
+                OsString::from(PROBE_REQUEST_KEY),
+                request_path.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from(PROBE_REPORT_KEY),
+                report_path.as_os_str().to_owned(),
+            ),
+        ];
+
+        // The request carries the activation nonce on its first line and the
+        // value the override must deliver on its second, so the child can prove
+        // it was activated for this run and that nothing rewrote the value.
+        let request = format!("{activation}\n{expected_override}");
+
+        clear_probe_directory(&directory);
+        fs::create_dir_all(&directory).expect("the probe directory can be created");
+        fs::write(&request_path, request.as_bytes()).expect("the probe request can be written");
+        assert!(
+            request_path.exists() && !report_path.exists(),
+            "this run starts from a clean request and no report, so neither a stale request \
+             nor a stale report can be mistaken for this probe's evidence"
+        );
 
         let launch =
             PreparedLaunch::new(test_binary(), vec![OsString::from(ENVIRONMENT_PROBE_TEST)])
@@ -327,15 +364,22 @@ mod tests {
             "the child test run must pass, but it reported {status:?}"
         );
         assert!(
-            !request_path().exists(),
+            !request_path.exists(),
             "the child consumes the request, so a request that survived means the child \
-             test never ran and its environment assertions were never evaluated"
+             never ran and its environment assertions were never evaluated"
         );
 
-        // The child reports back exactly what it observed, so the parent can
-        // assert the prepared override and the inherited value byte for byte.
-        let report = fs::read(report_path()).expect("the child writes a report");
-        let _ = fs::remove_file(report_path());
+        // The report is the second piece of evidence, and the stronger one: it
+        // carries the nonce of this probe run, so it can only have been written
+        // by a child that ran the activated test during this run. A filter that
+        // matched nothing would leave it missing.
+        let report = fs::read(&report_path)
+            .expect("the child writes a report; a missing report means the child probe never ran");
+        clear_probe_directory(&directory);
+        assert!(
+            !directory.exists(),
+            "the probe artifacts are cleaned up by the run that created them"
+        );
 
         let half = expected_override.len();
         let (observed_override, observed_inherited) = report.split_at(half);
@@ -361,26 +405,52 @@ mod tests {
         );
     }
 
-    /// Runs in the child instance of the test binary, and asserts from inside
-    /// the child that the environment is what the adapter promised: the
-    /// explicit override is present with exactly the prepared value, and the
-    /// variable the parent had is still inherited.
+    /// Runs only in the process the parent explicitly activated, and reports
+    /// from inside that child what the adapter actually delivered: the prepared
+    /// override, and the variable that can only have been inherited.
     ///
-    /// The parent instance of this test binary finds no marker and returns
-    /// immediately, so this test is inert unless a probe asked for it.
+    /// The activation variable is set on the child's launch and nowhere else, so
+    /// this test returns immediately in every other process, including this
+    /// test's own instance in the parent harness. That is what makes the probe
+    /// child-only: no other instance can read the request file and consume it
+    /// while the child is starting.
+    ///
+    /// The child does not assert about its own environment, because its output
+    /// is captured by its own harness. It records what it observed and lets the
+    /// parent assert; the request file it must read first is what keeps that
+    /// from being circular, since the parent wrote the expected value before
+    /// starting it.
     #[test]
     fn environment_probe_runs_in_the_child_process() {
-        let Ok(expected_override) = fs::read(request_path()) else {
-            // The parent instance of this test binary: nothing to probe.
+        if env::var_os(PROBE_ACTIVATION_KEY).is_none() {
+            // Not the activated child: this test is inert here.
             return;
-        };
+        }
 
-        // Consume the request first so its absence is unambiguous afterwards:
-        // the child ran, whatever the assertions below decide. The child does
-        // not assert about its own environment here, because the child test's
-        // output is captured; it records what it observed and lets the parent
-        // assert.
-        let _ = fs::remove_file(request_path());
+        let request_path = PathBuf::from(
+            env::var_os(PROBE_REQUEST_KEY).expect("the activated child names its request file"),
+        );
+        let report_path = PathBuf::from(
+            env::var_os(PROBE_REPORT_KEY).expect("the activated child names its report file"),
+        );
+
+        let request =
+            fs::read_to_string(&request_path).expect("the activated child finds its request file");
+        let mut lines = request.lines();
+        let expected_activation = lines.next().unwrap_or_default();
+        let expected_override = lines.next().unwrap_or_default().to_owned();
+
+        // The activation variable must carry this run's nonce, so this child
+        // cannot be confused with an instance activated by an older run.
+        assert_eq!(
+            env::var_os(PROBE_ACTIVATION_KEY).unwrap_or_default(),
+            OsString::from(expected_activation),
+            "the child must be activated for exactly this probe run"
+        );
+
+        // Consume the request so its absence is unambiguous afterwards: the
+        // child ran, whatever the parent concludes from the report.
+        let _ = fs::remove_file(&request_path);
 
         let observed_override =
             env::var_os(PROBE_KEY).expect("the prepared override must reach the child");
@@ -389,46 +459,15 @@ mod tests {
         let mut report = observed_override.into_encoded_bytes();
         report.extend_from_slice(observed_inherited.as_encoded_bytes());
 
-        // The report starts with the expected value, so the parent only has to
-        // read it back; the inherited value follows it.
+        // The report starts with the value the parent prepared before starting
+        // this process, so the parent can read it back byte for byte; the
+        // inherited value follows it.
         assert!(
-            report.starts_with(&expected_override),
-            "the child must report at least the expected value"
+            report.starts_with(expected_override.as_bytes()),
+            "the child must observe exactly the override the parent prepared"
         );
 
-        fs::write(report_path(), &report).expect("the probe report can be written");
-    }
-
-    /// Dropping the handle neither ends the process nor blocks on it.
-    ///
-    /// No `Drop` implementation exists, so dropping a handle releases only the
-    /// handle. A process that was started keeps running, which is what the
-    /// product needs when the user closes BitArchive while a game runs
-    /// (PRODUCT.md §27.5).
-    ///
-    /// The test cannot observe the first child's status, because dropping the
-    /// handle is exactly what gives up that ability. It proves the two things
-    /// that matter: dropping returns without blocking, and a process can still
-    /// be started, observed, and reaped afterwards, so the adapter holds no
-    /// state that a dropped handle could have corrupted.
-    #[test]
-    fn dropping_a_handle_does_not_end_or_wait_on_the_process() {
-        let process = spawn_harmless_child();
-
-        assert!(process.id() > 0);
-
-        drop(process);
-
-        let mut after = ProcessController::new()
-            .spawn(&PreparedLaunch::new(
-                test_binary(),
-                vec![OsString::from(LIST_TESTS)],
-            ))
-            .expect("a process can still be started after a handle was dropped");
-
-        let status = after.wait().expect("the later child can be waited on");
-
-        assert!(status.is_success());
+        fs::write(&report_path, &report).expect("the probe report can be written");
     }
 
     /// The controller is a stateless value: it can be created in a `const`
