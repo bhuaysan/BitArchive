@@ -1,0 +1,11 @@
+# Rust toolchain for BitArchive.
+#
+# The project tracks the stable release channel; no nightly features are used.
+# rustfmt and clippy are required because repository validation runs
+# `cargo fmt` and `cargo clippy` (docs/DEVELOPMENT.md §13, §30).
+#
+# No minimum supported Rust version (MSRV) is established yet.
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
