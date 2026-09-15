@@ -1,0 +1,9 @@
+[package]
+name = "bitarchive-platform"
+description = "BitArchive platform layer: OS-specific service implementations"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bitarchive-application = { path = "../bitarchive-application" }
