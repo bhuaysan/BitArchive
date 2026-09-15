@@ -1,0 +1,9 @@
+[package]
+name = "bitarchive-application"
+description = "BitArchive application layer: launch contracts"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bitarchive-domain = { path = "../bitarchive-domain" }
