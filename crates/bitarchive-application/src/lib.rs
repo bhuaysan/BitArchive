@@ -51,6 +51,10 @@
 //! form; the UI decides how to present it and which recovery action to offer
 //! (ARCHITECTURE.md §21).
 //!
+//! A [`LaunchReadiness`] is either ready or blocked by at least one issue. The
+//! blocked state is private and can only be produced from a non-empty issue
+//! collection, so a blocked result always names a reason:
+//!
 //! ```text
 //! Ready
 //! Blocked [CoreMissing, SourceOffline]
