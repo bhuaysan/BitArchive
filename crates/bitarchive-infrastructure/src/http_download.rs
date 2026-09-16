@@ -69,6 +69,7 @@ use bitarchive_application::managed_runtime::{
 };
 use bitarchive_domain::runtime::{RuntimeDefinition, Sha256Digest};
 use sha2::{Digest, Sha256};
+use ureq::ResponseExt as _;
 
 /// The size of one read from the response body.
 ///
@@ -225,6 +226,22 @@ impl HttpArtifactDownloader {
         // BitArchive did not pin, and everything else is a failure.
         let status = response.status();
 
+        // Belt and braces, and deliberately not redundant: the redirect policy
+        // above is a configuration of the transport client, while this check is a
+        // property of the artifact. If a client ever followed a redirect — a
+        // configuration regression, a transport that ignores the setting — the
+        // assembled URL would name a different location than the one BitArchive
+        // pinned, and the bytes would be refused here instead of trusted.
+        if !served_from_the_pinned_url(url, response.get_uri().to_string().as_str()) {
+            return Err(RuntimeStoreError::DownloadFailed {
+                url: url.to_owned(),
+                cause: std::io::Error::other(format!(
+                    "the artifact was served from {}, but the definition pins {url}",
+                    response.get_uri()
+                )),
+            });
+        }
+
         if status.is_redirection() {
             return Err(RuntimeStoreError::DownloadFailed {
                 url: url.to_owned(),
@@ -317,6 +334,15 @@ fn transport_error(url: &str, cause: ureq::Error) -> RuntimeStoreError {
         url: url.to_owned(),
         cause,
     }
+}
+
+/// Returns `true` when a response really came from the URL the definition pins.
+///
+/// Kept as a small function so the property is testable on its own, without a
+/// transport that would have to misbehave first.
+#[must_use]
+fn served_from_the_pinned_url(pinned: &str, served: &str) -> bool {
+    pinned == served
 }
 
 /// Returns the path a download is assembled in before it is verified.
@@ -587,6 +613,24 @@ mod tests {
         assert!(error.to_string().contains("404"));
         assert!(!target.exists());
         assert!(!partial_path(&target).exists());
+    }
+
+    /// A response is only accepted when it came from the exact URL the definition
+    /// pins, so a location change the client might follow cannot be trusted by
+    /// accident.
+    #[test]
+    fn only_the_pinned_url_is_accepted_as_the_origin_of_the_bytes() {
+        let pinned = "https://buildbot.libretro.com/stable/1.22.2/apple/osx/universal/                      RetroArch_Metal.dmg";
+
+        assert!(served_from_the_pinned_url(pinned, pinned));
+        assert!(!served_from_the_pinned_url(
+            pinned,
+            "https://mirror.invalid/stable/1.22.2/apple/osx/universal/RetroArch_Metal.dmg"
+        ));
+        assert!(!served_from_the_pinned_url(
+            pinned,
+            "http://buildbot.libretro.com/stable/1.22.2/apple/osx/universal/RetroArch_Metal.dmg"
+        ));
     }
 
     /// A redirect is refused rather than followed, so the artifact can only ever
