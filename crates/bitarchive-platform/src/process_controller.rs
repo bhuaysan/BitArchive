@@ -104,6 +104,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -111,9 +112,31 @@ mod tests {
     /// The test the child instance runs when the probe activates it.
     ///
     /// This is the test harness name of the test, including its module path,
-    /// which is the spelling `--exact` matches.
+    /// which is the spelling [`EXACT_MATCH`] matches.
     const ENVIRONMENT_PROBE_TEST: &str =
         "process_controller::tests::environment_probe_runs_in_the_child_process";
+
+    /// The test harness flag that turns the positional filter into an exact
+    /// match of the whole test name.
+    ///
+    /// Without it the harness treats the argument as a substring filter, so a
+    /// partial name could select a different test — or several. The parent
+    /// therefore asks for the probe test by its full name *and* passes this
+    /// flag, so exactly one test runs in the child.
+    const EXACT_MATCH: &str = "--exact";
+
+    /// The arguments the probe child is started with: the probe test and the
+    /// exact-match flag.
+    ///
+    /// The probe test's launch and the test that verifies the launch both use
+    /// this one list, so a change to the child's arguments can never make the
+    /// documentation and the implementation disagree.
+    fn environment_probe_arguments() -> Vec<OsString> {
+        vec![
+            OsString::from(ENVIRONMENT_PROBE_TEST),
+            OsString::from(EXACT_MATCH),
+        ]
+    }
 
     /// The directory name prefix for one probe's request and report files.
     const PROBE_DIRECTORY_PREFIX: &str = "bitarchive-platform-environment-probe";
@@ -221,6 +244,44 @@ mod tests {
             status.code(),
             Some(0),
             "a successful process exits with code zero"
+        );
+    }
+
+    /// The probe child's argument list selects exactly one test.
+    ///
+    /// The same arguments the probe launches with are given to the test binary
+    /// with pipes, so the harness reports what it really ran. The child has no
+    /// probe activation, so it consumes nothing and produces no artifacts; it is
+    /// waited on and reaped like every other child in this suite.
+    #[test]
+    fn the_probe_child_argument_list_selects_exactly_one_test() {
+        let mut command = Command::new(test_binary());
+        command.args(environment_probe_arguments());
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let output = command
+            .output()
+            .expect("the test binary can be started to inspect its selection");
+        let harness = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            output.status.success(),
+            "the child selection run must succeed; harness output:\n{harness}"
+        );
+        assert!(
+            harness.contains("1 passed; 0 failed"),
+            "the argument list must select exactly one test and pass it; \
+             a substring filter would select a different number; harness output:\n{harness}"
+        );
+        assert!(
+            !harness.contains("FAILED"),
+            "no test may fail in the child; harness output:\n{harness}"
         );
     }
 
@@ -349,9 +410,20 @@ mod tests {
              nor a stale report can be mistaken for this probe's evidence"
         );
 
-        let launch =
-            PreparedLaunch::new(test_binary(), vec![OsString::from(ENVIRONMENT_PROBE_TEST)])
-                .with_environment(environment);
+        let launch = PreparedLaunch::new(test_binary(), environment_probe_arguments())
+            .with_environment(environment);
+
+        // The launch must ask for exactly the probe test. Without the
+        // exact-match flag the harness would treat the name as a substring
+        // filter, so a partial or renamed test could select the wrong test.
+        assert_eq!(
+            launch.arguments(),
+            [
+                OsString::from(ENVIRONMENT_PROBE_TEST),
+                OsString::from(EXACT_MATCH),
+            ],
+            "the probe child is started with the full test name and the exact-match flag"
+        );
 
         let mut process = ProcessController::new()
             .spawn(&launch)
