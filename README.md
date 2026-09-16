@@ -83,13 +83,13 @@ Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind do
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell und Core-Resolution-Policy), `bitarchive-application` (Launch-Verträge und Orchestrierungsschicht), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
+- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell und Core-Resolution-Policy), `bitarchive-application` (Launch-Verträge und Orchestrierungsschicht), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung), `bitarchive-platform` (plattformspezifische Dienste, bisher der Prozessstart), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
 
-Im Launch-Pfad existieren bisher die ersten Verträge und der erste konkrete Backend-Schritt: ein Launch-Wunsch (`GameId` + `Play`/`Continue`), strukturierte Launch-Readiness-Kategorien, die deterministische Core-Resolution-Policy (`Release > Game > System`, ohne globalen Core-Default), der backend-neutrale Prozessvertrag `PreparedLaunch` und die deterministische Übersetzung bereits aufgelöster RetroArch-Eingaben in Prozessargumente (`-L <core> <content>`, optional `--config <config>`). Ein Prozess wird dabei nicht gestartet.
+Im Launch-Pfad existieren bisher die ersten Verträge und die ersten beiden konkreten Schritte: ein Launch-Wunsch (`GameId` + `Play`/`Continue`), strukturierte Launch-Readiness-Kategorien, die deterministische Core-Resolution-Policy (`Release > Game > System`, ohne globalen Core-Default), der backend-neutrale Prozessvertrag `PreparedLaunch`, die deterministische Übersetzung bereits aufgelöster RetroArch-Eingaben in Prozessargumente (`-L <core> <content>`, optional `--config <config>`) und der direkte Prozessstart dieses `PreparedLaunch` über `std::process::Command`. Der Prozessstart benutzt keine Shell: Executable und Argumente werden einzeln an die Prozess-API übergeben, Environment-Overrides ergänzen das geerbte Parent Environment, und ein Working Directory wird nur gesetzt, wenn `PreparedLaunch` eines vorgibt. Der gestartete Prozess bleibt über einen eigenen Handle (`ProcessController` → `SpawnedProcess`) beobachtbar; beendet oder überwacht wird er dabei nicht automatisch. RetroArch-spezifische Typen kennt die Platform-Crate nicht.
 
-Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, RetroArch-Prozessstart, RetroArch-Konfigurations- und Core-Options-Erzeugung, Runtime- und Core-Verwaltung, Firmware-Readiness, Session-Management, Controller-Input, Localization und Packaging.
+Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, RetroArch-Konfigurations- und Core-Options-Erzeugung, Runtime- und Core-Verwaltung, Firmware-Readiness, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization und Packaging.
 
 Weiteres wird als GitHub Issue geplant und umgesetzt.
 
@@ -109,6 +109,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 │   ├── bitarchive-application/
 │   ├── bitarchive-domain/
 │   ├── bitarchive-emulation/
+│   ├── bitarchive-platform/
 │   └── bitarchive-ui/
 └── docs/
     ├── DEVELOPMENT.md
