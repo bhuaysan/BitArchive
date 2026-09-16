@@ -760,17 +760,24 @@ fn an_installed_version_is_immutable() {
     );
 }
 
-/// A cross-filesystem move fails as a whole: no final version directory appears,
-/// the active runtime is unchanged, and staging is cleaned up.
+/// A cross-filesystem move fails as a whole on the store it happened to: the
+/// already active runtime of *that* store is untouched, no partial final version
+/// directory appears, and staging is cleaned up.
 ///
-/// The installation is one `rename`, and it stays one `rename` on every path. This
-/// test is what holds that invariant: it points the component store at a real,
-/// separate filesystem (a RAM disk), so the move genuinely fails with `EXDEV`, and
-/// then asserts that the failure left no trace at the final version path.
+/// Installation is one `rename`, and it stays one `rename` on every path. This
+/// test is what holds that invariant with a real `EXDEV`: the destination store
+/// lives on a RAM disk, so a genuinely separate filesystem is involved, and only
+/// its staging area is pointed back at the first filesystem. No filesystem trait is
+/// introduced and nothing is simulated.
 ///
-/// A copy fallback would fail this test: it would create the version directory
-/// first and fill it afterwards, so the assertions on `installation.exists()` and
-/// on the staged payload would both break for the wrong reason.
+/// The ordering matters and is deliberate: the first version is installed and
+/// activated while staging and store still share a filesystem, so the store is in
+/// the state a real installation leaves behind. Only then is the staging area moved
+/// to the other filesystem, so only the second installation is cross-device.
+///
+/// Every assertion about the active runtime is made against the *same* store whose
+/// installation failed. A test that checked a different store would only prove that
+/// an uninvolved store stays unchanged.
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "mounts a RAM disk to produce a real cross-device move; needs no network"]
@@ -778,61 +785,73 @@ fn a_cross_device_move_fails_without_leaving_a_partial_installation() {
     let root = TempRoot::new("cross-device");
     let id = RuntimeId::from_str(RuntimeId::RETROARCH).expect("a valid identity");
 
-    // A first version is installed and active, on the normal filesystem.
-    let store = working_store(&root);
+    let older = RuntimeVersion::from_str("1.22.1").expect("a valid version");
+    let newer = RuntimeVersion::from_str("1.22.2").expect("a valid version");
 
-    let active_before = store
-        .install(&definition("1.22.1", fixture_digest()))
-        .expect("the first install succeeds");
-
-    let record_before = fs::read(store.active_record(&id)).expect("the record exists");
-
-    // The second component store lives on a genuinely separate filesystem, and its
-    // staging area is deliberately pointed back at the normal filesystem. That is
-    // the misconfiguration the installation contract has to refuse: staging and the
-    // store no longer share a filesystem, so the one-`rename` installation cannot be
-    // honoured.
+    // The destination store, on its own filesystem.
     let ram_disk = RamDisk::mount("cross-device");
-    let ram_store: ComponentStore<_, _> = ComponentStore::new(
+    let store: ComponentStore<_, _> = ComponentStore::new(
         ram_disk.path(),
         FakeDownloader::writing(FIXTURE),
         FakeExtractor::producing(FakeLayout::WithExecutable),
     );
 
+    // While staging and store share a filesystem, an installation succeeds and
+    // becomes active. This is the state the failed installation below must preserve.
+    let active_before = store
+        .install(&definition("1.22.1", fixture_digest()))
+        .expect("the first install succeeds while the filesystem is shared");
+
+    assert_eq!(active_before.version(), &older);
+    assert!(active_before.executable_path().is_file());
+
+    let record_before = fs::read(store.active_record(&id)).expect("the record exists");
+
+    // The successful installation left its staging area empty, which is asserted
+    // here because the redirection below replaces that directory.
+    let staging = store.staging_directory();
+
+    assert!(
+        fs::read_dir(&staging)
+            .expect("the staging directory is readable")
+            .next()
+            .is_none(),
+        "a successful install leaves no staging state behind"
+    );
+
+    // Now the store's staging area is pointed at a different filesystem. That is the
+    // misconfiguration the installation contract has to refuse: staging and store no
+    // longer share a filesystem, so the one-`rename` installation cannot be honoured.
+    fs::remove_dir(&staging).expect("the empty staging directory is removed");
+
     let elsewhere_staging = root.path().join("staging-on-the-other-filesystem");
     fs::create_dir_all(&elsewhere_staging).expect("the foreign staging directory");
 
-    std::os::unix::fs::symlink(&elsewhere_staging, ram_store.staging_directory())
+    std::os::unix::fs::symlink(&elsewhere_staging, &staging)
         .expect("the staging area is moved to the other filesystem");
 
-    let installation = ram_store.installation_directory(
-        &id,
-        RuntimePlatform::MacOsUniversal,
-        &RuntimeVersion::from_str("1.22.2").expect("a valid version"),
-    );
+    let installation = store.installation_directory(&id, RuntimePlatform::MacOsUniversal, &newer);
 
-    let outcome = ram_store.install(&definition("1.22.2", fixture_digest()));
+    let outcome = store.install(&definition("1.22.2", fixture_digest()));
 
     // 1. No partial version directory exists at the final path. This is the
-    //    invariant an in-place copy would break, because it would create the
-    //    version directory first and fill it afterwards — and it is asserted before
-    //    the outcome so that a non-atomic fallback is reported as the partial
+    //    invariant an in-place copy would break, because it would create the version
+    //    directory first and fill it afterwards — and it is asserted before the
+    //    outcome so that a non-atomic fallback is reported as the partial
     //    installation it is, not merely as an unexpected success.
     assert!(
         !installation.exists(),
         "a failed move must not create the final version directory"
     );
 
-    // ...nor anywhere else below the destination store.
-    let versions = ram_store.versions_directory(&id, RuntimePlatform::MacOsUniversal);
-
-    assert!(
-        !versions.exists()
-            || fs::read_dir(&versions)
-                .expect("the versions directory is readable")
-                .next()
-                .is_none(),
-        "no version directory may survive a failed move"
+    // ...and the store lists exactly the version it had before, so nothing else
+    // appeared anywhere below the versions directory either.
+    assert_eq!(
+        store
+            .installed_versions(&id)
+            .expect("the store is readable"),
+        vec![older.clone()],
+        "only the previously installed version may remain"
     );
 
     // 2. The attempt did not succeed either, so no caller can mistake a refused
@@ -853,7 +872,7 @@ fn a_cross_device_move_fails_without_leaving_a_partial_installation() {
             staged_payload,
             installation: reported,
         } => {
-            assert!(staged_payload.starts_with(ram_store.staging_directory()));
+            assert!(staged_payload.starts_with(store.staging_directory()));
             assert_eq!(*reported, installation);
         }
         other => panic!("expected a cross-device installation failure, got {other}"),
@@ -868,7 +887,8 @@ fn a_cross_device_move_fails_without_leaving_a_partial_installation() {
         "staging is removed after a failed move"
     );
 
-    // 5. The active runtime is byte-for-byte unchanged and still usable.
+    // 5. The active runtime of the same store is byte-for-byte unchanged, is still
+    //    the previous version, and its executable is still present and resolvable.
     assert_eq!(
         fs::read(store.active_record(&id)).expect("the record exists"),
         record_before,
@@ -878,16 +898,32 @@ fn a_cross_device_move_fails_without_leaving_a_partial_installation() {
     let active_after = store
         .active_runtime(&id)
         .expect("the record is readable")
-        .expect("the previous runtime is still active");
+        .expect("the previously activated runtime is still active");
 
     assert_eq!(active_after, active_before);
+    assert_eq!(active_after.version(), &older);
     assert!(active_after.executable_path().is_file());
+    assert_ne!(
+        active_after.executable_path(),
+        installation.join(EXECUTABLE_IN_BUNDLE),
+        "the active runtime must not point at the version that failed to install"
+    );
 
-    // 6. And the store still installs the version once the filesystem is not
-    //    crossed, so the failure was the move and not the payload.
-    store
+    // 6. The refusal was the move and not the payload: with the staging area back on
+    //    the store's own filesystem, the same store installs the same version.
+    fs::remove_file(&staging).expect("the staging redirection is removed");
+
+    let installed = store
         .install(&definition("1.22.2", fixture_digest()))
-        .expect("the same version installs when staging and store share a filesystem");
+        .expect("the same version installs once staging and store share a filesystem");
+
+    assert_eq!(installed.version(), &newer);
+    assert_eq!(
+        store
+            .installed_versions(&id)
+            .expect("the store is readable"),
+        vec![older, newer],
+    );
 }
 
 // ---------------------------------------------------------------------------
