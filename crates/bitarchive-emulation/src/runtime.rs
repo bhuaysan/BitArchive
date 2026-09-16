@@ -16,7 +16,7 @@
 //! ├── digest       81b79121ba26d539064ae13b4d0419a120c3d165afbe656cf5f5412b15fdb434
 //! ├── kind         apple-disk-image { bundle: "RetroArch.app" }
 //! ├── executable   RetroArch.app/Contents/MacOS/RetroArch
-//! └── attribution  RetroArch · libretro/RetroArch · GPL-3.0-only
+//! └── attribution  RetroArch · libretro/RetroArch · GPL-3.0-or-later
 //! ```
 //!
 //! # Why this version and this artifact
@@ -96,11 +96,12 @@ pub const PINNED_RETROARCH_UPSTREAM_URL: &str = "https://github.com/libretro/Ret
 
 /// The license RetroArch is distributed under.
 ///
-/// RetroArch is GPLv3 ("GPL-3.0-only" in SPDX terms), which is why the runtime is
-/// recorded as a redistributed third-party component with its origin and license
-/// rather than as an anonymous download. Anyone redistributing a BitArchive build
-/// has to keep those obligations satisfiable, and this is where the facts live.
-pub const PINNED_RETROARCH_LICENSE: &str = "GPL-3.0-only";
+/// `GPL-3.0-or-later`, not `GPL-3.0-only`: RetroArch's own source headers grant
+/// "either version 3 of the License, or (at your option) any later version". The
+/// runtime is recorded as a redistributed third-party component with its origin
+/// and license rather than as an anonymous download, so anyone redistributing a
+/// BitArchive build can see which obligations apply.
+pub const PINNED_RETROARCH_LICENSE: &str = "GPL-3.0-or-later";
 
 /// Returns the pinned definition of the RetroArch runtime BitArchive manages.
 ///
@@ -231,7 +232,7 @@ mod tests {
         );
         assert_eq!(attribution.upstream_url, PINNED_RETROARCH_UPSTREAM_URL);
         assert_eq!(attribution.license.as_str(), PINNED_RETROARCH_LICENSE);
-        assert_eq!(attribution.license.as_str(), "GPL-3.0-only");
+        assert_eq!(attribution.license.as_str(), "GPL-3.0-or-later");
     }
 
     /// Reading the pin twice yields the same definition: it is a value, not a

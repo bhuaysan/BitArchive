@@ -419,7 +419,7 @@ mod tests {
                 component: String::from("RetroArch"),
                 upstream_project: String::from("libretro/RetroArch"),
                 upstream_url: String::from("https://github.com/libretro/RetroArch"),
-                license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_ONLY)
+                license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER)
                     .expect("a valid license identifier"),
             },
         })

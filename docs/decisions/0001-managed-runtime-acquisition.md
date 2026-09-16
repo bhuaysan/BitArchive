@@ -43,7 +43,7 @@ Source:         https://buildbot.libretro.com/stable/1.22.2/apple/osx/universal/
 SHA-256:        81b79121ba26d539064ae13b4d0419a120c3d165afbe656cf5f5412b15fdb434
 Artifact kind:  apple-disk-image { bundle: "RetroArch.app" }
 Executable:     RetroArch.app/Contents/MacOS/RetroArch
-License:        RetroArch · libretro/RetroArch · GPL-3.0-only
+License:        RetroArch · libretro/RetroArch · GPL-3.0-or-later
 ```
 
 There is no `latest` resolution, no version discovery, and no digest taken from a
@@ -114,6 +114,16 @@ Installation is one rename of a fully staged payload; activation replaces a smal
 record file with one rename. Both are single operations on one filesystem, so a
 crash leaves either the previous state or the new state. A version directory is
 never written again: re-installing an installed version is refused.
+
+There is deliberately **no** copy fallback for the installation move. A copy into
+the final version directory would make the installation multi-step, and a failure
+halfway through it would leave a partial directory at the path that is supposed to
+mean "complete installation" — breaking immutability, the meaning of the final
+path, and all-or-nothing installation at once. A cross-filesystem configuration is
+therefore reported as `RuntimeStoreError::CrossDeviceInstallation` and nothing is
+installed, rather than being repaired non-atomically. The layout makes the case
+unreachable in a correct configuration, because staging lives inside the component
+store precisely so that the two share a filesystem.
 
 ### 5. Staging lives inside the store, not in the cache directory
 
@@ -200,9 +210,17 @@ a license review.
 | Reuse a user-installed RetroArch or search `/Applications` | Contradicts `PRODUCT.md` §16.1 and §16.3; makes "which RetroArch ran?" unanswerable. |
 | Extract the `.dmg` with `ditto` or `unzip` through a shell | `ARCHITECTURE.md` §20.3 and `AGENTS.md` §10 forbid shell interpolation, and `unzip` cannot read a disk image. |
 | Pure-Rust UDIF/HFS+ reader | Reimplements a container, a compression format, and a file system for one artifact already covered by the pinned digest. |
+| Copy the staged payload into the final version directory when `rename` reports a cross-device move | A copy is multi-step: a failure halfway through leaves a partial directory at the path that means a complete installation, breaking immutability, the meaning of the final path, and all-or-nothing installation. The case is unreachable when staging is inside the store, so it is reported instead of repaired. |
 | Install into `/Applications/RetroArch.app` | `ARCHITECTURE.md` §43 keeps mutable data out of the app bundle, and §23.1 requires a versioned store; it would also overwrite a user installation. |
 | Introduce SQLite for the component registry now | `Issue #19` excludes it, and no data model exists yet. |
 | Bundle all libretro cores with the runtime | `Issue #19` §19 excludes it; cores need their own license review. |
+
+## License note
+
+RetroArch is recorded as `GPL-3.0-or-later`, not `GPL-3.0-only`: its own source
+headers grant "either version 3 of the License, or (at your option) any later
+version". Recording the narrower `-only` identifier would describe a grant
+upstream does not make and would misstate BitArchive's redistribution position.
 
 ## References
 

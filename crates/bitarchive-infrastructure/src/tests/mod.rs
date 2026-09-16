@@ -41,6 +41,105 @@ const FIXTURE: &[u8] = b"BitArchive managed runtime artifact fixture";
 /// installs is a plausible one.
 const FIXTURE_DIGEST: &str = "9972f9716254c031b4b7f03709834096b72c00d2b2e785eb1a36ec86d74c84d2";
 
+/// A real, temporary filesystem on a RAM disk, used to produce a cross-device
+/// move on purpose.
+///
+/// `EXDEV` cannot be produced inside one temporary directory, which is why this
+/// helper exists: a disk image is a genuinely separate filesystem, so a `rename`
+/// from the store staging area to it fails with `EXDEV` exactly as it would on a
+/// misconfigured installation. It is used only by the `#[ignore]`d cross-device
+/// test, so the normal suite still runs entirely inside one temporary directory.
+#[cfg(target_os = "macos")]
+struct RamDisk {
+    device: PathBuf,
+    mount_point: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl RamDisk {
+    /// Creates and mounts a small RAM disk.
+    fn mount(label: &str) -> Self {
+        /// 8 MiB of 512-byte sectors: far more than the test payload needs.
+        const SECTORS: u32 = 16_384;
+
+        let device = run(
+            "/usr/bin/hdiutil",
+            &["attach", "-nomount", &format!("ram://{SECTORS}")],
+        );
+        let device = PathBuf::from(device.trim());
+
+        run(
+            "/sbin/newfs_hfs",
+            &["-v", "BATest", &device.to_string_lossy()],
+        );
+
+        let mount_point = std::env::temp_dir().join(format!(
+            "bitarchive-b5-ramdisk-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&mount_point);
+        fs::create_dir_all(&mount_point).expect("a mount point directory");
+
+        run(
+            "/sbin/mount",
+            &[
+                "-t",
+                "hfs",
+                &device.to_string_lossy(),
+                &mount_point.to_string_lossy(),
+            ],
+        );
+
+        Self {
+            device,
+            mount_point,
+        }
+    }
+
+    /// Returns the mounted path.
+    fn path(&self) -> &Path {
+        &self.mount_point
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RamDisk {
+    fn drop(&mut self) {
+        let _ = run_status("/sbin/umount", &[&self.mount_point.to_string_lossy()]);
+        let _ = run_status(
+            "/usr/bin/hdiutil",
+            &["detach", &self.device.to_string_lossy()],
+        );
+        let _ = fs::remove_dir_all(&self.mount_point);
+    }
+}
+
+/// Runs a tool and returns its standard output, panicking on failure.
+#[cfg(target_os = "macos")]
+fn run(program: &str, arguments: &[&str]) -> String {
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|cause| panic!("{program} could not be started: {cause}"));
+
+    assert!(
+        output.status.success(),
+        "{program} {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Runs a tool and returns whether it succeeded.
+#[cfg(target_os = "macos")]
+fn run_status(program: &str, arguments: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(arguments)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// A temporary component root that removes itself.
 struct TempRoot(PathBuf);
 
@@ -275,7 +374,7 @@ fn definition(version: &str, digest: Sha256Digest) -> RuntimeDefinition {
             component: String::from("RetroArch"),
             upstream_project: String::from("libretro/RetroArch"),
             upstream_url: String::from("https://github.com/libretro/RetroArch"),
-            license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_ONLY)
+            license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER)
                 .expect("a valid license identifier"),
         },
     })
@@ -659,6 +758,136 @@ fn an_installed_version_is_immutable() {
         fs::read_to_string(&marker).expect("the marker is readable"),
         "first install"
     );
+}
+
+/// A cross-filesystem move fails as a whole: no final version directory appears,
+/// the active runtime is unchanged, and staging is cleaned up.
+///
+/// The installation is one `rename`, and it stays one `rename` on every path. This
+/// test is what holds that invariant: it points the component store at a real,
+/// separate filesystem (a RAM disk), so the move genuinely fails with `EXDEV`, and
+/// then asserts that the failure left no trace at the final version path.
+///
+/// A copy fallback would fail this test: it would create the version directory
+/// first and fill it afterwards, so the assertions on `installation.exists()` and
+/// on the staged payload would both break for the wrong reason.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "mounts a RAM disk to produce a real cross-device move; needs no network"]
+fn a_cross_device_move_fails_without_leaving_a_partial_installation() {
+    let root = TempRoot::new("cross-device");
+    let id = RuntimeId::from_str(RuntimeId::RETROARCH).expect("a valid identity");
+
+    // A first version is installed and active, on the normal filesystem.
+    let store = working_store(&root);
+
+    let active_before = store
+        .install(&definition("1.22.1", fixture_digest()))
+        .expect("the first install succeeds");
+
+    let record_before = fs::read(store.active_record(&id)).expect("the record exists");
+
+    // The second component store lives on a genuinely separate filesystem, and its
+    // staging area is deliberately pointed back at the normal filesystem. That is
+    // the misconfiguration the installation contract has to refuse: staging and the
+    // store no longer share a filesystem, so the one-`rename` installation cannot be
+    // honoured.
+    let ram_disk = RamDisk::mount("cross-device");
+    let ram_store: ComponentStore<_, _> = ComponentStore::new(
+        ram_disk.path(),
+        FakeDownloader::writing(FIXTURE),
+        FakeExtractor::producing(FakeLayout::WithExecutable),
+    );
+
+    let elsewhere_staging = root.path().join("staging-on-the-other-filesystem");
+    fs::create_dir_all(&elsewhere_staging).expect("the foreign staging directory");
+
+    std::os::unix::fs::symlink(&elsewhere_staging, ram_store.staging_directory())
+        .expect("the staging area is moved to the other filesystem");
+
+    let installation = ram_store.installation_directory(
+        &id,
+        RuntimePlatform::MacOsUniversal,
+        &RuntimeVersion::from_str("1.22.2").expect("a valid version"),
+    );
+
+    let outcome = ram_store.install(&definition("1.22.2", fixture_digest()));
+
+    // 1. No partial version directory exists at the final path. This is the
+    //    invariant an in-place copy would break, because it would create the
+    //    version directory first and fill it afterwards — and it is asserted before
+    //    the outcome so that a non-atomic fallback is reported as the partial
+    //    installation it is, not merely as an unexpected success.
+    assert!(
+        !installation.exists(),
+        "a failed move must not create the final version directory"
+    );
+
+    // ...nor anywhere else below the destination store.
+    let versions = ram_store.versions_directory(&id, RuntimePlatform::MacOsUniversal);
+
+    assert!(
+        !versions.exists()
+            || fs::read_dir(&versions)
+                .expect("the versions directory is readable")
+                .next()
+                .is_none(),
+        "no version directory may survive a failed move"
+    );
+
+    // 2. The attempt did not succeed either, so no caller can mistake a refused
+    //    installation for a completed one.
+    let error = match outcome {
+        Ok(installed) => panic!(
+            "a cross-device move must not report success, but installed {} at {}",
+            installed.version(),
+            installed.directory().display()
+        ),
+        Err(error) => error,
+    };
+
+    // 3. The failure is reported as the cross-device case, not as a generic I/O
+    //    error, so a caller can tell what is actually wrong.
+    match &error {
+        RuntimeStoreError::CrossDeviceInstallation {
+            staged_payload,
+            installation: reported,
+        } => {
+            assert!(staged_payload.starts_with(ram_store.staging_directory()));
+            assert_eq!(*reported, installation);
+        }
+        other => panic!("expected a cross-device installation failure, got {other}"),
+    }
+
+    // 4. Staging was cleaned up, on the filesystem it actually lived on.
+    assert!(
+        fs::read_dir(&elsewhere_staging)
+            .expect("the staging directory is readable")
+            .next()
+            .is_none(),
+        "staging is removed after a failed move"
+    );
+
+    // 5. The active runtime is byte-for-byte unchanged and still usable.
+    assert_eq!(
+        fs::read(store.active_record(&id)).expect("the record exists"),
+        record_before,
+        "the active record is untouched by a failed installation"
+    );
+
+    let active_after = store
+        .active_runtime(&id)
+        .expect("the record is readable")
+        .expect("the previous runtime is still active");
+
+    assert_eq!(active_after, active_before);
+    assert!(active_after.executable_path().is_file());
+
+    // 6. And the store still installs the version once the filesystem is not
+    //    crossed, so the failure was the move and not the payload.
+    store
+        .install(&definition("1.22.2", fixture_digest()))
+        .expect("the same version installs when staging and store share a filesystem");
 }
 
 // ---------------------------------------------------------------------------

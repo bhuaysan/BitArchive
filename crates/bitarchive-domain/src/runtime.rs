@@ -833,15 +833,19 @@ impl fmt::Display for ArtifactSource {
 ///
 /// use bitarchive_domain::runtime::LicenseIdentifier;
 ///
-/// let license = LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_ONLY).unwrap();
-/// assert_eq!(license.as_str(), "GPL-3.0-only");
+/// let license = LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER).unwrap();
+/// assert_eq!(license.as_str(), "GPL-3.0-or-later");
 /// ```
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LicenseIdentifier(String);
 
 impl LicenseIdentifier {
-    /// The license of RetroArch itself: GNU General Public License v3.0 only.
-    pub const GPL_3_0_ONLY: &'static str = "GPL-3.0-only";
+    /// The license RetroArch itself is distributed under.
+    ///
+    /// RetroArch's own source headers state "either version 3 of the License, or
+    /// (at your option) any later version", which is `GPL-3.0-or-later` in SPDX
+    /// terms. `GPL-3.0-only` would describe a grant upstream does not make.
+    pub const GPL_3_0_OR_LATER: &'static str = "GPL-3.0-or-later";
 
     /// Returns the identifier as a string slice.
     #[must_use]
@@ -957,7 +961,7 @@ pub struct RuntimeAttribution {
 ///         component: String::from("RetroArch"),
 ///         upstream_project: String::from("libretro/RetroArch"),
 ///         upstream_url: String::from("https://github.com/libretro/RetroArch"),
-///         license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_ONLY).unwrap(),
+///         license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER).unwrap(),
 ///     },
 /// });
 ///
@@ -992,7 +996,7 @@ pub struct RuntimeParts {
 /// ├── digest       81b79121…fdb434
 /// ├── kind         apple-disk-image { bundle: "RetroArch.app" }
 /// ├── executable   RetroArch.app/Contents/MacOS/RetroArch
-/// └── attribution  RetroArch / libretro / GPL-3.0-only
+/// └── attribution  RetroArch / libretro / GPL-3.0-or-later
 /// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RuntimeDefinition {
@@ -1325,7 +1329,7 @@ mod tests {
                 component: String::from("RetroArch"),
                 upstream_project: String::from("libretro/RetroArch"),
                 upstream_url: String::from("https://github.com/libretro/RetroArch"),
-                license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_ONLY)
+                license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER)
                     .expect("a valid license identifier"),
             },
         });
@@ -1354,6 +1358,6 @@ mod tests {
             attribution.upstream_url,
             "https://github.com/libretro/RetroArch"
         );
-        assert_eq!(attribution.license.as_str(), "GPL-3.0-only");
+        assert_eq!(attribution.license.as_str(), "GPL-3.0-or-later");
     }
 }

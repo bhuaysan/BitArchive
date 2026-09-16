@@ -505,11 +505,21 @@ where
 
     /// Moves the staged payload to the version directory in one step.
     ///
-    /// The move is a rename on one filesystem. When the staging area and the store
-    /// root happen to live on different filesystems, the payload is copied and the
-    /// staged copy removed; the move is then still all-or-nothing from the
-    /// caller's point of view, because the version directory only comes into
-    /// existence after the copy succeeded.
+    /// The move is a single `rename` on one filesystem, and that is the whole
+    /// mechanism. There is deliberately no copy fallback: a copy into the final
+    /// version directory would make the installation multi-step, and a failure
+    /// halfway through it would leave a *partial* directory at the path that is
+    /// supposed to represent a complete installation. That would break three
+    /// properties at once — installed versions are immutable, a final version path
+    /// means a complete installation, and an installation is all-or-nothing
+    /// (ARCHITECTURE.md §23.2).
+    ///
+    /// A cross-filesystem move is therefore a controlled failure, not a repair.
+    /// It cannot happen through the intended layout, because staging lives inside
+    /// the component store (see [`ComponentStore::staging_directory`]) precisely so
+    /// that the two share a filesystem; if the store is nevertheless configured
+    /// across filesystems, the error says so instead of silently taking a
+    /// non-atomic route.
     fn move_into_place(
         &self,
         staged_payload: &Path,
@@ -521,23 +531,20 @@ where
             })?;
         }
 
-        match fs::rename(staged_payload, installation) {
-            Ok(()) => Ok(()),
-            Err(cause) if is_cross_device(&cause) => {
-                copy_tree(staged_payload, installation).map_err(|cause| {
-                    RuntimeStoreError::io("copying the staged payload", installation, cause)
-                })?;
-
-                fs::remove_dir_all(staged_payload).map_err(|cause| {
-                    RuntimeStoreError::io("removing the staged payload", staged_payload, cause)
-                })
+        fs::rename(staged_payload, installation).map_err(|cause| {
+            // A failed rename is atomic by definition: nothing appeared at
+            // `installation`, so there is no partial version directory to clean up.
+            // The staged payload stays where it is and the caller removes the
+            // staging directory it created.
+            if is_cross_device(&cause) {
+                RuntimeStoreError::CrossDeviceInstallation {
+                    staged_payload: staged_payload.to_path_buf(),
+                    installation: installation.to_path_buf(),
+                }
+            } else {
+                RuntimeStoreError::io("installing the version directory", installation, cause)
             }
-            Err(cause) => Err(RuntimeStoreError::io(
-                "installing the version directory",
-                installation,
-                cause,
-            )),
-        }
+        })
     }
 
     /// Writes the activation record, replacing it as a whole.
@@ -677,49 +684,4 @@ impl ActiveRecord {
 /// filesystems.
 fn is_cross_device(cause: &std::io::Error) -> bool {
     cause.raw_os_error() == Some(18) // EXDEV
-}
-
-/// Copies a directory tree, preserving file permissions.
-///
-/// Symbolic links are reproduced as symbolic links instead of being followed, so a
-/// payload cannot smuggle content in from outside the staged tree by pointing at
-/// it.
-fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(target)?;
-
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = target.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&from)?;
-
-        if metadata.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if metadata.file_type().is_symlink() {
-            let destination = fs::read_link(&from)?;
-            symlink(&destination, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Creates a symbolic link.
-#[cfg(unix)]
-fn symlink(destination: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(destination, link)
-}
-
-/// Creates a symbolic link.
-#[cfg(not(unix))]
-fn symlink(_destination: &Path, link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        format!(
-            "symbolic links are not supported on this platform: {}",
-            link.display()
-        ),
-    ))
 }

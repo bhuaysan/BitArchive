@@ -473,6 +473,23 @@ pub enum RuntimeStoreError {
         /// The executable path that was expected.
         expected: PathBuf,
     },
+    /// Staging and the component store are on different filesystems.
+    ///
+    /// Installing a version is one `rename`, which only works within one
+    /// filesystem. A copy fallback would make the installation multi-step and
+    /// could leave a partial directory at the path that means "complete
+    /// installation", so a cross-filesystem configuration is reported instead of
+    /// being repaired non-atomically.
+    ///
+    /// Nothing was installed: the rename failed before anything appeared at
+    /// `installation`, and the active runtime is untouched. This error means the
+    /// store is configured in a way the installation contract cannot honour.
+    CrossDeviceInstallation {
+        /// The staged payload that could not be moved.
+        staged_payload: PathBuf,
+        /// The version directory it could not be moved to.
+        installation: PathBuf,
+    },
     /// The version is already installed.
     ///
     /// Installed versions are immutable, so this is reported instead of
@@ -562,6 +579,17 @@ impl fmt::Display for RuntimeStoreError {
                 f,
                 "the installed runtime does not contain the expected executable at {}",
                 expected.display()
+            ),
+            Self::CrossDeviceInstallation {
+                staged_payload,
+                installation,
+            } => write!(
+                f,
+                "the staged runtime at {} cannot be installed at {} in one step, because the two \
+                 are on different filesystems; nothing was installed and the active runtime is \
+                 unchanged",
+                staged_payload.display(),
+                installation.display()
             ),
             Self::AlreadyInstalled {
                 id,
