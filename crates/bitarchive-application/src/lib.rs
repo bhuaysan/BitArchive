@@ -12,7 +12,8 @@
 //! Domain
 //! ```
 //!
-//! What exists here is deliberately only the beginning of the launch path:
+//! What exists here is deliberately only the beginning of the launch path plus
+//! the runtime acquisition contract:
 //!
 //! - [`LaunchRequest`] — the user's launch wish, expressed as a [`GameId`] and a
 //!   [`LaunchAction`]
@@ -22,11 +23,14 @@
 //!   process launch
 //! - [`resolve_core`] — re-exported domain policy for deterministic core
 //!   selection
+//! - [`managed_runtime`] — the ports and result types of managed runtime
+//!   acquisition: [`ArtifactDownloader`], [`ArtifactExtractor`],
+//!   [`DiskImageExtractor`], [`RuntimeInstaller`], and [`InstalledRuntime`]
 //!
 //! Release resolution, content resolution, firmware readiness, configuration
-//! resolution, core options, process spawning, and session management are not
-//! implemented yet (ARCHITECTURE.md §20, §21, §22). This crate introduces no
-//! ports for them in advance.
+//! resolution, core options, process spawning, session management, and core
+//! management are not implemented yet (ARCHITECTURE.md §20, §21, §22, §23). This
+//! crate introduces no ports for them in advance.
 //!
 //! # Boundary
 //!
@@ -53,6 +57,12 @@
 //! it does not turn this crate into an adapter: no type here reads, writes, or
 //! starts anything.
 //!
+//! [`managed_runtime`] follows the same rule from the other side. It declares the
+//! *shapes* of downloading, unpacking, and installing because it owns the use
+//! case, and it carries the resulting paths back to its caller, but every
+//! operation is a trait method implemented by an outer layer. Declaring a port
+//! is not performing I/O.
+//!
 //! [`PathBuf`]: std::path::PathBuf
 //! [`OsString`]: std::ffi::OsString
 //! [`std::process::Command`]: std::process::Command
@@ -77,10 +87,15 @@
 
 mod launch;
 mod launch_readiness;
+pub mod managed_runtime;
 mod prepared_launch;
 
 pub use launch::{LaunchAction, LaunchRequest};
 pub use launch_readiness::{LaunchReadiness, ReadinessIssue};
+pub use managed_runtime::{
+    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactSourceKind, DiskImageExtractor,
+    DownloadTimeout, InstalledRuntime, RuntimeInstaller, RuntimeStoreError,
+};
 pub use prepared_launch::PreparedLaunch;
 
 pub use bitarchive_domain::core::{CoreSelectionSource, ResolvedCore, resolve_core};

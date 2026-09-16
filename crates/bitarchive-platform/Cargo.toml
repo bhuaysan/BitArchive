@@ -7,3 +7,10 @@ publish = false
 
 [dependencies]
 bitarchive-application = { path = "../bitarchive-application" }
+bitarchive-domain = { path = "../bitarchive-domain" }
+
+# The live disk-image tests read the pinned definition of the runtime they are
+# checking. They need the emulation crate to name it; the library itself does
+# not, and stays free of RetroArch knowledge.
+[dev-dependencies]
+bitarchive-emulation = { path = "../bitarchive-emulation" }

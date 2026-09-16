@@ -1,8 +1,7 @@
 # BitArchive Cargo workspace.
 #
-# The workspace intentionally contains only the crates that currently exist.
-# Infrastructure and platform crates are added as soon as implementation work
-# requires them (ARCHITECTURE.md §5).
+# The workspace contains only the crates that currently exist. A crate is
+# introduced by the Issue that needs it, not in advance (ARCHITECTURE.md §5).
 #
 # Cargo.lock is committed on purpose: BitArchive ships an application, so the
 # dependency graph is part of the repository state.
@@ -14,6 +13,7 @@ members = [
     "crates/bitarchive-application",
     "crates/bitarchive-domain",
     "crates/bitarchive-emulation",
+    "crates/bitarchive-infrastructure",
     "crates/bitarchive-platform",
     "crates/bitarchive-ui",
 ]
@@ -28,3 +28,12 @@ slint-build = "1.17.1"
 # Domain identities are UUIDv7 (ARCHITECTURE.md §7). Only the domain crate needs
 # it, and only the `v7` feature is required to generate them.
 uuid = { version = "1.26.1", features = ["v7"] }
+# SHA-256 is BitArchive's canonical content hash (ARCHITECTURE.md §11). `sha2` is
+# the RustCrypto implementation; only SHA-256 is used, and hashing is streaming
+# so a large artifact is never held in memory.
+sha2 = "0.10.9"
+# The HTTP transport of the managed runtime acquisition path (Issue #19). See
+# `crates/bitarchive-infrastructure/src/http_download.rs` for why this step uses
+# a synchronous, narrowly scoped client and not yet the shared async network
+# layer of ARCHITECTURE.md §31.
+ureq = "3.4.2"

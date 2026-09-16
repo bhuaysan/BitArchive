@@ -1083,6 +1083,21 @@ components/
         └── ...
 ```
 
+Die Plattform steht unterhalb der Komponentenklasse, damit eine spätere Plattform
+keine Installation einer anderen stillschweigend mitbenutzt und `cores/<core-id>/`
+davon unberührt bleibt:
+
+```text
+components/
+├── runtime/<platform>/<version>/
+└── cores/<core-id>/<version>/
+```
+
+Welche Runtime-Version aktiv ist, steht pro Runtime in einer kleinen Registry
+(`components/runtime/<id>/active`). Sie zeigt ausschließlich auf eine installierte
+Version; die Menge der installierten Versionen ergibt sich aus den
+Versionsverzeichnissen.
+
 ### 23.2 Update Flow
 
 Vor der Nutzerbestätigung wird ein `ComponentUpdateImpact` ermittelt.
@@ -1114,6 +1129,12 @@ Aktivierung
 ```
 
 Aktive Versionen werden nicht in-place überschrieben.
+
+Staging liegt innerhalb des Component Stores, damit die Installation ein Rename
+innerhalb eines Dateisystems und damit tatsächlich atomar ist. Der
+Staging-Bereich im Cache-Verzeichnis (§35) bleibt für Arbeit, die nicht atomar
+mit dem Store sein muss. Staging ist auf allen Pfaden transient und wird nach
+Erfolg wie nach Fehler entfernt.
 
 ### 23.3 Rollback
 
