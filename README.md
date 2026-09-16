@@ -89,9 +89,64 @@ Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
 Im Launch-Pfad existieren bisher die ersten Verträge und die ersten beiden konkreten Schritte: ein Launch-Wunsch (`GameId` + `Play`/`Continue`), strukturierte Launch-Readiness-Kategorien, die deterministische Core-Resolution-Policy (`Release > Game > System`, ohne globalen Core-Default), der backend-neutrale Prozessvertrag `PreparedLaunch`, die deterministische Übersetzung bereits aufgelöster RetroArch-Eingaben in Prozessargumente (`-L <core> <content>`, optional `--config <config>`) und der direkte Prozessstart dieses `PreparedLaunch` über `std::process::Command`. Der Prozessstart benutzt keine Shell: Executable und Argumente werden einzeln an die Prozess-API übergeben, Environment-Overrides ergänzen das geerbte Parent Environment, und ein Working Directory wird nur gesetzt, wenn `PreparedLaunch` eines vorgibt. Der gestartete Prozess bleibt über einen eigenen Handle (`ProcessController` → `SpawnedProcess`) beobachtbar; beendet oder überwacht wird er dabei nicht automatisch. RetroArch-spezifische Typen kennt die Platform-Crate nicht.
 
+Die technische Kette von RetroArch-Launch-Aufbereitung bis Prozessstart kann über einen Developer-Smoke-Target real ausgeführt werden. Dieser Target ist bewusst Entwicklerwerkzeug und kein Produkt-Flow: **Play aus der normalen BitArchive-UI ist noch nicht implementiert.** Ob ein realer RetroArch-Launch mit Core und Content erfolgreich verläuft, ist abhängig von lokal verfügbaren Ressourcen und wurde bisher nicht verifiziert (siehe [Developer-Smoke-Launch](#developer-smoke-launch-retroarch_smoke)).
+
 Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, RetroArch-Konfigurations- und Core-Options-Erzeugung, Runtime- und Core-Verwaltung, Firmware-Readiness, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization und Packaging.
 
 Weiteres wird als GitHub Issue geplant und umgesetzt.
+
+## Developer-Smoke-Launch (`retroarch_smoke`)
+
+Für die manuelle technische Verifikation der Launch-Kette existiert ein Cargo-Example-Target:
+
+```text
+apps/bitarchive-desktop/examples/retroarch_smoke.rs
+```
+
+Es setzt erstmals die vorhandenen Bausteine zusammen und startet einen realen RetroArch-Prozess:
+
+```text
+RetroArchLaunchInput
+    ↓
+RetroArchBackend::prepare_launch
+    ↓
+PreparedLaunch
+    ↓
+ProcessController::spawn
+    ↓
+SpawnedProcess
+```
+
+Aufruf:
+
+```bash
+cargo run --locked \
+  -p bitarchive-desktop \
+  --example retroarch_smoke \
+  -- \
+  <retroarch-executable> \
+  <core-library> \
+  <content> \
+  [config]
+```
+
+Drei Pfade sind erforderlich, der RetroArch-Konfigurationspfad ist optional. Da die Pfade als einzelne Prozessargumente übergeben werden, funktionieren Pfade mit Leerzeichen ohne Shell-Quoting.
+
+Wichtig:
+
+- Der Smoke Launcher ist **ausschließlich Entwicklerwerkzeug** und manuelle Integrationsverifikation. Er ist **kein Produkt-Flow** und **kein UI-Feature**.
+- Die konkreten Pfade werden nur beim manuellen Developer-Aufruf übergeben. Es gibt **keine Persistenz** und **keine User Settings**; ein RetroArch-Pfad ist keine Produktkonfiguration.
+- Der Launcher prüft und beschafft nichts: keine Existenz-Checks, keine Readiness, keine Core-Kompatibilität, keine Firmware-Prüfung, keine Downloads. Er arbeitet mit bereits bekannten konkreten Entwickler-Pfaden.
+- Der Launcher startet RetroArch, gibt die PID aus und **wartet** auf das Ende des Prozesses. Er beendet, terminiert oder killt RetroArch nicht; während des Smoke-Tests wird RetroArch normal beendet.
+- Der normale Start der Desktop-Anwendung bleibt unverändert:
+
+  ```bash
+  cargo run -p bitarchive-desktop
+  ```
+
+  startet weiterhin genau die bisherige Desktop-App.
+
+Dieser Target ersetzt weder den späteren Produkt-Play-Flow noch automatisierte Tests: CI setzt weder ein installiertes RetroArch noch ROMs voraus.
 
 ## Projektstruktur
 
@@ -105,6 +160,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 ├── ARCHITECTURE.md
 ├── apps/
 │   └── bitarchive-desktop/
+│       └── examples/                # Developer-Smoke-Targets, kein Produkt-Flow
 ├── crates/
 │   ├── bitarchive-application/
 │   ├── bitarchive-domain/

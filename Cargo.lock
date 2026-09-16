@@ -567,6 +567,8 @@ dependencies = [
 name = "bitarchive-desktop"
 version = "0.1.0"
 dependencies = [
+ "bitarchive-emulation",
+ "bitarchive-platform",
  "bitarchive-ui",
 ]
 

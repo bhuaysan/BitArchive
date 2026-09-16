@@ -7,3 +7,16 @@ publish = false
 
 [dependencies]
 bitarchive-ui = { path = "../../crates/bitarchive-ui" }
+# The desktop package is the composition root (ARCHITECTURE.md §5.7), so it is
+# the first and only place where the concrete emulation backend and the concrete
+# platform services are composed. Both are workspace-internal path dependencies;
+# no external dependency is introduced for the developer smoke example.
+bitarchive-emulation = { path = "../../crates/bitarchive-emulation" }
+bitarchive-platform = { path = "../../crates/bitarchive-platform" }
+
+# The developer smoke launcher (`examples/retroarch_smoke.rs`) is a developer
+# target, not a product target: it must be explicitly selected with
+# `--example` and never runs as part of the desktop binary.
+[[example]]
+name = "retroarch_smoke"
+path = "examples/retroarch_smoke.rs"
