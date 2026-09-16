@@ -5,7 +5,8 @@
 //! and [`CoreId`] identities that later resolvers need.
 //!
 //! It also owns the first fully deterministic launch rule, the core selection
-//! policy in [`core`] (ARCHITECTURE.md §20.4).
+//! policy in [`core`] (ARCHITECTURE.md §20.4), and the pinned description of a
+//! managed runtime component in [`runtime`] (ARCHITECTURE.md §23).
 //!
 //! It is deliberately small. It carries no titles, descriptions, regions,
 //! languages, release types, hashes, paths, scanner or scraping state, save
@@ -29,6 +30,12 @@
 //! executable paths, `.cfg` paths, environment variables, or launch arguments
 //! in any domain type.
 //!
+//! [`runtime`] is the one place where a domain type names a location, and it does
+//! so without touching the filesystem: an [`ArtifactSource`] is a reviewed,
+//! validated URL string and a [`RelativePath`] is a path *below* an installation
+//! directory that cannot contain `..` or an absolute component. Nothing in this
+//! crate opens, reads, or writes anything.
+//!
 //! # Model
 //!
 //! ```text
@@ -46,9 +53,15 @@ pub mod core;
 mod game;
 mod id;
 mod release;
+pub mod runtime;
 
 pub use content::Content;
 pub use core::{CoreSelectionSource, ResolvedCore, resolve_core};
 pub use game::Game;
 pub use id::{ContentId, CoreId, GameId, ReleaseId, SystemId};
 pub use release::Release;
+pub use runtime::{
+    ArtifactKind, ArtifactSource, LicenseIdentifier, LoopbackSource, RelativePath,
+    RuntimeAttribution, RuntimeDefinition, RuntimeId, RuntimeParts, RuntimePlatform, RuntimeSource,
+    RuntimeVersion, Sha256Digest,
+};

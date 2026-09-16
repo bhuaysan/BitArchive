@@ -5,5 +5,14 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# The composition root is the only place that knows every concrete
+# implementation (ARCHITECTURE.md §5.7). The launch UI still reaches the
+# presentation layer only; the additional crates exist for the opt-in developer
+# runtime acquisition command, which is the first flow that needs the whole
+# managed runtime path.
 [dependencies]
+bitarchive-application = { path = "../../crates/bitarchive-application" }
+bitarchive-emulation = { path = "../../crates/bitarchive-emulation" }
+bitarchive-infrastructure = { path = "../../crates/bitarchive-infrastructure" }
+bitarchive-platform = { path = "../../crates/bitarchive-platform" }
 bitarchive-ui = { path = "../../crates/bitarchive-ui" }

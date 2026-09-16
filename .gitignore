@@ -48,6 +48,17 @@ tmp/
 scratch/
 *.local
 
+# --- Managed component store / downloaded runtime artifacts ----------------
+# Runtime and core components are downloaded into the application data
+# directories (ARCHITECTURE.md §23.1, §35) and are never source. The patterns
+# below only catch a component store that was deliberately rooted inside the
+# repository during local development; they must never be used to commit a
+# runtime, a core, a ROM, or firmware.
+components/
+artifacts/
+*.dmg
+*_libretro.dylib
+
 # --- Test / coverage output ------------------------------------------------
 coverage/
 

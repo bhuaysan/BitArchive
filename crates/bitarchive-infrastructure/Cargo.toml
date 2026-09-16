@@ -1,6 +1,6 @@
 [package]
-name = "bitarchive-emulation"
-description = "BitArchive emulation layer: RetroArch launch preparation"
+name = "bitarchive-infrastructure"
+description = "BitArchive infrastructure layer: HTTP, downloads, and the versioned component store"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -8,3 +8,5 @@ publish = false
 [dependencies]
 bitarchive-application = { path = "../bitarchive-application" }
 bitarchive-domain = { path = "../bitarchive-domain" }
+sha2 = { workspace = true }
+ureq = { workspace = true }
