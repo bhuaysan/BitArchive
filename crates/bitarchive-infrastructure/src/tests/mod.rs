@@ -1,10 +1,14 @@
-//! Integration tests for the managed runtime acquisition path.
+//! Integration tests for managed component acquisition.
+//!
+//! This module holds the helpers both component classes' tests share — a temporary
+//! component root and a fake downloader — and the runtime store tests. The core
+//! store and the core archive extractor are tested in [`core_acquisition`].
 //!
 //! Every test here runs against a temporary component root and a fake downloader
 //! and extractor, or against a loopback HTTP server. None of them downloads a real
-//! RetroArch artifact, so the normal test suite never depends on the public
-//! network or on the official build host being reachable
-//! (ARCHITECTURE.md §45.4, Issue #19).
+//! RetroArch artifact or a real libretro core, so the normal test suite never
+//! depends on the public network or on the official build host being reachable
+//! (ARCHITECTURE.md §45.4, Issue #19, Issue #21).
 //!
 //! The fakes are deliberately *not* the real adapters with the network switched
 //! off: they are separate implementations of the same ports, so a test can make
@@ -18,14 +22,16 @@ use std::str::FromStr;
 
 use crate::ComponentStore;
 use bitarchive_application::managed_runtime::{
-    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactSourceKind, InstalledRuntime,
-    RuntimeInstaller, RuntimeStoreError,
+    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactRequest, ArtifactSourceKind,
+    InstalledRuntime, RuntimeInstaller, RuntimeStoreError,
 };
 use bitarchive_domain::runtime::{
     ArtifactKind, ArtifactSource, LicenseIdentifier, RelativePath, RuntimeAttribution,
     RuntimeDefinition, RuntimeId, RuntimeParts, RuntimePlatform, RuntimeSource, RuntimeVersion,
     Sha256Digest,
 };
+
+mod core_acquisition;
 
 /// The executable path inside a modern macOS RetroArch build, as the official
 /// universal artifact lays it out.
@@ -147,7 +153,7 @@ impl TempRoot {
     fn new(label: &str) -> Self {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "bitarchive-b5-store-{label}-{}",
+            "bitarchive-store-test-{label}-{}",
             std::process::id()
         ));
 
@@ -211,7 +217,7 @@ impl FakeDownloader {
 impl ArtifactDownloader for FakeDownloader {
     fn download(
         &self,
-        definition: &RuntimeDefinition,
+        request: &ArtifactRequest,
         target: &Path,
     ) -> Result<Artifact, RuntimeStoreError> {
         // The real downloader creates the artifact directory; the fake does the
@@ -222,7 +228,7 @@ impl ArtifactDownloader for FakeDownloader {
 
         match self.outcome.borrow().clone() {
             FakeOutcome::Unreachable => Err(RuntimeStoreError::DownloadFailed {
-                url: definition.source().as_str().to_owned(),
+                url: request.source().as_str().to_owned(),
                 cause: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "the fake host is unreachable",
@@ -232,7 +238,7 @@ impl ArtifactDownloader for FakeDownloader {
                 fs::write(target, &bytes).expect("the fake writes its bytes");
 
                 Err(RuntimeStoreError::DigestMismatch {
-                    expected: definition.digest(),
+                    expected: request.digest(),
                     actual: Sha256Digest::from_bytes([0xff; 32]),
                 })
             }
@@ -240,7 +246,7 @@ impl ArtifactDownloader for FakeDownloader {
                 fs::write(target, &bytes).expect("the fake writes its bytes");
 
                 Ok(
-                    Artifact::new(target, definition.digest(), ArtifactSourceKind::Local)
+                    Artifact::new(target, request.digest(), ArtifactSourceKind::Local)
                         .with_size(bytes.len() as u64),
                 )
             }

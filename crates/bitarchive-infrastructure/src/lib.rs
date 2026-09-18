@@ -7,52 +7,56 @@
 //! ```text
 //! UI
 //!  ↓
-//! Application   ← declares ArtifactDownloader, ArtifactExtractor, RuntimeInstaller
-//!  ↓
-//! Domain        ← owns the pinned RuntimeDefinition
+//! Application   ← declares ArtifactDownloader, ArtifactExtractor,
+//!  ↓               CoreArchiveExtractor, RuntimeInstaller, CoreInstaller
+//! Domain        ← owns the pinned RuntimeDefinition and CoreDefinition
 //!
 //! Infrastructure ← this crate: HTTP, download, staging, installation
 //! Platform       ← the OS-specific bridges those adapters need
 //! ```
 //!
-//! What exists here is deliberately only the first infrastructure capability, the
-//! one managed runtime acquisition needs (Issue #19):
+//! What exists here is the infrastructure of managed component acquisition, for
+//! both component classes:
 //!
-//! - [`HttpArtifactDownloader`] — fetches the pinned artifact over HTTPS and
-//!   verifies its SHA-256 while it arrives
-//! - [`AppleDiskImageExtractor`] — dispatches unpacking by artifact kind and hands
-//!   a disk image to the platform layer
-//! - [`ComponentStore`] — stages, installs into the versioned component store, and
-//!   activates a runtime version
+//! - [`HttpArtifactDownloader`] — fetches a pinned artifact over HTTPS and verifies
+//!   its SHA-256 while it arrives. One implementation serves a runtime image and a
+//!   core archive alike, because the contract it implements names no component
+//!   class and carries no version, platform, or install layout
+//! - [`AppleDiskImageExtractor`] — unpacks a runtime disk image by handing it to
+//!   the platform layer
+//! - [`ZipCoreArchiveExtractor`] — writes the one pinned library out of a verified
+//!   core archive, and never unpacks an archive wholesale
+//! - [`ComponentStore`] — stages, installs, and activates a runtime version
+//! - [`CoreStore`] — stages, installs, and resolves a core build, and activates
+//!   nothing, because there is no active core
 //!
 //! ```text
-//! RuntimeDefinition
-//!       ↓
-//! ComponentStore::install
-//!       ├── HttpArtifactDownloader      download + verify
-//!       ├── AppleDiskImageExtractor     unpack (delegating to the platform layer)
-//!       ├── validate                    the pinned executable exists
-//!       ├── move into place             one rename
-//!       └── activate                    one atomic record write
-//!       ↓
-//! InstalledRuntime   →  executable_path()
+//! RuntimeDefinition → ComponentStore::install → InstalledRuntime → executable_path()
+//! CoreDefinition    → CoreStore::install      → ManagedCore      → library_path()
 //! ```
+//!
+//! The two flows share the download, the staging area, and the artifact cache, and
+//! nothing else. A runtime has an activation record; a core must never have one
+//! (ARCHITECTURE.md §23.1, invariant 21). A core is installed as an opaque file:
+//! nothing here opens, loads, or interprets a `.dylib`.
 //!
 //! # Boundary
 //!
 //! Dependencies point inwards (ARCHITECTURE.md §2.4). This crate depends on
-//! [`bitarchive_application`], [`bitarchive_domain`], and the two crates its
-//! transport and hashing need — `ureq` and `sha2`. It stays free of:
+//! [`bitarchive_application`], [`bitarchive_domain`], and the crates its transport,
+//! hashing, and archive reading need — `ureq`, `sha2`, and `zip`. It stays free of:
 //!
 //! - Slint
 //! - SQLite / rusqlite
 //! - Tokio and async runtimes
 //! - [`bitarchive_emulation`], and therefore of `RetroArchBackend`,
-//!   `RetroArchLaunchInput`, cores, and content
+//!   `RetroArchLaunchInput`, core semantics, and content
 //! - process creation, and therefore of any shell
 //!
 //! The last two matter: installing a runtime must not require knowing what
 //! RetroArch is beyond the [`RuntimeDefinition`](bitarchive_domain::runtime::RuntimeDefinition)
+//! it is handed, installing a core must not require knowing what libretro is
+//! beyond the [`CoreDefinition`](bitarchive_domain::managed_core::CoreDefinition)
 //! it is handed, and a download must never be a shell command.
 //!
 //! # What is not implemented yet
@@ -66,9 +70,8 @@
 //!   possible (ARCHITECTURE.md §23.3) but does not implement the operation
 //! - no version pruning. Which older versions are kept is an update-policy
 //!   decision for the Issue that implements updates
-//! - no core management of any kind. Cores are a separate component class with
-//!   their own identity and licensing (ARCHITECTURE.md §23.4, AGENTS.md §11), and
-//!   nothing here downloads, bundles, or installs one
+//! - no core catalog. Exactly one core is curated, and this crate can install
+//!   nothing that has no reviewed definition (Issue #21)
 //!
 //! [`bitarchive_emulation`]: https://docs.rs/bitarchive-emulation
 
@@ -78,10 +81,15 @@
 
 mod artifact_extract;
 mod component_store;
+mod core_archive;
+mod core_store;
 mod http_download;
+mod store_layout;
 
 pub use artifact_extract::AppleDiskImageExtractor;
 pub use component_store::ComponentStore;
+pub use core_archive::ZipCoreArchiveExtractor;
+pub use core_store::CoreStore;
 pub use http_download::{HttpArtifactDownloader, user_agent};
 
 #[cfg(test)]

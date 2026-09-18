@@ -80,7 +80,7 @@ Runtime und Cores sind getrennt versionierte Komponenten:
 - Die **Runtime** ist RetroArch selbst.
 - **Cores** sind libretro-Bibliotheken mit eigenen Versionen und eigenen Lizenzen.
 
-Ein RetroArch-Download enthält **nicht** automatisch die von BitArchive gewünschten Cores. Core-Bezug, Core-Auswahl und Lizenzprüfung sind ein eigener Bereich und werden in einem separaten Schritt umgesetzt.
+Ein RetroArch-Download enthält **nicht** automatisch die von BitArchive gewünschten Cores. Core-Bezug und Lizenzprüfung sind ein eigener Bereich; die erste Stufe davon ist implementiert (siehe unten). Die **Core-Auswahl** für ein Spiel bleibt davon getrennt und folgt weiterhin `Release > Game > System` ohne globalen Default.
 
 ### Stand der Runtime-Acquisition
 
@@ -100,9 +100,38 @@ Installation in den versionierten Component Store
 Auflösung des installierten RetroArch-Executables
 ```
 
-Der echte **Start eines Spiels** folgt erst nach dem Core Management: Die Launch-Kette kann heute eine bereits vorbereitete Eingabe in einen Prozessstart übersetzen, aber es wird noch kein Spiel aus dem Produkt-Flow gestartet, und es wird noch kein Core installiert.
+### Stand der Core-Acquisition
 
-Signierte Distribution-Manifeste sind noch nicht implementiert. Bis dahin ist der gepinnte SHA-256 der BitArchive-seitige Trust Anchor; Details stehen in [`docs/decisions/0001-managed-runtime-acquisition.md`](./docs/decisions/0001-managed-runtime-acquisition.md).
+Die erste Stufe der Core-Verwaltung ist ebenfalls implementiert. BitArchive kuratiert **genau einen** libretro-Core (mGBA) in einer reviewten Build-Identität und installiert ihn für die Architektur des Hosts:
+
+```text
+kuratierte Core-Definition / Allowlist (mgba, macos-arm64 | macos-x86_64)
+    ↓
+Auswahl des Host-Artefakts (keine Universal-Annahme)
+    ↓
+Download vom offiziellen Build-Host
+    ↓
+SHA-256-Verifikation (der Pin, kein TOFU)
+    ↓
+Extraktion genau des gepinnten Archiv-Members
+    ↓
+Installation als immutabler, plattform- und build-spezifischer Build
+    ↓
+Auflösung des Core-Library-Pfads
+```
+
+Wichtig für den Umgang mit dem Pin:
+
+- Der offizielle Host veröffentlicht macOS-Cores nur unter einem rollierenden `latest`-Pfad. `latest` ist deshalb **keine** Version und **keine** Build-Identität, sondern nur der Transportweg; die Identität sind Build-ID, Revision und der gepinnte SHA-256.
+- Wird ein Core upstream neu gebaut, passen die Bytes nicht mehr zum Pin. Die Installation wird dann **abgelehnt** (Digest-Mismatch); BitArchive übernimmt den neuen Digest nicht selbst. Ein Pin wird bewusst und reviewt angehoben.
+- Cores werden pro Architektur getrennt installiert; ein Intel-Build wird nie für Apple Silicon eingesetzt (und umgekehrt).
+- Es gibt **keine** Core-Aktivierung, keinen „aktuellen Core" und keinen globalen Core-Default. Mehrere Builds eines Cores liegen nebeneinander.
+
+Die Entscheidungen im Detail stehen in [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md).
+
+Der echte **Start eines Spiels** ist weiterhin nicht implementiert: Die Launch-Kette kann eine vorbereitete Eingabe in einen Prozessstart übersetzen, und Runtime wie Core sind als Komponenten installierbar, aber aus dem Produkt-Flow wird noch kein Spiel gestartet.
+
+Signierte Distribution-Manifeste sind noch nicht implementiert. Bis dahin ist der gepinnte SHA-256 der BitArchive-seitige Trust Anchor; Details stehen in [`docs/decisions/0001-managed-runtime-acquisition.md`](./docs/decisions/0001-managed-runtime-acquisition.md) und [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md).
 
 Für RetroArch-Konfigurationen ist folgende Priorität vorgesehen:
 
@@ -126,7 +155,7 @@ Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind do
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell, Core-Resolution-Policy und gepinnte Runtime-Definition), `bitarchive-application` (Launch-Verträge, Runtime-Acquisition-Ports und Orchestrierungsschicht), `bitarchive-infrastructure` (HTTP-Download, Verifikation, Staging und Component Store), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung, gepinnte RetroArch-Runtime und Auflösung des verwalteten Executables), `bitarchive-platform` (plattformspezifische Dienste: Prozessstart, App-Pfade und das Lesen des macOS-Disk-Images), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
+- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell, Core-Resolution-Policy, gepinnte Runtime-Definition und kuratierte Core-Definition), `bitarchive-application` (Launch-Verträge, Runtime- und Core-Acquisition-Ports und Orchestrierungsschicht), `bitarchive-infrastructure` (HTTP-Download, Verifikation, ZIP-Extraktion, Staging und Component Stores), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung, gepinnte RetroArch-Runtime und Auflösung des verwalteten Executables), `bitarchive-platform` (plattformspezifische Dienste: Prozessstart, App-Pfade und das Lesen des macOS-Disk-Images), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
 
@@ -134,7 +163,9 @@ Im Launch-Pfad existieren bisher die ersten Verträge und die ersten beiden konk
 
 Für die **RetroArch-Runtime** existiert die erste kontrollierte Management-Stufe: eine im Code gepinnte Runtime-Definition (Version, offizielle URL, SHA-256, Artefaktart, erwarteter Executable-Pfad sowie Upstream- und Lizenzmetadaten), ein HTTPS-Download ausschließlich vom offiziellen Host, eine SHA-256-Verifikation streaming während des Schreibens, ein versionierter Component Store (`components/runtime/<platform>/<version>/`), eine Aktivierungs-Registry, die ausschließlich auf installierte Versionen zeigen kann, und die Auflösung des konkreten RetroArch-Executable-Pfads. Ein Hash-Mismatch bricht die Installation ab und lässt die aktive Runtime unangetastet; bereits installierte Versionen sind immutable. Die Installation ist ein einzelner Rename innerhalb des Component Stores; ein finaler Versionspfad entsteht also nur als vollständige Installation, und ein fehlgeschlagener Move hinterlässt dort nichts. Kein Shell-Download, keine `latest`-Auflösung, kein beliebiger User-RetroArch-Pfad.
 
-Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, Core-Verwaltung (Download, Installation, Auswahl, Allowlist), RetroArch-Konfigurations- und Core-Options-Erzeugung, Firmware-Readiness, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization, Rollback sowie Runtime-Update-UI und Packaging.
+Für **Cores** existiert die erste kontrollierte Management-Stufe ebenfalls, bewusst auf genau einen kuratierten Core begrenzt: eine Allowlist mit einer reviewten mGBA-Definition (Komponenten-ID, libretro-Core-Name, Build-ID, Revision, Architektur, offizielle URL, gepinnter SHA-256, erwartetes Archiv-Member, Library-Pfad sowie Upstream- und Lizenzmetadaten), ein Download über dieselbe HTTP-Implementierung wie die Runtime, eine member-genaue ZIP-Extraktion (nur das gepinnte Member wird geschrieben; absolute Pfade, `..`, Verzeichnis- und Symlink-Einträge werden abgelehnt), ein plattform- und build-spezifischer Core Store (`components/cores/<component>/<platform>/<build>/`) mit einem einzelnen Rename als Installationsschritt und **ohne** jegliche Aktivierung. Ein Core, für den keine kuratierte Definition existiert, wird nicht installiert — es gibt keinen User-URL-, Core-Namen- oder Library-Pfad-Parameter. Vom offiziellen Build-Host stammt nur der rollierende `latest`-Pfad; Identität und Vertrauensanker sind Build-ID, Revision und der gepinnte SHA-256.
+
+Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, Core-Auswahl und Core-Katalog über den einen kuratierten Core hinaus, Core-Options, RetroArch-Konfigurationserzeugung, Firmware-Readiness, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization, Rollback sowie Runtime-Update-UI und Packaging.
 
 Weiteres wird als GitHub Issue geplant und umgesetzt.
 
@@ -248,11 +279,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 `Cargo.lock` wird bewusst versioniert, da BitArchive eine Anwendung ist.
 
-Die normalen Tests laden **kein** echtes RetroArch-Artefakt herunter. Sie verwenden Fake-Downloader, einen lokalen HTTP-Server auf der Loopback-Adresse und temporäre Component Roots. Die Tests, die ein echtes Disk-Image brauchen, sind `#[ignore]`d.
+Die normalen Tests laden **kein** echtes RetroArch-Artefakt und **keinen** echten Core herunter. Sie verwenden Fake-Downloader, einen lokalen HTTP-Server auf der Loopback-Adresse, selbst gebaute ZIP-Fixtures und temporäre Component Roots. Die Tests, die ein echtes Disk-Image brauchen, sind `#[ignore]`d.
 
 ### LIVE RUNTIME ACQUISITION (Developer, opt-in)
 
-Der einzige Befehl, der Netzwerkzugriffe ausführt, ist ein expliziter Developer-Befehl. Er lädt die gepinnte RetroArch-Runtime vom offiziellen Host, verifiziert sie gegen den gepinnten SHA-256, installiert sie in den Component Store, aktiviert sie und löst den Executable-Pfad auf:
+Der erste Befehl, der Netzwerkzugriffe ausführt, ist ein expliziter Developer-Befehl. Er lädt die gepinnte RetroArch-Runtime vom offiziellen Host, verifiziert sie gegen den gepinnten SHA-256, installiert sie in den Component Store, aktiviert sie und löst den Executable-Pfad auf:
 
 ```bash
 cargo run -p bitarchive-desktop -- acquire-retroarch-runtime --dry-run
@@ -264,10 +295,27 @@ cargo run -p bitarchive-desktop -- acquire-retroarch-runtime --root /tmp/bitarch
 - Der Befehl startet **kein** Spiel und installiert **keinen** Core.
 - CI führt ihn nicht aus; die normalen Tests hängen nicht davon ab.
 
+### LIVE CORE ACQUISITION (Developer, opt-in)
+
+Der zweite Developer-Befehl lädt den kuratierten Core (mGBA) für die Architektur des Hosts, verifiziert ihn gegen den gepinnten SHA-256, extrahiert genau das gepinnte Library-Member, installiert ihn als immutablen Build und löst den Library-Pfad auf:
+
+```bash
+cargo run -p bitarchive-desktop -- acquire-core --dry-run
+cargo run -p bitarchive-desktop -- acquire-core --root /tmp/bitarchive-core-check
+```
+
+- `--dry-run` zeigt die kuratierte Definition (inklusive Build-ID, Revision, Archiv-Member, Lizenz und Store-Pfad) und lädt nichts herunter.
+- `--root <dir>` richtet den gesamten Lauf auf ein Wegwerf-Verzeichnis.
+- Der Befehl akzeptiert **kein** Argument für Core, URL, Version oder Library-Pfad: was installiert wird, entscheidet allein die Allowlist.
+- Er startet **kein** Spiel, verändert **keine** Runtime und aktiviert **nichts** (es gibt keinen aktiven Core).
+- Schlägt die Verifikation fehl, weil der Host den Core neu gebaut hat, wird nichts installiert; der Pin muss dann reviewt angehoben werden (siehe [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md)).
+- CI führt ihn nicht aus; die normalen Tests hängen nicht davon ab.
+
 Wo die Daten liegen (macOS, siehe `ARCHITECTURE.md` §35):
 
 ```text
 ~/Library/Application Support/BitArchive/components/runtime/retroarch/macos-universal/<version>/
+~/Library/Application Support/BitArchive/components/cores/mgba/<platform>/<build-id>/mgba_libretro.dylib
 ```
 
 ## Beiträge

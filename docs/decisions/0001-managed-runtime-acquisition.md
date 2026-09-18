@@ -180,6 +180,11 @@ bundles, lists, or installs a core, and nothing assumes a RetroArch artifact
 contains one. Core distribution gets its own Issue with an explicit allowlist and
 a license review.
 
+**Follow-up:** that Issue is #21, and its decision is recorded in
+[ADR 0002](./0002-managed-core-acquisition.md). Cores reuse the download contract,
+the staging area, and the artifact cache this step introduced, and they add neither
+an activation record nor a shared installation pipeline.
+
 ## Consequences
 
 **Positive**

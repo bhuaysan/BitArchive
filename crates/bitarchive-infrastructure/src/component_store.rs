@@ -35,8 +35,12 @@
 //!     └── retroarch-1.22.2-macos-universal.dmg
 //! ```
 //!
-//! Cores get `runtime/`'s sibling `cores/<core-id>/<version>/` when their own
-//! Issue arrives. Nothing here assumes a core exists or creates a place for one.
+//! Cores are installed by [`CoreStore`](crate::CoreStore), which owns
+//! `runtime/`'s sibling `cores/<component-id>/<platform>/<build-id>/`. The two
+//! stores share the component root, the staging area, and the artifact cache —
+//! and nothing else: this type activates a version, and the core store has no
+//! activation at all (ARCHITECTURE.md §23.1, invariant 21). See
+//! [`store_layout`](crate::store_layout) for the shared vocabulary.
 //!
 //! # Immutability
 //!
@@ -64,28 +68,15 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use bitarchive_application::managed_runtime::{
-    Artifact, ArtifactDownloader, ArtifactExtractor, InstalledRuntime, RuntimeInstaller,
-    RuntimeStoreError,
+    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactRequest, InstalledRuntime,
+    RuntimeInstaller, RuntimeStoreError,
 };
 use bitarchive_domain::runtime::{RuntimeDefinition, RuntimeId, RuntimePlatform, RuntimeVersion};
 
-/// The directory below the component root that holds installed runtimes.
-const RUNTIME_DIRECTORY: &str = "runtime";
-
-/// The directory below the component root that holds transient staging state.
-const STAGING_DIRECTORY: &str = "staging";
-
-/// The directory below the component root that holds downloaded artifacts.
-const ARTIFACT_DIRECTORY: &str = "artifacts";
-
-/// The name of the record that says which version is active.
-const ACTIVE_RECORD: &str = "active";
-
-/// The prefix of a staging directory, so an abandoned one is recognisable.
-const STAGING_PREFIX: &str = "install-";
-
-/// The suffix of a record that is being replaced.
-const TEMPORARY_SUFFIX: &str = ".tmp";
+use crate::store_layout::{
+    ACTIVE_RECORD, ARTIFACT_DIRECTORY, PAYLOAD_DIRECTORY, RUNTIME_DIRECTORY, STAGING_DIRECTORY,
+    STAGING_PREFIX, TEMPORARY_SUFFIX, below, is_cross_device,
+};
 
 /// The versioned component store for managed runtime components.
 ///
@@ -202,46 +193,7 @@ where
     /// Returns [`RuntimeStoreError::UnreadableStore`] when the staging directory
     /// exists but cannot be listed.
     pub fn cleanup_staging(&self) -> Result<usize, RuntimeStoreError> {
-        let staging = self.staging_directory();
-
-        let entries = match fs::read_dir(&staging) {
-            Ok(entries) => entries,
-            Err(cause) if cause.kind() == ErrorKind::NotFound => return Ok(0),
-            Err(cause) => {
-                return Err(RuntimeStoreError::UnreadableStore {
-                    directory: staging,
-                    cause,
-                });
-            }
-        };
-
-        let mut removed = 0;
-
-        for entry in entries {
-            let entry = entry.map_err(|cause| RuntimeStoreError::UnreadableStore {
-                directory: staging.clone(),
-                cause,
-            })?;
-
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-
-            if !name.starts_with(STAGING_PREFIX) {
-                continue;
-            }
-
-            let path = entry.path();
-
-            if path.is_dir() {
-                fs::remove_dir_all(&path).map_err(|cause| {
-                    RuntimeStoreError::io("removing an abandoned staging directory", &path, cause)
-                })?;
-
-                removed += 1;
-            }
-        }
-
-        Ok(removed)
+        crate::store_layout::cleanup_staging(&self.staging_directory())
     }
 }
 
@@ -272,7 +224,7 @@ where
         }
 
         let staging = self.create_staging_directory(definition)?;
-        let staged_payload = staging.join("payload");
+        let staged_payload = staging.join(PAYLOAD_DIRECTORY);
 
         // From here on, every failure path removes the staging directory. The
         // active runtime is untouched by all of them, because it is only written
@@ -420,7 +372,14 @@ where
     ) -> Result<InstalledRuntime, RuntimeStoreError> {
         let artifact_target = self.artifact_path(definition);
 
-        let artifact = self.downloader.download(definition, &artifact_target)?;
+        // The download contract names no component class, so the runtime path
+        // builds the same request shape a core path does.
+        let request = ArtifactRequest::new(
+            definition.id().as_str(),
+            definition.source().clone(),
+            definition.digest(),
+        );
+        let artifact = self.downloader.download(&request, &artifact_target)?;
 
         // The downloaded artifact is verified by now, so it is safe to hand to the
         // extractor. It stays in the artifact directory as a rebuildable local
@@ -474,11 +433,7 @@ where
         definition: &RuntimeDefinition,
         staged_payload: &Path,
     ) -> Result<(), RuntimeStoreError> {
-        let mut expected = staged_payload.to_path_buf();
-
-        for component in definition.executable().components() {
-            expected.push(component);
-        }
+        let expected = below(staged_payload, definition.executable());
 
         let metadata = match fs::symlink_metadata(&expected) {
             Ok(metadata) => metadata,
@@ -678,10 +633,4 @@ impl ActiveRecord {
             executable: executable.ok_or_else(|| String::from("the record has no executable"))?,
         })
     }
-}
-
-/// Returns `true` when a rename failed because the two paths are on different
-/// filesystems.
-fn is_cross_device(cause: &std::io::Error) -> bool {
-    cause.raw_os_error() == Some(18) // EXDEV
 }

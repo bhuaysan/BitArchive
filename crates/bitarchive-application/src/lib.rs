@@ -26,11 +26,30 @@
 //! - [`managed_runtime`] — the ports and result types of managed runtime
 //!   acquisition: [`ArtifactDownloader`], [`ArtifactExtractor`],
 //!   [`DiskImageExtractor`], [`RuntimeInstaller`], and [`InstalledRuntime`]
+//! - [`managed_core`] — the ports and result types of curated core acquisition:
+//!   [`CoreArchiveExtractor`], [`CoreInstaller`], and [`ManagedCore`]
 //!
 //! Release resolution, content resolution, firmware readiness, configuration
-//! resolution, core options, process spawning, session management, and core
-//! management are not implemented yet (ARCHITECTURE.md §20, §21, §22, §23). This
-//! crate introduces no ports for them in advance.
+//! resolution, core options, process spawning, and session management are not
+//! implemented yet (ARCHITECTURE.md §20, §21, §22, §23). This crate introduces no
+//! ports for them in advance.
+//!
+//! # One download contract, two component classes
+//!
+//! Runtime and core artifacts are fetched the same way, so they share one contract
+//! instead of having one implementation each:
+//!
+//! ```text
+//! ArtifactRequest              ← component id + pinned source + pinned digest
+//!       ↓
+//! ArtifactDownloader           ← exactly one implementation, in infrastructure
+//!       ↑                    ↑
+//! RuntimeInstaller      CoreInstaller
+//! ```
+//!
+//! What the two classes do *not* share is anything that would erase what makes them
+//! different. A runtime has an activation record and a core must never have one, so
+//! the install contracts stay separate (Issue #21 §5, §12, §16).
 //!
 //! # Boundary
 //!
@@ -57,11 +76,19 @@
 //! it does not turn this crate into an adapter: no type here reads, writes, or
 //! starts anything.
 //!
-//! [`managed_runtime`] follows the same rule from the other side. It declares the
-//! *shapes* of downloading, unpacking, and installing because it owns the use
-//! case, and it carries the resulting paths back to its caller, but every
-//! operation is a trait method implemented by an outer layer. Declaring a port
-//! is not performing I/O.
+//! [`managed_runtime`] and [`managed_core`] follow the same rule from the other
+//! side. They declare the *shapes* of downloading, unpacking, and installing
+//! because the application layer owns the use cases, and they carry the resulting
+//! paths back to their caller, but every operation is a trait method implemented by
+//! an outer layer. Declaring a port is not performing I/O.
+
+//! # No "active core"
+//!
+//! [`managed_core`] has no activation concept at all. `ARCHITECTURE.md` §23.1
+//! records an active runtime; core selection is the policy in
+//! [`resolve_core`], which follows `Release > Game > System` with no global
+//! default (invariant 21). A stored "currently active core" would contradict that
+//! policy, so no type here can express one.
 //!
 //! [`PathBuf`]: std::path::PathBuf
 //! [`OsString`]: std::ffi::OsString
@@ -87,14 +114,18 @@
 
 mod launch;
 mod launch_readiness;
+pub mod managed_core;
 pub mod managed_runtime;
 mod prepared_launch;
 
 pub use launch::{LaunchAction, LaunchRequest};
 pub use launch_readiness::{LaunchReadiness, ReadinessIssue};
+pub use managed_core::{
+    CoreArchiveExtractor, CoreInstaller, CoreStoreError, ManagedCore, artifact_request,
+};
 pub use managed_runtime::{
-    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactSourceKind, DiskImageExtractor,
-    DownloadTimeout, InstalledRuntime, RuntimeInstaller, RuntimeStoreError,
+    Artifact, ArtifactDownloader, ArtifactExtractor, ArtifactRequest, ArtifactSourceKind,
+    DiskImageExtractor, DownloadTimeout, InstalledRuntime, RuntimeInstaller, RuntimeStoreError,
 };
 pub use prepared_launch::PreparedLaunch;
 

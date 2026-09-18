@@ -10,3 +10,4 @@ bitarchive-application = { path = "../bitarchive-application" }
 bitarchive-domain = { path = "../bitarchive-domain" }
 sha2 = { workspace = true }
 ureq = { workspace = true }
+zip = { workspace = true }
