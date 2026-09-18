@@ -1,7 +1,15 @@
 //! Downloading a pinned artifact over HTTPS and verifying it while it arrives.
 //!
-//! This is the concrete [`ArtifactDownloader`] of the managed runtime path
-//! (Issue #19). It implements a narrow, reviewable contract:
+//! This is the concrete [`ArtifactDownloader`] for **every** managed component —
+//! the RetroArch runtime (Issue #19) and curated libretro cores (Issue #21) alike.
+//! The contract is written against [`ArtifactRequest`], which names no component
+//! class, so there is exactly one HTTP path in BitArchive to review, audit, and
+//! later replace with the shared network layer of ARCHITECTURE.md §31. A
+//! `HttpCoreDownloader` next to this type would be a second copy of host checking,
+//! redirect refusal, streaming hashing, partial-file handling, and timeouts, and a
+//! second copy is a second place for the rules to drift.
+//!
+//! It implements a narrow, reviewable contract:
 //!
 //! 1. it downloads **only** from the host the pinned definition names, so a
 //!    mirror, a redirect to a third party, or a plaintext URL is refused before a
@@ -11,7 +19,7 @@
 //! 3. it removes everything it wrote when the digest does not match.
 //!
 //! ```text
-//! RuntimeDefinition        ← pinned: version, official URL, SHA-256
+//! ArtifactRequest          ← pinned: official URL, SHA-256, published name
 //!         ↓
 //! HTTP GET (https, pinned host, bounded timeouts)
 //!         ↓
@@ -57,17 +65,21 @@
 //!   manifests and that step is not implemented yet, so the pinned SHA-256 is the
 //!   trust anchor. Nothing is weakened in the meantime: there was no signature
 //!   check to weaken.
-//! - **No dynamic digest.** The expected digest is read from the definition and
-//!   never from a response header, a sidecar file, or the artifact's own claims.
+//! - **No dynamic digest.** The expected digest is read from the request and never
+//!   from a response header, a sidecar file, or the artifact's own claims. There is
+//!   therefore no code path that adopts a digest simply because a download
+//!   succeeded — not for the runtime, and not for a core whose upstream URL is
+//!   rolling.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use bitarchive_application::managed_runtime::{
-    Artifact, ArtifactDownloader, ArtifactSourceKind, DownloadTimeout, RuntimeStoreError,
+    Artifact, ArtifactDownloader, ArtifactRequest, ArtifactSourceKind, DownloadTimeout,
+    RuntimeStoreError,
 };
-use bitarchive_domain::runtime::{RuntimeDefinition, Sha256Digest};
+use bitarchive_domain::component::Sha256Digest;
 use sha2::{Digest, Sha256};
 use ureq::ResponseExt as _;
 
@@ -164,7 +176,7 @@ fn agent_for(timeout: DownloadTimeout) -> ureq::Agent {
 impl ArtifactDownloader for HttpArtifactDownloader {
     fn download(
         &self,
-        definition: &RuntimeDefinition,
+        request: &ArtifactRequest,
         target: &Path,
     ) -> Result<Artifact, RuntimeStoreError> {
         if let Some(parent) = target.parent() {
@@ -175,7 +187,7 @@ impl ArtifactDownloader for HttpArtifactDownloader {
 
         let partial = partial_path(target);
 
-        match self.fetch_verified(definition, &partial) {
+        match self.fetch_verified(request, &partial) {
             Ok(size) => {
                 // The verified bytes only become the artifact once they are in
                 // their final place, so an interrupted run never leaves a file
@@ -187,7 +199,7 @@ impl ArtifactDownloader for HttpArtifactDownloader {
                 })?;
 
                 Ok(
-                    Artifact::new(target, definition.digest(), ArtifactSourceKind::Network)
+                    Artifact::new(target, request.digest(), ArtifactSourceKind::Network)
                         .with_size(size),
                 )
             }
@@ -209,10 +221,10 @@ impl HttpArtifactDownloader {
     /// Returns the number of bytes written on success.
     fn fetch_verified(
         &self,
-        definition: &RuntimeDefinition,
+        request: &ArtifactRequest,
         partial: &Path,
     ) -> Result<u64, RuntimeStoreError> {
-        let url = definition.source().as_str();
+        let url = request.source().as_str();
 
         let mut response = self
             .agent
@@ -308,7 +320,7 @@ impl HttpArtifactDownloader {
         }
 
         let actual = Sha256Digest::from_bytes(hasher.finalize().into());
-        let expected = definition.digest();
+        let expected = request.digest();
 
         if actual != expected {
             return Err(RuntimeStoreError::DigestMismatch { expected, actual });
@@ -355,24 +367,21 @@ fn partial_path(target: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use bitarchive_domain::runtime::RuntimeParts;
-
     use std::net::TcpListener;
-    use std::str::FromStr;
     use std::thread;
 
-    use bitarchive_domain::runtime::{
-        ArtifactKind, LicenseIdentifier, LoopbackSource, RelativePath, RuntimeAttribution,
-        RuntimeId, RuntimePlatform, RuntimeSource, RuntimeVersion,
-    };
+    use bitarchive_domain::component::{ComponentArtifactSource, LoopbackSource};
 
     use super::*;
 
     /// The bytes the loopback server serves as the artifact fixture.
-    const FIXTURE: &[u8] = b"BitArchive runtime artifact fixture";
+    const FIXTURE: &[u8] = b"BitArchive component artifact fixture";
 
     /// The path the loopback server answers.
     const FIXTURE_PATH: &str = "/stable/1.22.2/fixture.dmg";
+
+    /// The path a loopback server answers a *core* artifact under.
+    const CORE_FIXTURE_PATH: &str = "/nightly/apple/osx/arm64/latest/mgba_libretro.dylib.zip";
 
     /// Returns the SHA-256 of the fixture.
     fn fixture_digest() -> Sha256Digest {
@@ -424,41 +433,36 @@ mod tests {
             Self { port }
         }
 
-        /// Returns a definition whose source points at this server.
-        fn definition_for(&self, digest: Sha256Digest) -> RuntimeDefinition {
-            definition(
-                RuntimeSource::from(
+        /// Returns a request whose source points at this server.
+        fn request_for(&self, digest: Sha256Digest) -> ArtifactRequest {
+            request(
+                ComponentArtifactSource::from(
                     LoopbackSource::new(self.port, FIXTURE_PATH).expect("a valid loopback source"),
                 ),
                 digest,
             )
         }
+
+        /// Returns a *core-shaped* request whose source points at this server.
+        ///
+        /// The artifact describes a libretro core archive rather than a disk image,
+        /// which is the point: the same downloader serves both component classes.
+        fn core_request_for(&self, digest: Sha256Digest) -> ArtifactRequest {
+            ArtifactRequest::new(
+                "mgba",
+                ComponentArtifactSource::from(
+                    LoopbackSource::new(self.port, CORE_FIXTURE_PATH)
+                        .expect("a valid loopback source"),
+                ),
+                digest,
+            )
+            .with_expected_file_name("mgba_libretro.dylib.zip")
+        }
     }
 
-    /// Builds the artifact definition used by these tests.
-    fn definition(source: RuntimeSource, digest: Sha256Digest) -> RuntimeDefinition {
-        RuntimeDefinition::new(RuntimeParts {
-            identity: (
-                RuntimeId::from_str(RuntimeId::RETROARCH).expect("a valid identity"),
-                RuntimeVersion::from_str("1.22.2").expect("a valid version"),
-                RuntimePlatform::MacOsUniversal,
-            ),
-            artifact: (source, digest),
-            layout: (
-                ArtifactKind::AppleDiskImage {
-                    bundle: String::from("RetroArch.app"),
-                },
-                RelativePath::from_str("RetroArch.app/Contents/MacOS/RetroArch")
-                    .expect("a valid relative path"),
-            ),
-            attribution: RuntimeAttribution {
-                component: String::from("RetroArch"),
-                upstream_project: String::from("libretro/RetroArch"),
-                upstream_url: String::from("https://github.com/libretro/RetroArch"),
-                license: LicenseIdentifier::from_str(LicenseIdentifier::GPL_3_0_OR_LATER)
-                    .expect("a valid license identifier"),
-            },
-        })
+    /// Builds the artifact request used by these tests.
+    fn request(source: ComponentArtifactSource, digest: Sha256Digest) -> ArtifactRequest {
+        ArtifactRequest::new("retroarch", source, digest)
     }
 
     /// Assembles a minimal HTTP/1.1 response with a body.
@@ -500,25 +504,86 @@ mod tests {
         }
     }
 
-    /// The pinned host is the only host a production definition can name, and it
-    /// must be reached over https.
+    /// The pinned host is the only host a production component can name, and it
+    /// must be reached over https. The rule is a property of the shared source
+    /// type, so it holds for a core artifact exactly as for a runtime artifact.
     #[test]
     fn a_mirror_cannot_become_a_production_source() {
-        use bitarchive_domain::runtime::ArtifactSource;
+        use bitarchive_domain::component::{ArtifactSource, SourceError};
 
         assert_eq!(
             ArtifactSource::new("https://mirror.invalid/a.dmg"),
-            Err(bitarchive_domain::runtime::SourceError::UnexpectedHost)
+            Err(SourceError::UnexpectedHost)
         );
         assert_eq!(
             ArtifactSource::new("http://buildbot.libretro.com/a.dmg"),
-            Err(bitarchive_domain::runtime::SourceError::NotHttps)
+            Err(SourceError::NotHttps)
+        );
+        assert_eq!(
+            ArtifactSource::new("https://mirror.invalid/nightly/apple/osx/arm64/latest/a.zip"),
+            Err(SourceError::UnexpectedHost)
         );
 
         let official = ArtifactSource::new("https://buildbot.libretro.com/stable/1.22.2/a.dmg")
             .expect("the official source is valid");
 
-        assert!(RuntimeSource::official(official).is_official());
+        assert!(ComponentArtifactSource::official(official).is_official());
+    }
+
+    /// The same downloader verifies a core artifact against its pin, so a core
+    /// acquisition cannot pass through a second, less reviewed code path.
+    #[test]
+    fn a_core_artifact_is_downloaded_and_verified_by_the_same_downloader() {
+        let root = TempRoot::new("core-accepted");
+        let target = root.join("artifacts/mgba_libretro.dylib.zip");
+        let server = LoopbackServer::answering(response("200 OK", FIXTURE));
+        let downloader = HttpArtifactDownloader::new();
+
+        let request = server.core_request_for(fixture_digest());
+
+        assert_eq!(request.component(), "mgba");
+        assert_eq!(
+            request.expected_file_name(),
+            Some("mgba_libretro.dylib.zip")
+        );
+        assert!(request.published_name_matches_url());
+
+        let artifact = downloader
+            .download(&request, &target)
+            .expect("the fixture matches its pinned digest");
+
+        assert_eq!(artifact.digest(), fixture_digest());
+        assert_eq!(artifact.source(), ArtifactSourceKind::Network);
+        assert_eq!(
+            std::fs::read(&target).expect("the artifact exists"),
+            FIXTURE
+        );
+    }
+
+    /// A core download whose bytes do not match the pin is rejected and leaves
+    /// nothing behind — a rolling upstream URL is therefore *not* a way for new
+    /// bytes to become trusted.
+    #[test]
+    fn a_core_download_whose_digest_moved_is_rejected_without_adopting_it() {
+        let root = TempRoot::new("core-mismatch");
+        let target = root.join("artifacts/mgba_libretro.dylib.zip");
+        let server = LoopbackServer::answering(response("200 OK", b"a newer nightly build"));
+        let downloader = HttpArtifactDownloader::new();
+
+        let error = downloader
+            .download(&server.core_request_for(fixture_digest()), &target)
+            .expect_err("bytes the pin does not describe must be refused");
+
+        match error {
+            RuntimeStoreError::DigestMismatch { expected, actual } => {
+                assert_eq!(expected, fixture_digest());
+                assert_ne!(actual, expected, "the moved digest was not adopted");
+            }
+            other => panic!("expected a digest mismatch, got {other}"),
+        }
+
+        assert!(!target.exists());
+        assert!(!partial_path(&target).exists());
     }
 
     /// A `.part` file is used while a download is assembled, so an interrupted
@@ -552,7 +617,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let artifact = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect("the fixture matches its pinned digest");
 
         assert_eq!(artifact.digest(), fixture_digest());
@@ -578,7 +643,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let error = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect_err("the bytes do not match the pinned digest");
 
         match error {
@@ -606,7 +671,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let error = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect_err("a 404 is not an artifact");
 
         assert!(matches!(error, RuntimeStoreError::DownloadFailed { .. }));
@@ -647,7 +712,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let error = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect_err("a redirect is not an artifact");
 
         assert!(matches!(error, RuntimeStoreError::DownloadFailed { .. }));
@@ -666,7 +731,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let error = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect_err("a dropped connection is not an artifact");
 
         assert!(matches!(error, RuntimeStoreError::DownloadFailed { .. }));
@@ -684,7 +749,7 @@ mod tests {
         let downloader = HttpArtifactDownloader::new();
 
         let error = downloader
-            .download(&server.definition_for(fixture_digest()), &target)
+            .download(&server.request_for(fixture_digest()), &target)
             .expect_err("an empty body is not an artifact");
 
         assert!(matches!(error, RuntimeStoreError::DownloadFailed { .. }));

@@ -32,8 +32,18 @@ uuid = { version = "1.26.1", features = ["v7"] }
 # the RustCrypto implementation; only SHA-256 is used, and hashing is streaming
 # so a large artifact is never held in memory.
 sha2 = "0.10.9"
-# The HTTP transport of the managed runtime acquisition path (Issue #19). See
-# `crates/bitarchive-infrastructure/src/http_download.rs` for why this step uses
-# a synchronous, narrowly scoped client and not yet the shared async network
-# layer of ARCHITECTURE.md §31.
+# The HTTP transport of the managed component acquisition paths (Issues #19 and
+# #21). See `crates/bitarchive-infrastructure/src/http_download.rs` for why this
+# step uses a synchronous, narrowly scoped client and not yet the shared async
+# network layer of ARCHITECTURE.md §31.
 ureq = "3.4.2"
+# Reading the ZIP archive an official libretro core is published as (Issue #21).
+# The test suite also writes DEFLATE fixtures with it, so the extraction rules can
+# be tested against archives that are deliberately malformed.
+#
+# `default-features = false` and one feature on purpose: the default set pulls in
+# bzip2, deflate64, lzma, ppmd, zstd, xz, AES, and time handling, none of which the
+# official libretro build host uses for a core archive — it publishes one DEFLATE
+# member. Only DEFLATE is enabled, and only through the pure-Rust `zlib-rs` backend,
+# so no C toolchain and no system zlib becomes a build requirement.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -45,7 +45,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bitarchive_domain::runtime::{RuntimeDefinition, RuntimeId, RuntimeVersion, Sha256Digest};
+use bitarchive_domain::component::Sha256Digest;
+use bitarchive_domain::runtime::{RuntimeDefinition, RuntimeId, RuntimeVersion};
 
 /// One verified artifact, on local disk.
 ///
@@ -141,25 +142,151 @@ pub enum ArtifactSourceKind {
     Local,
 }
 
-/// Fetches the artifact of a pinned definition and verifies it while doing so.
+/// One pinned artifact to fetch, described without naming a component class.
+///
+/// This is the value the download contract is written against, and it is the whole
+/// of the reuse between runtime and core acquisition: a runtime artifact, a core
+/// artifact, and a later bundled artifact all fetch the same way — one official
+/// `https` URL, one pinned SHA-256, one published file name — so there is exactly
+/// one downloader implementation and not one per component class.
+///
+/// The request deliberately carries **no** version, platform, install layout, or
+/// component identity. Those belong to the definition that produced the request and
+/// are none of the downloader's business; a downloader that knew them would start
+/// making installation decisions.
+///
+/// ```
+/// use bitarchive_application::managed_runtime::ArtifactRequest;
+/// use bitarchive_domain::component::{ArtifactSource, ComponentArtifactSource};
+///
+/// let request = ArtifactRequest::new(
+///     "mgba",
+///     ComponentArtifactSource::official(
+///         ArtifactSource::new(
+///             "https://buildbot.libretro.com/nightly/apple/osx/arm64/latest/\
+///              mgba_libretro.dylib.zip",
+///         )
+///         .unwrap(),
+///     ),
+///     "1aa000e5a88c2ea2afb788cdee89853f86d1c8639fc0df5d2ed6f261c2d81462"
+///         .parse()
+///         .unwrap(),
+/// )
+/// .with_expected_file_name("mgba_libretro.dylib.zip");
+///
+/// assert_eq!(request.host(), "buildbot.libretro.com");
+/// ```
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ArtifactRequest {
+    component: String,
+    source: bitarchive_domain::component::ComponentArtifactSource,
+    digest: Sha256Digest,
+    expected_file_name: Option<String>,
+}
+
+impl ArtifactRequest {
+    /// Describes the artifact of `component`, pinned to `source` and `digest`.
+    #[must_use]
+    pub fn new(
+        component: impl Into<String>,
+        source: bitarchive_domain::component::ComponentArtifactSource,
+        digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            component: component.into(),
+            source,
+            digest,
+            expected_file_name: None,
+        }
+    }
+
+    /// Records the file name the artifact is published under.
+    ///
+    /// The name is a cross-check for a diagnostic: if the pinned URL ends in a
+    /// different name than the definition records, the definition is stale. It is
+    /// never used to build a local path — the store decides that from the
+    /// definition.
+    #[must_use]
+    pub fn with_expected_file_name(mut self, file_name: impl Into<String>) -> Self {
+        self.expected_file_name = Some(file_name.into());
+
+        self
+    }
+
+    /// Returns the component the artifact belongs to, for diagnostics.
+    #[must_use]
+    pub fn component(&self) -> &str {
+        &self.component
+    }
+
+    /// Returns the pinned official URL the artifact is downloaded from.
+    #[must_use]
+    pub const fn source(&self) -> &bitarchive_domain::component::ComponentArtifactSource {
+        &self.source
+    }
+
+    /// Returns the SHA-256 the downloaded bytes must have.
+    #[must_use]
+    pub const fn digest(&self) -> Sha256Digest {
+        self.digest
+    }
+
+    /// Returns the host the artifact is downloaded from.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        self.source.host()
+    }
+
+    /// Returns the file name the artifact is published under, if it is recorded.
+    #[must_use]
+    pub fn expected_file_name(&self) -> Option<&str> {
+        self.expected_file_name.as_deref()
+    }
+
+    /// Returns the file name the pinned URL itself ends in, if it names one.
+    #[must_use]
+    pub fn url_file_name(&self) -> Option<&str> {
+        self.source.file_name()
+    }
+
+    /// Returns `true` when the recorded published name matches the URL.
+    ///
+    /// A definition that records a name its URL does not end in is internally
+    /// inconsistent, and this is what lets a store notice instead of downloading
+    /// something the pin does not describe.
+    #[must_use]
+    pub fn published_name_matches_url(&self) -> bool {
+        match (self.expected_file_name.as_deref(), self.url_file_name()) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+}
+
+/// Fetches the artifact of a pinned request and verifies it while doing so.
 ///
 /// # Contract
 ///
 /// An implementation must:
 ///
-/// 1. download only from [`RuntimeDefinition::source`], and only from the
-///    official host that source is pinned to;
+/// 1. download only from [`ArtifactRequest::source`], and only from the official
+///    host that source is pinned to;
 /// 2. compute the SHA-256 of the bytes **as they are written**, so no window
 ///    exists in which unverified bytes are treated as verified;
 /// 3. return [`Err`] when the computed digest differs from
-///    [`RuntimeDefinition::digest`], removing whatever it wrote;
+///    [`ArtifactRequest::digest`], removing whatever it wrote;
 /// 4. never overwrite the target path of a previous successful result.
 ///
-/// The expected digest is read from the definition and never from the response
-/// that delivered the artifact: a download that succeeded is not a download that
-/// is trusted (Issue #19, ARCHITECTURE.md §11).
+/// The expected digest is read from the request and never from the response that
+/// delivered the artifact: a download that succeeded is not a download that is
+/// trusted (ARCHITECTURE.md §11).
+///
+/// The contract names no component class, so one implementation serves a runtime
+/// artifact and a core artifact alike and there is no second HTTP path to review
+/// (Issue #21 §12).
 pub trait ArtifactDownloader {
-    /// Downloads `definition`'s artifact into `target` and verifies it.
+    /// Downloads `request`'s artifact into `target` and verifies it.
     ///
     /// `target` is a file path that does not exist yet; the parent directory is
     /// created if needed. On failure nothing of the artifact may remain at
@@ -172,7 +299,7 @@ pub trait ArtifactDownloader {
     /// downloaded bytes do not match the pinned digest.
     fn download(
         &self,
-        definition: &RuntimeDefinition,
+        request: &ArtifactRequest,
         target: &std::path::Path,
     ) -> Result<Artifact, RuntimeStoreError>;
 }
@@ -656,6 +783,20 @@ impl DownloadTimeout {
         Self {
             overall: Duration::from_secs(30 * 60),
             idle: Duration::from_secs(60),
+        }
+    }
+
+    /// Returns the timeout used for a managed core artifact.
+    ///
+    /// A libretro core archive is a few hundred *kilobytes* — smaller than the
+    /// runtime image by three orders of magnitude — so the overall budget is much
+    /// tighter. A download that has not finished in minutes is a problem, and a
+    /// caller should learn that rather than wait half an hour.
+    #[must_use]
+    pub const fn core_artifact() -> Self {
+        Self {
+            overall: Duration::from_secs(5 * 60),
+            idle: Duration::from_secs(30),
         }
     }
 }

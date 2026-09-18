@@ -8,10 +8,11 @@ publish = false
 # The composition root is the only place that knows every concrete
 # implementation (ARCHITECTURE.md §5.7). The launch UI still reaches the
 # presentation layer only; the additional crates exist for the opt-in developer
-# runtime acquisition command, which is the first flow that needs the whole
-# managed runtime path.
+# acquisition commands, which are the flows that need the whole managed component
+# path: the RetroArch runtime path and the curated core path.
 [dependencies]
 bitarchive-application = { path = "../../crates/bitarchive-application" }
+bitarchive-domain = { path = "../../crates/bitarchive-domain" }
 bitarchive-emulation = { path = "../../crates/bitarchive-emulation" }
 bitarchive-infrastructure = { path = "../../crates/bitarchive-infrastructure" }
 bitarchive-platform = { path = "../../crates/bitarchive-platform" }
