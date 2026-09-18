@@ -211,9 +211,16 @@ RetroArch-specific is needed above `CoreInstaller::resolve`.
   options. Each is a later Issue with its own license review.
 - The artifact archive is kept in the store's `artifacts/` directory after a
   successful install. It is rebuildable and never authoritative.
-- Duplicate member names are collapsed by the archive reader, so the extractor's
-  refusal of an ambiguous archive cannot currently be triggered by input; the rule
-  stays in place because it belongs to the extractor, not to the archive library.
+- Duplicate member names are counted and refused by the extractor, but the refusal is
+  not reachable through the current read backend: `ZipWriter` refuses to create one
+  name twice through its normal API, while an externally produced or carelessly
+  rewritten archive can carry two directory records with the same name — and the
+  `zip` reader binds a name to a single entry while it parses, so the second record
+  overwrites the first and the extractor's count sees one. The rule stays in place
+  because it belongs to the extractor's contract rather than to the archive library,
+  and the duplicate-name test in `bitarchive-infrastructure` proves both the fixture
+  that contains the name twice and the reader's collapse, so a backend that stopped
+  collapsing would fail the test instead of silently changing what is installed.
 
 ## Alternatives considered
 

@@ -16,6 +16,24 @@
 //! the staged library
 //! ```
 //!
+//! # Duplicate member names are counted, and the count is a contract
+//!
+//! `ZipWriter` refuses to create one name twice through its normal API, but that is a
+//! property of that writer and not of the format: an externally produced or
+//! carelessly rewritten archive can carry two directory records with one name. This
+//! extractor therefore counts the entries that match the pinned member and refuses an
+//! archive that carries it more than once, because which of two candidates should
+//! become the installed library is not a decision an archive may make.
+//!
+//! The count is also what makes the rule independent of the read backend. The `zip`
+//! reader this adapter uses binds a member name to one entry while it parses the
+//! archive — a duplicate record overwrites its predecessor in the reader's index — so
+//! the refusal is currently not reachable through the reader's API. It stays in place
+//! as the extractor's own rule, and the duplicate-name test in
+//! `tests::core_acquisition` pins both halves of that statement: the fixture really
+//! carries the name twice, and the reader really does collapse it before the count is
+//! reached.
+//!
 //! # The archive never decides a destination
 //!
 //! Nothing here unpacks "everything into a directory". The destination is derived
@@ -130,12 +148,18 @@ impl ZipCoreArchiveExtractor {
         let mut matching = None;
         let mut found = Vec::with_capacity(archive.len());
 
-        // The reader keys its entries by raw name, so an archive that carried the
-        // same name twice arrives here as *one* entry: `zip` resolves that ambiguity
-        // itself, and which of the two survives is its decision and not this code's.
-        // The count therefore stays in place as the extractor's own rule — an
-        // ambiguous archive is refused rather than resolved — even though the
-        // current backend cannot deliver that input.
+        // The reader keys its entry index by raw file name, and the index is built
+        // while the archive is parsed: a second directory record with the same name
+        // *overwrites* the first, so an archive that carried the name twice arrives
+        // here as one entry, and `by_index` can only hand out the survivor. Which of
+        // the two survives is the reader's decision, not this code's.
+        //
+        // The count is therefore the extractor's own rule rather than a rule the
+        // backend can deliver input for: an ambiguous archive is refused instead of
+        // resolved, whatever the reader did with it. That the current backend
+        // collapses such an archive before this loop runs is asserted by the
+        // duplicate-name test in `tests::core_acquisition`, which fails if that ever
+        // stops being true.
         for index in 0..archive.len() {
             let entry = archive
                 .by_index(index)

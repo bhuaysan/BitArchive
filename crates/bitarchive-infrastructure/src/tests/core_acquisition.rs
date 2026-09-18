@@ -32,7 +32,7 @@ use bitarchive_domain::managed_core::{
 };
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::{FakeDownloader, TempRoot};
 use crate::core_archive::ZipCoreArchiveExtractor;
@@ -104,6 +104,209 @@ fn zip_with(build: impl FnOnce(&mut ZipWriter<Cursor<Vec<u8>>>)) -> Vec<u8> {
 /// The entry options of a fixture member: DEFLATE, as the build host uses.
 fn options() -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
+}
+
+/// The four-byte signature that opens a ZIP central directory record.
+const CENTRAL_DIRECTORY_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+
+/// The four-byte signature that opens the ZIP end-of-central-directory record.
+const END_OF_CENTRAL_DIRECTORY_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+
+/// Where the central directory size and offset sit in that record.
+const DIRECTORY_SIZE_AT: usize = 12;
+const DIRECTORY_OFFSET_AT: usize = 16;
+
+/// Where the entry counts sit in that record, on this disk and in total.
+const ENTRIES_ON_DISK_AT: usize = 8;
+const ENTRIES_TOTAL_AT: usize = 10;
+
+/// Where a central directory record stores the offset of its local entry.
+const LOCAL_OFFSET_AT: usize = 42;
+
+/// Finds the one occurrence of `signature` in `bytes`.
+fn find_signature(bytes: &[u8], signature: [u8; 4]) -> usize {
+    let mut found = bytes
+        .windows(signature.len())
+        .enumerate()
+        .filter(|(_, window)| *window == signature)
+        .map(|(at, _)| at);
+
+    let at = found
+        .next()
+        .unwrap_or_else(|| panic!("the fixture must contain {signature:02x?}, but does not"));
+
+    assert!(
+        found.next().is_none(),
+        "the fixture must contain {signature:02x?} exactly once"
+    );
+
+    at
+}
+
+/// Reads the little-endian `u32` at `at`.
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[at..at + 4]
+            .try_into()
+            .expect("a four-byte field is in bounds"),
+    )
+}
+
+/// Builds the fixture `member` occurs twice in, with different content each time.
+///
+/// A ZIP archive is a sequence of local entries followed by a central directory that
+/// indexes them, and a *duplicate name* is a property of the directory alone. That is
+/// why the reference writer cannot produce this input: `ZipWriter` keeps the member
+/// set of the archive it is writing and refuses to hand out one name twice. So each
+/// entry is written into its own complete little archive instead — where it is
+/// unambiguous — and the fixture is assembled from those two files the way the format
+/// defines the layout:
+///
+/// ```text
+/// [ local file header + data of entry 1 ]   ← the first archive's file section
+/// [ local file header + data of entry 2 ]   ← the second archive's file section
+/// [ central directory of both, patched ]    ← entry 2's offset shifted by entry 1's size
+/// [ end of central directory, patched ]     ← the offset, size, and count of that directory
+/// ```
+///
+/// Every part is bytes the writer produced, so both entries stay ordinary DEFLATE
+/// entries with correct local headers, sizes, and CRC-32 values: it is the archive the
+/// build host publishes, with one entry appended and both names landing in the same
+/// directory. Nothing is invented by hand and no byte inside an entry is rewritten.
+///
+/// The directory is located by its signature rather than by arithmetic on the file
+/// length, so a writer that adds another record cannot silently shift the assembly.
+/// [`assert_the_reader_collapses_duplicate_names`] then checks what the reader makes
+/// of the result, so a fixture that cannot be read back is reported as the broken
+/// fixture it is rather than as a passing test.
+fn zip_with_duplicate_member(member: &str, first: &[u8], second: &[u8]) -> Vec<u8> {
+    // Two complete archives, each with exactly one entry.
+    let one = zip_of(&[(member, first)]);
+    let two = zip_of(&[(member, second)]);
+
+    // Each archive's file section, its one directory record, and the end record: all
+    // read off the bytes the writer produced, which is why the entries themselves are
+    // never touched.
+    let one_directory_at = find_signature(&one, CENTRAL_DIRECTORY_SIGNATURE);
+    let two_directory_at = find_signature(&two, CENTRAL_DIRECTORY_SIGNATURE);
+    let one_end_at = find_signature(&one, END_OF_CENTRAL_DIRECTORY_SIGNATURE);
+    let two_end_at = find_signature(&two, END_OF_CENTRAL_DIRECTORY_SIGNATURE);
+
+    let directory_size = one_end_at - one_directory_at;
+
+    assert_eq!(
+        two_end_at - two_directory_at,
+        directory_size,
+        "both fixture archives must carry one directory record of the same size"
+    );
+    assert_eq!(
+        u32_at(&one, one_end_at + DIRECTORY_SIZE_AT) as usize,
+        directory_size,
+        "the located directory must be the one the end record describes"
+    );
+    assert_eq!(
+        u32_at(&one, one_end_at + DIRECTORY_OFFSET_AT) as usize,
+        one_directory_at,
+        "the located directory must start where the end record says"
+    );
+
+    // The two local entries, back to back. The second one now starts one entry later
+    // than it did in its own archive, which is the only offset that moves.
+    let mut combined = one[..one_directory_at].to_vec();
+    combined.extend_from_slice(&two[..two_directory_at]);
+
+    // The first archive's record is already relative to the start of the file and
+    // stays valid. The second archive's entry moved, so its record is shifted.
+    let mut second_record = two[two_directory_at..two_end_at].to_vec();
+    let shifted = u32_at(&second_record, LOCAL_OFFSET_AT) as usize + one_directory_at;
+
+    second_record[LOCAL_OFFSET_AT..LOCAL_OFFSET_AT + 4]
+        .copy_from_slice(&(shifted as u32).to_le_bytes());
+
+    let mut directory = one[one_directory_at..one_end_at].to_vec();
+    directory.extend_from_slice(&second_record);
+
+    let directory_start = combined.len();
+    combined.extend_from_slice(&directory);
+
+    // ...and the end record, which now describes the combined directory and names it as
+    // the one on this disk.
+    let mut end = one[one_end_at..].to_vec();
+    let size = (directory_size * 2) as u32;
+
+    end[ENTRIES_ON_DISK_AT..ENTRIES_ON_DISK_AT + 2].copy_from_slice(&2_u16.to_le_bytes());
+    end[ENTRIES_TOTAL_AT..ENTRIES_TOTAL_AT + 2].copy_from_slice(&2_u16.to_le_bytes());
+    end[DIRECTORY_SIZE_AT..DIRECTORY_SIZE_AT + 4].copy_from_slice(&size.to_le_bytes());
+    end[DIRECTORY_OFFSET_AT..DIRECTORY_OFFSET_AT + 4]
+        .copy_from_slice(&(directory_start as u32).to_le_bytes());
+    combined.extend_from_slice(&end);
+
+    combined
+}
+
+/// Asserts what the reader does with `archive`, a ZIP file whose central directory
+/// names `member` twice.
+///
+/// Two facts are asserted here, and both are properties of the `zip` crate that the
+/// extractor inherits — not of this test:
+///
+/// 1. the file *is* an archive the reader accepts, and its one visible entry is named
+///    `member`, so the fixture is not a byte sequence that merely fails to parse;
+/// 2. the reader **collapses** the two records into one entry: `len` is 1, not 2, and
+///    the surviving entry is the *last* one in the directory, which is the one whose
+///    content comes back. `ZipArchive` builds its index as
+///    `IndexMap<raw name, entry>`, so the second record overwrites the first before
+///    any accessor runs. That is why `by_index` — which does address entries by
+///    index — can still never hand out two entries with one name.
+///
+/// Reading the entry to the end is what makes the fixture meaningful: the `zip` crate
+/// checks a DEFLATE entry's CRC-32 while it streams, so an assembly that damaged the
+/// appended entry would surface here as an error rather than as a clean entry, and a
+/// mis-patched local offset would surface as the wrong content.
+///
+/// The collapse is asserted rather than assumed, because it is the fact the whole
+/// duplicate-member question turns on. It is a property of the `zip` release this
+/// workspace pins, not of the format: a release that stopped collapsing would fail
+/// this test, which is exactly when the extractor's own duplicate rule would become
+/// reachable and the expectation would have to be revisited deliberately.
+fn assert_the_reader_collapses_duplicate_names(archive: &[u8], member: &str, last: &[u8]) {
+    let mut reader = ZipArchive::new(Cursor::new(archive.to_vec()))
+        .expect("the duplicate-name fixture is a readable archive");
+
+    let mut content = Vec::new();
+    let name = {
+        let mut entry = reader
+            .by_index(0)
+            .expect("the collapsed archive exposes one entry");
+
+        let name = entry.name().to_owned();
+
+        entry
+            .read_to_end(&mut content)
+            .expect("the surviving entry is decompressed and its CRC-32 matches");
+
+        name
+    };
+
+    assert_eq!(
+        name, member,
+        "the surviving entry is named the pinned member"
+    );
+    assert_eq!(
+        content, last,
+        "the surviving entry is the last record of the directory, so the reader \
+         resolved the duplicate name rather than merely skipping one record"
+    );
+    assert_eq!(
+        reader.len(),
+        1,
+        "the reader collapses the two records into one entry, so the extractor never \
+         sees an ambiguous archive"
+    );
+    assert!(
+        reader.by_index(1).is_err(),
+        "there is no second entry to hand out"
+    );
 }
 
 /// Builds a component source that points at a loopback server.
@@ -326,6 +529,61 @@ fn an_archive_without_the_pinned_member_is_refused() {
     }
 
     assert!(!work.join(LIBRARY).exists());
+}
+
+/// An archive whose central directory names the pinned member twice is resolved by
+/// the reader before the extractor sees it, so what is installed is the last of the
+/// two entries — and never a mix of both or a partial file.
+///
+/// This test exists because the opposite was believed about this code path. The
+/// extractor carries an occurrence count and refuses an archive that contains the
+/// pinned member more than once, and the fixture below is a real archive that does
+/// contain it twice — assembled from two writer-produced archives, not simulated. The
+/// count is nevertheless never reached: `ZipArchive` keys its entry index by raw file
+/// name (`IndexMap<raw name, entry>`), so the second directory record *overwrites* the
+/// first while the archive is parsed, and `by_index` can only ever hand out the
+/// survivor. The count stays in the extractor as its own rule — an ambiguous archive
+/// is refused rather than resolved — but it is a rule about input this backend cannot
+/// deliver, and this test is what says so out loud and keeps saying so.
+///
+/// The consequence for the product is the one asserted at the end: a duplicate-name
+/// archive does not fail, and it does not install the first entry either. It installs
+/// the last entry's bytes, and the staged payload holds exactly one file. If a future
+/// `zip` stopped collapsing the records, the helper above fails first, which is when
+/// the extractor's refusal would start to matter.
+#[test]
+fn a_duplicate_named_archive_is_resolved_by_the_reader_and_the_last_entry_is_installed() {
+    let root = TempRoot::new("core-member-duplicated");
+    let work = root.path().join("work");
+    fs::create_dir_all(&work).expect("a working directory");
+
+    let first: &[u8] = b"the first library";
+    let last: &[u8] = b"the second library, which one would win is undecidable";
+    let archive = zip_with_duplicate_member(LIBRARY, first, last);
+
+    // The fixture really carries the name twice and really is readable: the reader
+    // accepts it, exposes one entry, and that entry is the second one.
+    assert_the_reader_collapses_duplicate_names(&archive, LIBRARY, last);
+
+    let artifact_path = write_artifact(&root, "core.zip", &archive);
+    let definition = curated_definition(host_platform(), &archive, UNCONTACTED_PORT);
+
+    ZipCoreArchiveExtractor::new()
+        .unpack(&definition, &artifact_at(&artifact_path, &archive), &work)
+        .expect("the collapsed archive is not ambiguous to this backend");
+
+    assert_eq!(
+        fs::read(work.join(LIBRARY)).expect("the extracted library"),
+        last,
+        "the surviving entry is the one that is installed"
+    );
+    assert_eq!(
+        fs::read_dir(&work)
+            .expect("the working directory is readable")
+            .count(),
+        1,
+        "exactly the one library is written: no partial file and no other output"
+    );
 }
 
 /// A symbolic link is never installed as the library, whatever it points at.
@@ -784,6 +1042,48 @@ fn an_archive_without_the_pinned_library_leaves_no_build_directory() {
             .expect("the staging directory is readable")
             .count(),
         0
+    );
+}
+
+/// A duplicate-name archive installs the surviving entry as a complete build
+/// directory, and the store reports no ambiguity because the reader resolved it
+/// before the extractor was asked.
+///
+/// This is the store-side counterpart of
+/// [`a_duplicate_named_archive_is_resolved_by_the_reader_and_the_last_entry_is_installed`]:
+/// the full path — download, digest verification, extraction, validation, move — runs
+/// on an archive whose directory names the pinned library twice, and what ends up
+/// installed is a single, complete library.
+#[test]
+fn a_duplicate_named_archive_installs_a_complete_single_library() {
+    let root = TempRoot::new("core-wrong-member-install-duplicated");
+    let platform = host_platform();
+    let last: &[u8] = b"the second library, which one would win is undecidable";
+    let archive = zip_with_duplicate_member(LIBRARY, b"the first library", last);
+    let definition = curated_definition(platform, &archive, UNCONTACTED_PORT);
+    let store = store_serving(&root, &archive);
+
+    let installed = store
+        .install(&definition)
+        .expect("the collapsed archive installs its surviving entry");
+
+    assert_eq!(
+        fs::read(installed.library_path()).expect("the installed library"),
+        last
+    );
+    assert_eq!(
+        fs::read_dir(installed.directory())
+            .expect("the build directory is readable")
+            .count(),
+        1,
+        "the build directory holds the one library, with no partial file beside it"
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("staging"))
+            .expect("the staging directory is readable")
+            .count(),
+        0,
+        "a successful install leaves no staging state"
     );
 }
 

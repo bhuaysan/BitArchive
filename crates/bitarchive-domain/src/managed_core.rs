@@ -44,8 +44,8 @@
 //!   serves, and it is only ever used to *fetch* bytes that are then checked
 //!   against the pinned digest.
 //!
-//! `latest` is deliberately **not** a build id, and it is not a version. Bitcoin
-//! Archive does not model "the newest core" (see
+//! `latest` is deliberately **not** a build id, and it is not a version. BitArchive
+//! does not model "the newest core" (see
 //! `docs/decisions/0002-managed-core-acquisition.md`).
 //!
 //! # The digest is the trust anchor, and it never comes from the download
