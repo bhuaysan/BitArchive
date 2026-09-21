@@ -123,7 +123,7 @@ Auflösung des Core-Library-Pfads
 Wichtig für den Umgang mit dem Pin:
 
 - Der offizielle Host veröffentlicht macOS-Cores nur unter einem rollierenden `latest`-Pfad. `latest` ist deshalb **keine** Version und **keine** Build-Identität, sondern nur der Transportweg; die Identität sind Build-ID, Revision und der gepinnte SHA-256.
-- Wird ein Core upstream neu gebaut, passen die Bytes nicht mehr zum Pin. Die Installation wird dann **abgelehnt** (Digest-Mismatch); BitArchive übernimmt den neuen Digest nicht selbst. Ein Pin wird bewusst und reviewt angehoben.
+- Wird ein Core upstream neu gebaut, passen die Bytes nicht mehr zum Pin. Die Installation wird dann **abgelehnt** (Digest-Mismatch); BitArchive übernimmt den neuen Digest nicht selbst. Ein Pin wird bewusst und reviewt angehoben. Auch ein reiner **Repack** des ZIPs (gleiche Library, neue Archiv-Bytes) ändert den gepinnten Archiv-Digest und muss deshalb reviewt nachgezogen werden; Build-ID, Revision und Library bleiben dabei unverändert (`docs/decisions/0002-managed-core-acquisition.md` §2).
 - Cores werden pro Architektur getrennt installiert; ein Intel-Build wird nie für Apple Silicon eingesetzt (und umgekehrt).
 - Es gibt **keine** Core-Aktivierung, keinen „aktuellen Core" und keinen globalen Core-Default. Mehrere Builds eines Cores liegen nebeneinander.
 
