@@ -2,9 +2,7 @@
 
 /// A structured reason why a launch cannot proceed.
 ///
-/// The categories mirror the readiness model in ARCHITECTURE.md §21, extended by the
-/// one category that model does not name and a launch decision genuinely needs:
-/// [`InvalidConfiguration`](ReadinessIssue::InvalidConfiguration). They are data, not
+/// The categories mirror the readiness model in ARCHITECTURE.md §21. They are data, not
 /// presentation: no user-facing text, no localization, and no recovery action. A UI
 /// layer decides how to phrase an issue and which action to offer.
 ///
@@ -57,9 +55,9 @@ pub enum ReadinessIssue {
     /// [`InvalidContent`](Self::InvalidContent): the content of the launch is not what
     /// is wrong, and a UI would offer the wrong action for it.
     ///
-    /// ARCHITECTURE.md §21 does not name this category. It is added here because the
-    /// configuration hierarchy is part of the launch path and a stored override can
-    /// genuinely be unusable, which the model has to be able to say.
+    /// ARCHITECTURE.md §21 names this category. It exists because the configuration
+    /// hierarchy is part of the launch path and a stored override can genuinely be
+    /// unusable, which the model has to be able to say.
     InvalidConfiguration,
 
     /// Another emulation session is already active.

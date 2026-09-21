@@ -157,12 +157,18 @@ pub struct GameLaunchContext<'a> {
     /// Ignored when no system was resolved: without a system there is nothing to
     /// resolve a core *for*.
     pub core: Option<SystemCoreState>,
-    /// The applicable configurations, from the least to the most specific scope.
+    /// The applicable configurations for this launch.
     ///
-    /// The caller passes the scopes that apply to this concrete launch — the global
-    /// values, the values of the game's *system*, and the values of this game — in
-    /// the order `Global`, `System`, `Game`, because that is the order the
-    /// precedence is applied in.
+    /// The caller supplies the scopes that apply to this concrete launch — the global
+    /// values, the values of the game's *system*, and the values of this game. Their
+    /// iteration order does **not** determine precedence: [`resolve_launch_config`]
+    /// groups them by [`ConfigScope`](bitarchive_domain::config::ConfigScope) and
+    /// always applies `Global` → `System` → `Game`, whatever order they were supplied
+    /// in.
+    ///
+    /// Within the same scope the caller's relative order is kept, so it stays
+    /// deterministic: several sources may name the same scope, and a later value of
+    /// the same scope can override an earlier one.
     pub config: Vec<ScopedConfig>,
 }
 

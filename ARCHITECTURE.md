@@ -1010,9 +1010,15 @@ pub enum ReadinessIssue {
     UnsupportedFormat,
     InvalidContent,
 
+    InvalidConfiguration,
+
     SessionActive,
 }
 ```
+
+`InvalidConfiguration` bedeutet: die Launch-Konfiguration enthält einen unbrauchbaren gespeicherten Override.
+
+Das ist getrennt von `InvalidContent`: über die Content-Bytes wird damit keine Aussage getroffen.
 
 Die Backend-/Application-Schicht liefert Zustände und Recovery-Metadaten. Die UI entscheidet über Darstellung und konkrete Aktionen.
 

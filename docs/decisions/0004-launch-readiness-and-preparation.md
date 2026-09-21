@@ -107,14 +107,10 @@ UnsupportedSystemOrCore     → UnsupportedFormat
 CoreUnusable                → CoreMissing
 ContentMissing              → ContentUnavailable
 FirmwareMissing             → FirmwareMissing
-InvalidConfiguration        → InvalidContent
+InvalidConfiguration        → InvalidConfiguration
 ```
 
-```text
-InvalidConfiguration        → InvalidConfiguration  (added by this decision)
-```
-
-`InvalidConfiguration` is the one category §21 does not name and a launch decision
+`InvalidConfiguration` is the category this decision adds to §21 and a launch decision
 genuinely needs: the configuration hierarchy is part of the launch path, and a stored
 override can be unusable. It is deliberately **not** mapped to `InvalidContent`: an
 unusable stored key says nothing about the bytes to launch, and a UI that reported
