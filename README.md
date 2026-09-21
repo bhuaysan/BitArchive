@@ -129,7 +129,37 @@ Wichtig für den Umgang mit dem Pin:
 
 Die Entscheidungen im Detail stehen in [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md).
 
-Der echte **Start eines Spiels** ist weiterhin nicht implementiert: Die Launch-Kette kann eine vorbereitete Eingabe in einen Prozessstart übersetzen, und Runtime wie Core sind als Komponenten installierbar, aber aus dem Produkt-Flow wird noch kein Spiel gestartet.
+### Stand des ersten Managed-Launch
+
+Der erste reale Launch über die BitArchive-eigene Runtime und den BitArchive-eigenen Core ist als Developer-Slice implementiert. Ein opt-in Developer-Befehl löst das Executable der aktiven Managed Runtime und den Library-Pfad des kuratierten mGBA-Builds aus dem Component Store auf, setzt beides mit einem vom Developer angegebenen lokalen Content-Pfad über die bestehende Launch-Kette zusammen und startet einen echten RetroArch-Prozess:
+
+```text
+Managed Runtime → Executable
+Managed Core    → Library
+lokaler Content (Developer)
+      ↓
+RetroArchLaunchInput
+      ↓
+RetroArchBackend::prepare_launch (-L <core> <content>)
+      ↓
+PreparedLaunch
+      ↓
+ProcessController::spawn (keine Shell)
+      ↓
+echter RetroArch-Prozess
+      ↓
+warten auf das Prozessende
+```
+
+Dabei gilt:
+
+- Runtime und Core werden **ausschließlich** aus dem Managed-Component-System aufgelöst. Es gibt keine Developer-Pfade, keine Settings und keine Fallbacks (kein `PATH`, kein `/Applications`, keine System-RetroArch, keine beliebige lokale Core-Datei), und kein Argument benennt Runtime, Core, Version, URL oder Library.
+- Der Developer gibt nur den Content-Pfad an. Content ist eine externe, user-eigene Datei: BitArchive lädt keinen Content herunter, kopiert, verschiebt, benennt oder verändert ihn nicht und implementiert hier keine Library, keinen Scan und keinen Import.
+- Der Launch-Befehl lädt **nichts** herunter. Fehlt die Runtime oder der Core, nennt er den vorhandenen Acquisition-Befehl, der die Komponente installiert — es entsteht kein zweiter Acquisition-Flow.
+- Der gestartete Prozess wird nur beobachtet und über den bestehenden `SpawnedProcess`-Handle abgewartet; Exit-Status und technische Fehler gehen an den Developer zurück. Es gibt keinen SessionManager, keine Persistenz, keine Playtime und kein Beenden des Prozesses durch BitArchive.
+- Ein Produkt-Play-Flow ist weiterhin **nicht** implementiert: kein Play-Button, keine Library, keine Readiness-Prüfung, keine Konfigurationserzeugung, keine Save States, und aus dem normalen BitArchive-Fenster wird noch kein Spiel gestartet.
+
+Die Entscheidung im Detail steht in [`docs/decisions/0003-managed-launch-composition.md`](./docs/decisions/0003-managed-launch-composition.md).
 
 Signierte Distribution-Manifeste sind noch nicht implementiert. Bis dahin ist der gepinnte SHA-256 der BitArchive-seitige Trust Anchor; Details stehen in [`docs/decisions/0001-managed-runtime-acquisition.md`](./docs/decisions/0001-managed-runtime-acquisition.md) und [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md).
 
@@ -310,6 +340,25 @@ cargo run -p bitarchive-desktop -- acquire-core --root /tmp/bitarchive-core-chec
 - Er startet **kein** Spiel, verändert **keine** Runtime und aktiviert **nichts** (es gibt keinen aktiven Core).
 - Schlägt die Verifikation fehl, weil der Host den Core neu gebaut hat, wird nichts installiert; der Pin muss dann reviewt angehoben werden (siehe [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md)).
 - CI führt ihn nicht aus; die normalen Tests hängen nicht davon ab.
+
+### MANAGED RETROARCH LAUNCH (Developer, opt-in)
+
+Der dritte Developer-Befehl startet echten lokalen Content mit der BitArchive-verwalteten RetroArch-Runtime und dem kuratierten mGBA-Core. Runtime und Core werden ausschließlich aus dem Component Store aufgelöst; der Developer gibt nur den Content-Pfad an:
+
+```bash
+cargo run -p bitarchive-desktop -- launch /pfad/zu/lokalem/content
+cargo run -p bitarchive-desktop -- launch /pfad/zu/lokalem/content --root /tmp/bitarchive-launch-check
+```
+
+- `<content>` ist der einzige Launch-Input des Developers und muss bereits lokal existieren. BitArchive lädt keinen Content herunter und kopiert oder verändert ihn nicht.
+- `--root <dir>` löst Runtime und Core aus einem anderen Store-Root auf (dieselbe Option wie bei den Acquisition-Befehlen). Es benennt keine Komponente, sondern einen Store.
+- Es gibt **kein** Argument für Runtime, Core, Version, URL oder Library-Pfad: `--retroarch`, `--runtime`, `--core`, `--core-library`, `--core-path`, `--core-url`, `--core-version` und `--runtime-version` werden abgelehnt.
+- Fehlt die Runtime oder der Core, bricht der Befehl ab und nennt `acquire-retroarch-runtime` bzw. `acquire-core`. Der Launch-Befehl lädt **nichts** herunter und legt keinen zweiten Acquisition-Flow an.
+- Der Befehl startet RetroArch direkt über die Prozess-API (keine Shell, Executable und Argumente getrennt), meldet die PID, wartet auf das Prozessende und gibt den Exit-Status als Exit-Code zurück. Er beendet oder signalisiert RetroArch nicht selbst.
+- Der normale Start `cargo run -p bitarchive-desktop` startet weiterhin die Desktop-Anwendung; aus dem Produkt-Flow wird noch kein Spiel gestartet.
+- CI führt ihn nicht aus; die normalen Tests hängen nicht davon ab. Der reale Launch mit echter Runtime und echtem Core ist eine manuelle Developer-Verifikation.
+
+Die Entscheidung im Detail steht in [`docs/decisions/0003-managed-launch-composition.md`](./docs/decisions/0003-managed-launch-composition.md).
 
 Wo die Daten liegen (macOS, siehe `ARCHITECTURE.md` §35):
 

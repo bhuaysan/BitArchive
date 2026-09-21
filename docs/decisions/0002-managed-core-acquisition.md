@@ -182,6 +182,12 @@ a RetroArch-specific concern, and the launch path does not consume a core yet. B
 (the first real launch) introduces the `-L` argument and decides whether anything
 RetroArch-specific is needed above `CoreInstaller::resolve`.
 
+**Follow-up:** that step is #23, and its decision is recorded in
+[ADR 0003](./0003-managed-launch-composition.md). The launch path consumes the core
+through `CoreStore::resolve` and hands the resolved library to the existing
+`RetroArchBackend`, which owns the `-L` argument. No RetroArch-specific core type
+was needed above `CoreInstaller::resolve`, and none was added.
+
 ## Consequences
 
 **Positive**
