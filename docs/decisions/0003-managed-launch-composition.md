@@ -100,13 +100,21 @@ Acquisition is an explicit, deliberate step (ADR 0001, ADR 0002): it is the only
 network activity in BitArchive, it is opt-in, and CI never runs it. A launch that
 downloaded a runtime or a core would make what is running depend on network timing,
 would create a second acquisition flow beside the reviewed one, and would blend two
-lifecycle steps that have different failure modes. A missing or broken component is
-therefore reported, together with the existing command that installs it:
+lifecycle steps that have different failure modes. A component that is **not
+installed** is therefore reported together with the existing command that installs
+it, resolved against the same store the launch used:
 
 ```text
-cargo run -p bitarchive-desktop -- acquire-retroarch-runtime
-cargo run -p bitarchive-desktop -- acquire-core
+launch <content>                    → cargo run -p bitarchive-desktop -- acquire-retroarch-runtime
+                                      cargo run -p bitarchive-desktop -- acquire-core
+launch <content> --root /tmp/store  → the same commands with --root /tmp/store
 ```
+
+The advice is deliberately narrow: only "not installed" has an installing answer. A
+build directory that exists without its library is a broken installation, and the
+store refuses to install a build that is already installed — so that failure is
+reported for diagnosis instead of being answered with a command that cannot repair
+it. No repair or force-reinstall operation exists.
 
 ### 4. The developer slice supplies content only
 
@@ -123,6 +131,8 @@ and content hashing are later workflows.
 `--root <dir>` redirects the component store root, exactly as the two acquisition
 commands already allow, so the launch path can be verified against a throwaway
 store. It names a store, not a component: it cannot express a runtime or a core.
+The store it selects is also the store the recovery advice names, so a `--root` run
+is told to repair the same root (§3).
 
 An argument that names a component (`--retroarch`, `--runtime`, `--core`,
 `--core-library`, `--core-path`, `--core-url`, `--core-version`, `--runtime-url`,
@@ -131,11 +141,15 @@ An argument that names a component (`--retroarch`, `--runtime`, `--core`,
 ### 5. Waiting is the whole process lifecycle in this step
 
 The developer command reports the PID, waits for the process through the existing
-`SpawnedProcess` handle, and turns the exit status into its own exit code. It does
-not signal, terminate, or kill the process, keeps no registry, persists nothing,
-and measures no playtime. Exclusivity, recovery, persistence, and ordered shutdown
-belong to the session lifecycle (`ARCHITECTURE.md` §22), which is not implemented
-yet.
+`SpawnedProcess` handle, and reports the exit code the process ended with as its own
+exit code, so a script or a developer sees the number the launched process reported.
+A code `std::process::ExitCode` cannot carry (one outside the `0–255` range of its
+`u8`), and a process that reported no code at all — a signal termination, for
+example — are answered with the generic failure code instead of a truncated or
+invented number. The command does not signal, terminate, or kill the process, keeps
+no registry, persists nothing, and measures no playtime. Exclusivity, recovery,
+persistence, and ordered shutdown belong to the session lifecycle
+(`ARCHITECTURE.md` §22), which is not implemented yet.
 
 ## Consequences
 
