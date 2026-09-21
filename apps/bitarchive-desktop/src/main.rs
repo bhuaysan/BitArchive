@@ -8,7 +8,8 @@
 //! argv
 //!  ├── (nothing)                        → the Slint desktop UI
 //!  ├── acquire-retroarch-runtime [opts] → the opt-in developer runtime acquisition
-//!  └── acquire-core [opts]              → the opt-in developer core acquisition
+//!  ├── acquire-core [opts]              → the opt-in developer core acquisition
+//!  └── launch <content> [--root <dir>]  → the opt-in developer managed launch
 //! ```
 //!
 //! # LIVE COMPONENT ACQUISITION
@@ -20,6 +21,16 @@
 //! never runs them. The automated test suite of the workspace uses fake downloaders
 //! and loopback servers instead, so a normal `cargo test` never downloads a
 //! RetroArch artifact or a libretro core.
+//!
+//! # FIRST REAL MANAGED LAUNCH
+//!
+//! `launch` is the developer command that starts a real RetroArch process out of
+//! the components those two commands install (Issue #23). It resolves the active
+//! managed runtime's executable and the curated core's library from the component
+//! store, composes them with a developer-supplied local content path through the
+//! existing launch path, and waits for the process to exit. It accepts no runtime
+//! and no core argument, downloads nothing, and is likewise never called by the
+//! UI, by a test, or by CI.
 //!
 //! What the runtime command does:
 //!
@@ -56,11 +67,13 @@
 
 mod acquire_core;
 mod acquire_runtime;
+mod launch;
 
 use std::process::ExitCode;
 
 use acquire_core::AcquireCoreRequest;
 use acquire_runtime::AcquireRequest;
+use launch::LaunchRequest;
 
 /// The command that acquires the pinned RetroArch runtime.
 const ACQUIRE_COMMAND: &str = "acquire-retroarch-runtime";
@@ -68,12 +81,16 @@ const ACQUIRE_COMMAND: &str = "acquire-retroarch-runtime";
 /// The command that acquires the curated libretro core.
 const ACQUIRE_CORE_COMMAND: &str = "acquire-core";
 
+/// The command that launches local content with the managed components.
+const LAUNCH_COMMAND: &str = "launch";
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
     match arguments.split_first() {
         Some((command, rest)) if command == ACQUIRE_COMMAND => acquire_runtime::run(rest),
         Some((command, rest)) if command == ACQUIRE_CORE_COMMAND => acquire_core::run(rest),
+        Some((command, rest)) if command == LAUNCH_COMMAND => launch::run(rest),
         Some((command, _)) if command == "--help" || command == "-h" => {
             print_usage();
 
@@ -109,6 +126,10 @@ fn print_usage() {
          \x20 bitarchive-desktop {ACQUIRE_CORE_COMMAND} [--root <dir>] [--dry-run]\n\
          \x20                                              acquire the curated mGBA core\n\
          \x20                                              (LIVE CORE ACQUISITION, developer opt-in)\n\
+         \x20 bitarchive-desktop {LAUNCH_COMMAND} <content> [--root <dir>]\n\
+         \x20                                              launch local content with the managed\n\
+         \x20                                              runtime and core (REAL PROCESS START,\n\
+         \x20                                              developer opt-in)\n\
          \x20 bitarchive-desktop --help\n\
          \n\
          Options for {ACQUIRE_COMMAND}:"
@@ -119,4 +140,8 @@ fn print_usage() {
     println!("\nOptions for {ACQUIRE_CORE_COMMAND}:");
 
     let _ = AcquireCoreRequest::usage();
+
+    println!("\nOptions for {LAUNCH_COMMAND}:");
+
+    let _ = LaunchRequest::usage();
 }
