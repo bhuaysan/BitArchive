@@ -1,0 +1,2718 @@
+# BitArchive – Data Model
+
+- **Status:** Defined (Issue #33)
+- **Scope:** Conceptual data model for the local SQLite database (schema v1)
+- **Derives from:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) §54, [`PRODUCT.md`](./PRODUCT.md)
+- **Derived into:** SQLite Schema v1 (Issue #109), domain types and repository ports (Issue #34)
+
+---
+
+## 1. Purpose and scope
+
+### 1.1 What this document is
+
+This document fixes BitArchive's concrete data model: which entities exist, what
+identifies them, how they relate, what each constraint protects, who owns each
+piece of data, and when it may be deleted.
+
+It is the binding reference between the architecture and the schema:
+
+```text
+ARCHITECTURE.md
+      ↓
+DATA_MODEL.md          ← this document
+      ↓
+SQLite Schema v1       ← Issue #109
+      ↓
+Domain Types / Repository Ports   ← Issue #34
+      ↓
+MVP Implementation Plan
+```
+
+The model is **concrete enough that SQLite schema v1 can be derived from it
+without re-modelling the product**, and it is deliberately **not SQL**. No
+`CREATE TABLE` statement, no migration file, and no Rust type is defined here.
+
+### 1.2 Binding force
+
+The rules in this document are **binding rules, not examples**.
+
+- `MUST` and `MUST NOT` state constraints that schema v1, the repository ports,
+  and every later persistence Issue have to honour.
+- A later Issue that needs to deviate updates this document in the same change
+  (AGENTS.md, "Document ownership").
+- Where the source documents leave a modeling choice open, this document makes
+  one, following "choose the simplest design that satisfies the product
+  requirement, fits the architecture, remains testable, and does not
+  unnecessarily constrain known future extensions" (AGENTS.md §3), and records
+  the choice and its reason in a **Decision** block.
+- Genuine **product** questions are not decided here. They are listed in §20.4
+  with their document status (`DECIDED` / `FAVORED` / `OPEN` / `DEFERRED`).
+
+### 1.3 Terminology
+
+The repository documents are written in German and the code in English. This
+document uses the repository's existing mixture: prose is English, and domain
+terms that the source documents establish (`Game`, `Release`, `Content`,
+`Library Source`, `fachlich`) keep their established spelling.
+
+### 1.4 What is out of scope
+
+- SQL statements, index DDL, migration files, `rusqlite` usage.
+- Rust types, traits, repository ports, bootstrap wiring.
+- The curated catalogue's own data (systems, cores, formats, launch rules). It
+  ships as reviewed Rust constants and catalog data, not as database content
+  (§12.2).
+- Product decisions (scope, MVP features, UX behavior).
+
+---
+
+## 2. Modeling principles
+
+### 2.1 The four separations the model exists to protect
+
+```text
+Game  ≠  Release  ≠  Content  ≠  Content Location
+```
+
+`Game` is the logical work, `Release` a concrete publication or variant,
+`Content` the concrete technical content unit, and `Content Location` merely
+where that content was observed. `ARCHITECTURE.md` §53.1 and AGENTS.md §4 make
+this separation an invariant, so the model keeps it in **four separate tables**
+with four separate identities (see §6).
+
+The same reasoning separates other pairs that are easy to conflate and expensive
+to conflate later:
+
+| Kept apart | Why |
+|---|---|
+| Provider metadata vs. manual overrides vs. effective value | A provider refresh must never destroy a user's edit (§9). |
+| RetroArch settings vs. core options | Two hierarchies with different scopes and different owners (`ARCHITECTURE.md` §26, §27). |
+| Runtime vs. cores | Independently versioned components (`ARCHITECTURE.md` §53.10). |
+| Curated catalogue vs. online distribution manifest | `ARCHITECTURE.md` §15 and the backlog audit; never one table. |
+| Save-state metadata vs. normal saved games | Invariant 13: SRAM, memory cards and other regular saves are outside BitArchive scope and MUST NOT be modelled. |
+| BitArchive media store vs. media cache | One is persistent user-visible state, the other is a rebuildable cache. |
+
+### 2.2 Storage vs. derivation
+
+> **Store what cannot be derived. Derive what can.**
+
+A value is **stored** when the database is its owner, when it records a fact the
+file system or the curated catalogue cannot answer, or when losing it would lose
+user data. A value is **derived** when it is a pure function of stored rows.
+
+Consequences that recur through this document:
+
+- Playtime is **derived** from sessions, not stored a second time (§16.3).
+- Save-state compatibility is **derived** from core identity and core version,
+  not stored (§15.3).
+- Core-option and setting validity are **derived** by validating against the
+  current catalogue at load time, not frozen into a status column (§13, §14.5).
+- Statistics are **derived** from the session history (§16.3).
+- The component index **can be rebuilt** from the component store (§12.4).
+
+Derivation MUST be deterministic and MUST NOT depend on the order rows happen to
+be read in. Every derived value needs a total tie-breaker over stable identities
+(`ARCHITECTURE.md` §36.3).
+
+### 2.3 Authoritativeness
+
+Each kind of data has exactly one owner. The database is the owner of the
+fachliche model, never a shadow of another owner:
+
+| Data | Authoritative owner |
+|---|---|
+| Fachliche identity, relationships, manual overrides, settings, session history | SQLite |
+| ROM/ISO/ZIP/ZIP-entry bytes | The user's file system, outside BitArchive |
+| Firmware bytes | The user's firmware folder, outside BitArchive |
+| Managed runtime and core binaries, and which runtime version is active | The component store on disk |
+| RetroArch save-state files and thumbnails | RetroArch and the user's file system |
+| Media blobs (covers, screenshots) | The managed media store on disk |
+| CURATED catalogue definitions | Reviewed Rust constants / catalog data shipped with the app |
+| Session `.cfg` files, logs, generated playlists | Generated artifacts, rebuildable |
+
+When two owners could disagree, the **non-database owner wins** and the database
+is reconciled to it. §12.4 makes that rule concrete for the component store.
+
+### 2.4 Numeric identity is never domain identity
+
+The model uses database-generated row numbers only as an internal storage
+convenience. Every entity a user, a resolver, or a saved focus can name carries a
+UUIDv7 identity (§3). Row numbers MUST NOT appear in a UI contract, in a
+persisted preference, or in a log that a user is asked to reason about
+(`ARCHITECTURE.md` §53.22).
+
+---
+
+## 3. Identity and storage conventions
+
+### 3.1 Domain identities
+
+Domain entities use stable UUIDv7 identities (`ARCHITECTURE.md` §7).
+The following identity types exist. The list is closed for schema v1: **no
+additional UUID identity is introduced unless a fachliche need requires it.**
+
+| Identity | Identifies | Introduced by |
+|---|---|---|
+| `GameId` | the logical work | §6.1 |
+| `ReleaseId` | a concrete publication or variant | §6.2 |
+| `ContentId` | a concrete technical content unit | §6.3 |
+| `LibrarySourceId` | one configured library source | §5.1 |
+| `SystemId` | one curated system, stably | §6.5 |
+| `CoreId` | one core a scope can select | §12.3 |
+| `ManagedComponentId` | one managed component index entry (runtime or core artifact) | §12.1 |
+| `ScanRunId` | one library scan run | §8.1 |
+| `ScrapeRunId` | one metadata scraping run | §9.5 |
+| `SaveStateId` | one indexed save state | §15.1 |
+| `SessionId` | one emulation session | §16.1 |
+| `MediaAssetId` | one media asset record | §10.1 |
+
+`SystemId` and `CoreId` already exist in `bitarchive-domain`; this document
+supplies the stable store they were missing (ADR 0004, "Alternatives
+considered").
+
+`ManagedComponentId` is deliberately **not** called `ComponentId`: that name is
+already taken in `bitarchive-domain::component` by the **distribution slug** of a
+managed component (`retroarch`, `mgba`), which is a string, is never minted, and
+is never a primary key. The two must not be confused, and this document calls the
+slug `component_key` when it stores it (§12.1).
+
+### 3.2 Encoding
+
+| Logical type | SQLite storage | Notes |
+|---|---|---|
+| UUIDv7 identity | `BLOB`, exactly 16 bytes | RFC 4122 network byte order. `NOT NULL` on every identity column. |
+| SHA-256 digest | `BLOB`, exactly 32 bytes | Raw bytes, never hex text, never base64. |
+| Provider external identifier | `TEXT` | Opaque to BitArchive; never an identity, never a key. |
+| Technical key (setting key, core option key, catalog key) | `TEXT` | ASCII, lower case, case-sensitive comparison. |
+| Locale / BCP-47 language tag | `TEXT` | Lower-case primary subtag, e.g. `de`, `en-us`. |
+| Enum | `TEXT` | Spelled exactly like the document's or the domain enum's variant, e.g. `ArchiveEntry`. Never a bare integer. |
+| Boolean | `INTEGER`, `0` or `1` | `CHECK`-constrained to those two values. |
+| Timestamp | `INTEGER`, milliseconds since the Unix epoch, UTC | Monotonic source is the system clock; the model stores instants, not local time. |
+| Duration | `INTEGER`, milliseconds | Monotonic measurement, not wall-clock subtraction. |
+| Counter / size | `INTEGER`, signed 64-bit | Byte sizes are `>= 0`. |
+| Float setting value | `REAL` | Only ever alongside an explicit type tag (§13.2). |
+| Free text | `TEXT` | UTF-8. |
+
+**Decision — timestamps are integer milliseconds.** An ISO-8601 string sorts
+lexicographically and is human-readable, but it needs a canonical form, a
+canonical timezone, and a parser on every compare. Integer milliseconds give a
+total order for `ORDER BY` and `lastPlayedAt` sorting with no text collation
+rules, and they are unambiguous across locales and calendar systems. Formatting
+belongs to presentation.
+
+**Decision — enums are stored as their spelled names.** A numeric enum makes
+every stored row depend on the declaration order of a Rust enum, so inserting a
+variant silently reinterprets existing data. Names are readable in a database
+dump during diagnosis and cannot drift silently.
+
+### 3.3 Reading a persisted identity
+
+> **Rule (binding).** A persisted identity MUST be validated back into its domain
+> type. Invalid persisted UUID bytes MUST NOT be accepted silently.
+
+The read path is:
+
+```text
+BLOB column
+   ↓ length exactly 16?                        no → error, never a default
+   ↓ RFC 4122 variant bits set?                 no → error
+   ↓ version nibble exactly 7?                  no → error
+   ↓ DomainTypeId
+```
+
+A failed validation produces a typed error that names the column, the table, and
+the offending bytes, and the affected read fails. It MUST NOT fall back to a
+freshly generated identity, to a `NULL`, or to a "best effort" value: a silently
+regenerated identity detaches user metadata from its game, and a silently dropped
+row hides data loss.
+
+The same rule holds one level up. A referenced identity that does not exist is a
+broken invariant, and it stays broken when foreign keys are enforced
+(`ARCHITECTURE.md` §8.1), because the read failed loudly instead of inventing a
+row. **Foreign keys MUST stay enabled on every connection**, and schema v1 MUST
+be derivable without relying on SQLite's default of disabled enforcement.
+
+The version check is not decorative. Only UUIDv7 identities are minted
+(`bitarchive-domain::id`), and UUIDv7 is time-ordered, so it is the property that
+makes an identity sortable and index-friendly. Accepting a v4 byte string would
+silently accept something BitArchive never wrote.
+
+### 3.4 What is never an identity or a key
+
+> **Rules (binding).**
+>
+> - A **path is not a domain identity** (`ARCHITECTURE.md` §53.2). No table's
+>   primary key is a path, and no fachliche relationship is expressed through a
+>   path.
+> - A **hash is not an identity and not a primary key** (`ARCHITECTURE.md` §53.3).
+>   A digest column is `NOT NULL` where required and indexed where looked up, and
+>   it is never a primary key, never a foreign key target, and never a substitute
+>   for `ContentId`.
+> - A **provider external ID is not a BitArchive identity**. It is provenance
+>   (§9.4).
+> - A **file name** is not an identity.
+> - A **title** is not an identity. Titles change, are translated, and collide.
+
+### 3.5 Uniqueness
+
+A unique constraint expresses a fachliche rule:
+
+- Two rows that mean "the same thing" MUST collide.
+- A unique constraint MUST be justified by the rule it protects, not by
+  convenience. Every table below names that rule.
+- Where a uniqueness rule depends on a discriminator (a scope, an algorithm, a
+  file-system case policy), the constraint is a **partial unique index over that
+  discriminator** rather than a nullable column trick.
+
+### 3.6 Text comparison and case sensitivity
+
+The default comparison for text columns is **case-sensitive**. Case-insensitive
+comparison is requested explicitly where a *user-visible* rule needs it, and then
+through `COLLATE NOCASE` on that index or lookup only.
+
+- **Titles and display names**: compared case-insensitively by the search
+  projection (§17), never by a unique constraint.
+- **Technical keys** (configuration keys, core option keys, catalog keys,
+  component ids, library-relative paths): compared **case-sensitively**. These
+  are identifiers whose spelling is meaningful, and `Mario.nes` and `mario.nes`
+  are two different files on a case-sensitive volume.
+- **File-system case policy** belongs to the platform, not to the model. A
+  content location records the path **verbatim as observed**; normalizing it
+  would make BitArchive unable to find the file it indexed on a case-sensitive
+  volume. Duplicate-by-path detection is therefore case-sensitive, and
+  duplicate-by-content detection is hash-based and unaffected.
+
+### 3.7 Constraints the model deliberately does not use
+
+**Decision — no unnamed `ON DELETE CASCADE`.** Every foreign key states its
+delete behavior explicitly, and a cascade is used only where the child rows are
+*intrinsic parts* of the parent and are meaningless without it — currently only
+`release_regions` and `release_languages` (§6.4). For everything else the rule
+is expressed in §19, because the fachliche meaning of "delete a library source"
+is not "delete every game that was ever seen there" (`PRODUCT.md` §7.3).
+
+---
+
+## 4. Ownership and lifecycle
+
+### 4.1 Lifecycle vocabulary
+
+`ARCHITECTURE.md` §35.1 defines four artifact lifetimes. This document applies
+them to **data**, one level down:
+
+| Lifetime | Meaning for database rows |
+|---|---|
+| **Persistent** | User state. Survives restarts, is part of a backup, and is only removed by an explicit user action or an explicit rule in §19. |
+| **Rebuildable** | An index or projection over persistent state or over an external owner. May be deleted wholesale at any time and reconstructed without user-visible loss of meaning. |
+| **SessionScoped** | Meaningful only while a session exists, and deleted with it. |
+| **Temporary** | Work state that may be removed by startup cleanup with no user-visible effect. |
+
+A row that mixes lifetimes MUST be split, so that a rebuild of the rebuildable
+part cannot touch the persistent part.
+
+### 4.2 Every persisted structure has an owner
+
+For each structure this document states:
+
+```text
+Purpose
+Identity / primary key
+Columns and logical types
+Nullable columns and what NULL means
+Foreign keys and their delete behavior
+Unique constraints
+Indexes
+Owner
+Lifecycle
+Retention
+Invariant protected
+```
+
+### 4.3 The four ownership classes
+
+```text
+A. SQLite authoritative (Persistent)
+   fachliche identity, relationships, manual overrides, settings,
+   scan/scrape history, session history, user flags
+
+B. File-system authoritative (Persistent, indexed by SQLite)
+   user ROM/ISO/ZIP files, user firmware, managed component binaries,
+   RetroArch save-state files and thumbnails, media blobs
+
+C. Rebuildable projections and indexes
+   FTS5 search index, firmware index, managed component index,
+   managed media file consistency
+
+D. Generated artifacts (SessionScoped / Temporary)
+   sessions/<session-id>/retroarch.cfg, core-options.cfg, launch.json,
+   stdout.log, stderr.log, managed .m3u playlists, staging, downloads
+```
+
+**Rules (binding).**
+
+- Class A is never rebuilt from class B or C. Losing class A is data loss.
+- Class B is never modified by BitArchive except through an explicit,
+  user-confirmed product action. No internal cleanup touches it (invariant 20).
+- Class C may be dropped and rebuilt at any time without changing a fachliche
+  answer.
+- Class D never becomes a fachliche source (`ARCHITECTURE.md` §53.7). A `.cfg` is
+  output; the setting table of §13 is truth.
+
+### 4.4 Backup
+
+`PRODUCT.md` §39 and `ARCHITECTURE.md` §34 define the backup content. The model
+classifies each structure accordingly:
+
+| Structure | In the backup |
+|---|---|
+| Every class A table | yes |
+| `firmware_entries`, `firmware_index_state` | no — rebuildable |
+| `managed_components`, `component_index_state` | no — rebuildable from the component store |
+| `search_index` (FTS5) | no — rebuildable |
+| Media assets: the **rows** | yes (metadata); cover/screenshot blobs are `Rebuildable` per `ARCHITECTURE.md` §34.3 |
+| Session rows | yes |
+| Save-state metadata rows | yes; save-state **files** only when the user checks the optional box |
+| Session artifacts, staging, downloads | no |
+
+No table in this model stores ROM, ISO, ZIP, or firmware bytes; no table stores a
+secret in clear text.
+
+---
+
+## 5. Library sources and content locations
+
+### 5.1 `library_sources`
+
+**Purpose.** One configured place BitArchive looks for content. Library Sources
+are stable fachliche entities (`ARCHITECTURE.md` §10.1), so a source keeps its
+identity across restarts, re-adds, and availability changes.
+
+**Identity.** `LibrarySourceId` (UUIDv7 `BLOB(16)`).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `display_name` | TEXT | no | User-visible name; a label, not an identity |
+| `location` | TEXT | no | The source root as the platform reports it |
+| `platform_locator_kind` | TEXT enum | no | `Path` today; a later Android build may add `DocumentTree` (`ARCHITECTURE.md` §10.4) |
+| `fixed_system_id` | UUIDv7 | yes | `NULL` = detect per file; set = every file of this source belongs to this system (`PRODUCT.md` §7.5) |
+| `availability` | TEXT enum | no | `Available`, `Offline`, `PermissionDenied`, `Missing` (`ARCHITECTURE.md` §10.3) |
+| `availability_checked_at` | timestamp | yes | When availability was last observed; `NULL` = never observed yet |
+| `created_at` | timestamp | no | When the source was added |
+| `removed_at` | timestamp | yes | `NULL` = active; set = removed from the active library |
+
+**Foreign keys.** `fixed_system_id → systems.system_id`, delete behavior
+`RESTRICT`.
+
+**Unique constraints.**
+
+- `(location, platform_locator_kind)` — adding the same root twice would create
+  two sources that see the same files and would then scan them twice and treat
+  each other's findings as duplicates. This is the rule that protects against it.
+  It is deliberately **not** enforced on `display_name`: two sources may carry
+  the same label.
+- `id` (primary key).
+
+**Indexes.** `(availability)` — the startup availability pass and the
+"Source Offline" UI state query it. `(removed_at)` — active-library queries.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Removing a source sets `removed_at`; it does **not** delete the
+row and does **not** touch the file system (`PRODUCT.md` §7.3). Files remain
+untouched because BitArchive never owned them. The row stays so that re-adding
+the same root can be recognized and so that the history of what came from where
+stays legible. See §19.2 for the full removal procedure.
+
+**Invariant protected.** Source removal must never delete user files
+(invariant 20); an offline source must never delete games
+(`ARCHITECTURE.md` §10.3, invariant 18).
+
+**Decision — removability is a timestamp on the source, not a delete.** A hard
+delete would immediately break every `content_locations` row that points at the
+source, or force a cascade that violates §19. A `removed_at` column keeps the
+history intact and makes "re-add the same source" a recognizable, cheap
+operation.
+
+**Decision — availability is stored on the source row, not derived per scan.**
+Availability is observed outside a scan (at startup, and through platform volume
+events), and launch readiness has to answer `SourceOffline` without running a
+scan (`ARCHITECTURE.md` §10.3, §21). `availability_checked_at` is stored next to
+it so that a stale observation is distinguishable from a fresh one.
+
+### 5.2 `content_locations`
+
+**Purpose.** Where one `Content` was actually observed. A location is a
+**fact about the file system**, not part of the content's identity
+(`ARCHITECTURE.md` §2.3, §14.1).
+
+**Identity.** The row's identity is `(content_id, location_kind, source_id,
+relative_path, archive_entry_path)`; the table has a database row number for
+reference convenience only, and **no domain identity**, because a location is not
+a fachliche entity (invariant 2).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `content_id` | UUIDv7 | no | The content found here |
+| `location_kind` | TEXT enum | no | `File` or `ArchiveEntry` |
+| `source_id` | UUIDv7 | no | The source this path is relative to |
+| `relative_path` | TEXT | no | Path **relative to the source root**, verbatim as observed |
+| `archive_entry_path` | TEXT | yes | Entry path inside the archive; required for `ArchiveEntry`, `NULL` for `File` |
+| `observed_filename` | TEXT | no | The file name as observed; a label, not an identity |
+| `observed_size` | INTEGER | yes | Last observed size in bytes; `NULL` = not observed |
+| `observed_mtime` | timestamp | yes | Last observed modification time; `NULL` = not observed |
+| `state` | TEXT enum | no | `Present`, `Missing`, `Unreadable`, `PermissionDenied` |
+| `last_seen_scan_run_id` | UUIDv7 | yes | The run that last observed this location; `NULL` = never observed by a persisted run |
+| `first_seen_at` | timestamp | no | When this location was first indexed |
+| `last_seen_at` | timestamp | yes | When it was last observed present |
+
+**Foreign keys.**
+
+- `content_id → contents.content_id` — `RESTRICT`.
+- `source_id → library_sources.id` — `RESTRICT`.
+- `last_seen_scan_run_id → scan_runs.id` — `RESTRICT`, nullable.
+
+**Unique constraints.**
+
+- `(content_id, location_kind, source_id, relative_path)` for `File` rows: the
+  same content has one location record per path.
+- `(content_id, source_id, relative_path, archive_entry_path)` for
+  `ArchiveEntry` rows.
+- `(source_id, relative_path, archive_entry_path)` for `ArchiveEntry` rows only:
+  **two contents MUST NOT claim the same entry of the same archive**. Without
+  this rule a re-scan that changed its mind about which entry is playable would
+  leave the losing content pointing at a location that now belongs to another
+  content.
+
+These three are **partial unique indexes over `location_kind`**, because the
+discriminator is what makes the key meaningful.
+
+**Indexes.**
+
+- `(source_id)` — reconciliation and source removal walk all locations of a
+  source.
+- `(content_id)` — "where can this content be found" and launch content
+  resolution.
+- `(state)` — the "missing content" and maintenance-queue queries.
+- `(source_id, relative_path)` — the case-sensitive lookup during a scan.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** A location is a *discovery*. It is marked `Missing`, never deleted
+while its content still exists (§19.4), and it is deleted only when its source is
+removed (§19.2) or when the user resets the library index (`PRODUCT.md` §40).
+
+**Invariant protected.** Paths are locations, not identities (invariant 2); a
+content can be found in several places at once (`PRODUCT.md` §7.7); a missing
+file does not delete a game (invariant 18).
+
+**Decision — relative paths, with the source root stored once.** Storing the
+absolute path per location would duplicate the root into every row and would make
+"the volume is mounted somewhere else today" look like "every file moved"
+(`ARCHITECTURE.md` §10.2). The absolute path is computed as
+`library_sources.location + relative_path`. `relative_path` MUST be relative,
+MUST NOT escape the source root, and is stored exactly as observed (§3.6).
+
+**Decision — the path is not normalized beyond making it relative.** Case
+normalization, Unicode normalization, and symlink resolution are all
+platform-dependent, and any of them can turn a path that BitArchive indexed into
+a path that does not resolve. Identity comes from the content fingerprint (§7);
+the path only has to be good enough to open the file again.
+
+**Decision — no separate table for archive contents.** A ZIP entry is a location,
+not a content: it is inside a file that is itself indexed, and `PRODUCT.md` §10
+does not require BitArchive to keep an inventory of every entry. Only the entries
+BitArchive actually identified are recorded, which also keeps a library scan from
+having to persist a row per file inside every archive.
+
+### 5.3 Multi-disc and playlists
+
+A multi-disc release stores one `Content` per disc and, when a `.m3u` exists,
+one more `Content` of type `Playlist` whose locations are the `.m3u` files
+(`ARCHITECTURE.md` §14.3, `PRODUCT.md` §9).
+
+The rule is:
+
+- An existing, valid `.m3u` is preferred as `LaunchContent` and becomes the
+  release's playlist content.
+- If none exists, BitArchive may generate a managed `.m3u`. That file lives in
+  the BitArchive data area, is `Rebuildable`, and is therefore **not** a
+  `content_locations` row of a configured source. It is recorded as a
+  `content_derivations` row (§6.6) pointing at the discs it lists.
+- Original files are never modified, and the original files are never the
+  generated playlist.
+
+### 5.4 What `LaunchContent` resolves to
+
+`ARCHITECTURE.md` §14.2 models the launch input as:
+
+```rust
+pub enum LaunchContent {
+    File(ContentId),
+    ArchiveEntry { archive: ContentId, entry: ArchiveEntryId },
+    ExistingPlaylist { playlist: ContentId },
+    ManagedPlaylist { path: PathBuf, members: Vec<ContentId> },
+}
+```
+
+The model supplies these identities without introducing an `ArchiveEntryId`
+table:
+
+| `LaunchContent` variant | This model |
+|---|---|
+| `File(content)` | the `Content` of kind `Content`; its `Present` location supplies source and relative path |
+| `ArchiveEntry { archive, entry }` | `archive` is the `ArchiveContainer` content; `entry` is the `Content` of kind `Content` whose `EntryList` fingerprint (§7.1) records that entry path inside that archive. The launch reads the entry path from the content's fingerprint and the archive's location, so no second entry identity is needed |
+| `ExistingPlaylist(content)` | the `Playlist` content whose location is the user's `.m3u` |
+| `ManagedPlaylist { path, members }` | a `content_derivations` row (§6.6): `content_id` is the managed playlist, `relative_path` is `path`, and the `source_content_id` rows are `members` in `member_index` order |
+
+**Decision — no `ArchiveEntryId`.** An `ArchiveEntryId` would be a fourth
+identity for something that is already fully identified by (container content,
+entry path) and whose entry path is recorded as the content's own fingerprint.
+Introducing it would add an identity type with no fachliche content, which §3.1
+forbids.
+
+---
+
+## 6. Games, releases and contents
+
+### 6.1 `games`
+
+**Purpose.** The logical work (`ARCHITECTURE.md` §13.1, `PRODUCT.md` §8.1).
+
+**Identity.** `GameId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `first_seen_at` | timestamp | no | When this game entered the library |
+| `default_release_id` | UUIDv7 | yes | The user's explicit default release; `NULL` = none chosen (`PRODUCT.md` §8.6) |
+| `is_favorite` | boolean | no | Favorite flag; default `0` |
+| `is_hidden` | boolean | no | "Hidden from library" (`PRODUCT.md` §41) |
+| `is_ignored` | boolean | no | "Ignore" (`PRODUCT.md` §41) |
+
+**Foreign keys.** `default_release_id → releases.release_id`, delete behavior
+`SET NULL`.
+
+**Unique constraints.** `id` only. A game has **no natural key**: titles collide
+and change, and two games may legitimately share a title.
+
+**Indexes.** `(is_favorite)`, `(is_hidden, is_ignored)` — the standard library
+views filter on both (`ARCHITECTURE.md` §36.6).
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** A game is never deleted by a scan, by a scrape, by an import, by a
+provider refresh, or by a source becoming unavailable. It is removed only by an
+explicit user action or by the explicit reset in `PRODUCT.md` §40 (§19.3).
+
+**Invariant protected.** A game does not disappear because a source is offline
+(`ARCHITECTURE.md` §53.18, `PRODUCT.md` §7.2); invalid or refreshed provider data
+does not delete user state.
+
+**Decision — the release that was just created gets the game's first
+`default_release_id`, and later defaults are user choices.** §8.6 of `PRODUCT.md`
+puts the explicit game default first in the resolution priority. If nothing is
+stored, the resolver falls through to the language and region preferences, which
+is exactly the documented behavior. An implicit "the only release" default would
+be a second truth that silently stops applying as soon as a second release
+arrives.
+
+**Decision — favorite, hidden and ignored live on the game, not in a separate
+"library state" table.** They are properties of the logical work, they are
+one-per-game, and all three survive a source removal (`PRODUCT.md` §7.3, §7.6).
+A separate table would add a join to every library query for no modeling gain.
+`is_hidden` and `is_ignored` are separate flags because the product separates
+them: a hidden game is out of the active library, an ignored one is also excluded
+from future scans' "new game" handling. Both are reversible, and neither ever
+deletes a file.
+
+### 6.2 `releases`
+
+**Purpose.** A concrete publication or variant of a game
+(`ARCHITECTURE.md` §13.2, `PRODUCT.md` §8.2).
+
+**Identity.** `ReleaseId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `game_id` | UUIDv7 | no | The game this release belongs to |
+| `system_id` | UUIDv7 | no | The curated system this release targets |
+| `release_title` | TEXT | yes | The release's own title, when it differs from the game's; `NULL` = use the effective game title |
+| `release_date` | TEXT | yes | The release date as it is known. Partial dates are allowed and stored as a prefix (`1996`, `1996-03`); `NULL` = unknown |
+| `revision` | TEXT | yes | e.g. `Rev 1`, `v1.1`; `NULL` = unknown |
+| `release_type` | TEXT enum | no | `Official`, `RomHack`, `FanTranslation`, `Homebrew`, `Prototype`, `Unlicensed`; default `Official` |
+| `archive_kind` | TEXT enum | yes | `Zip` for a container-derived release, `NULL` otherwise |
+| `created_at` | timestamp | no | When the release was indexed |
+
+**Foreign keys.**
+
+- `game_id → games.id` — `RESTRICT`.
+- `system_id → systems.system_id` — `RESTRICT`.
+- `(id, game_id)` — unique, so that `contents` can reference the pair and the
+  database itself can prove that a content's release belongs to the content's
+  game (§6.3).
+
+**Unique constraints.**
+
+- **Fachliche uniqueness is `(game_id, system_id, release_type, region set,
+  language set, revision)`**, computed by the resolver during a scan. Because the
+  region and language sets live in child tables, the enforceable part of this key
+  is materialized as `release_key`: a `NOT NULL` digest computed by the resolver
+  over the normalized release identity (game, system, type, sorted region tags,
+  sorted language tags, revision).
+  - Unique: `(game_id, release_key)`.
+  - **Decision — release identity is a computed digest, because SQLite cannot
+    index a multi-row set.** The alternative is to store the region and language
+    tags as a delimited string column, which would make "all European releases"
+    or "all German releases" a `LIKE` scan and would put two representations of
+    the same fact into the database. `release_key` is derived from the same
+    normalized inputs the resolver already uses, so it is not a second truth — it
+    is the *key* form of the one truth, and §20.3 requires it to be recomputed
+    whenever a tag changes.
+  - `release_key` is a **fingerprint of the release's fachliche identity**, so it
+    MUST NOT be used as the primary key (invariant 3).
+
+**Indexes.** `(game_id)`, `(system_id)`, `(system_id, release_type)` for the
+filter in `ARCHITECTURE.md` §36.1, `(release_date)` for the `ReleaseDate` sort.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** A release disappears only when its game does (§19.3), or when the
+library index is reset (`PRODUCT.md` §40).
+
+**Invariant protected.** `Game ≠ Release` (invariant 1); a game has many releases
+(`PRODUCT.md` §8.2).
+
+### 6.3 `contents`
+
+**Purpose.** One concrete technical content unit of a release
+(`ARCHITECTURE.md` §13.3, §14.1).
+
+**Identity.** `ContentId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `release_id` | UUIDv7 | no | The release this content belongs to |
+| `game_id` | UUIDv7 | no | Redundant-by-design parent for the integrity rule below |
+| `content_kind` | TEXT enum | no | `Content`, `ArchiveContainer`, `Playlist` |
+| `format` | TEXT | yes | Normalized format token, e.g. `nes`, `chd`, `cue`, `bin`, `gb`; `NULL` = not classified |
+| `validation_state` | TEXT enum | no | `Unvalidated`, `Valid`, `Suspect`, `Invalid` |
+| `validation_detail` | TEXT | yes | Machine-readable reason for `Suspect`/`Invalid` (`PRODUCT.md` §11); `NULL` = none |
+| `disc_index` | INTEGER | yes | 1-based position in a multi-disc release; `NULL` = not part of a multi-disc set |
+| `created_at` | timestamp | no | When the content was indexed |
+
+**Foreign keys.**
+
+- `(release_id, game_id) → releases(id, game_id)` — `RESTRICT`. This composite
+  foreign key is what makes "a content's release belongs to the content's game" a
+  database fact rather than a hope.
+- `release_id → releases.id` — covered by the composite key above.
+
+**Unique constraints.** `id`. There is **no** unique constraint on
+`(release_id, disc_index)`: a multi-disc release may legitimately hold a disc and
+an alternate dump of the same disc (a `.bin` and its `.cue`,
+`PRODUCT.md` §9), and both are separate contents. Duplicate *files* are a
+location-level fact (§5.2), and duplicate *payloads* are a fingerprint-level
+fact (§7).
+
+**Indexes.** `(release_id)`, `(game_id)`, `(validation_state)`.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** A content disappears with its release (§19.3), or when the library
+index is reset. Losing its last location does **not** delete it — the content's
+fingerprint is what allows BitArchive to recognize it when it comes back
+(`PRODUCT.md` §7.6).
+
+**Invariant protected.** `Release ≠ Content` (invariant 1); one release has many
+contents.
+
+**Decision — `ArchiveContainer` is a content.** `PRODUCT.md` §10 says the ZIP is
+only a container and the hash of the *contained* ROM decides the release
+identity. That makes the archive and the ROM two different things that both need
+an identity: the ROM is the `Content` the release is identified by, and the
+archive is the `ArchiveContainer` whose locations the scanner actually saw. The
+alternative — modelling the ZIP as a location of the ROM content — would lose the
+distinction between "the file BitArchive opens" and "the entry inside it", which
+is exactly what launch content resolution needs (`ARCHITECTURE.md` §14.2, §14.4).
+
+**Decision — at most one playable entry is imported per archive.** A ZIP with
+zero or several playable entries is *ambiguous* and is recorded as an unsupported
+or unknown file rather than as a release (`PRODUCT.md` §10). BitArchive never
+extracts an archive persistently.
+
+### 6.4 `release_regions`, `release_languages`
+
+**Purpose.** The multi-valued region and language tags of a release
+(`PRODUCT.md` §8.4, §8.5).
+
+| Table | Columns | Notes |
+|---|---|---|
+| `release_regions` | `release_id` UUIDv7, `region` TEXT enum | `Europe`, `Usa`, `Japan`, `World`, `Asia`, `Unknown` |
+| `release_languages` | `release_id` UUIDv7, `language` TEXT | Lower-case BCP-47 primary subtag, e.g. `de`, `en`, `ja` |
+
+**Primary key.** `(release_id, region)` and `(release_id, language)`
+respectively — the same tag twice on one release is meaningless.
+
+**Foreign keys.** `release_id → releases.id` — **`ON DELETE CASCADE`**. This is
+the one place a cascade is correct: a region tag has no meaning without its
+release, holds no user data, and cannot be referenced by anything. Deleting the
+release without its tags would leave unreachable rows that a later join could
+resurrect as a phantom region.
+
+**Indexes.** `(region)`, `(language)` — the "preferred region" and "preferred
+language" resolution and the corresponding filters read tags across releases.
+
+**Owner.** SQLite. **Lifecycle.** Persistent (as part of the release).
+
+**Retention.** Follows the release, and only the release.
+
+**Invariant protected.** Region and language are *sets*, and
+`ARCHITECTURE.md` §13.4/§20.4 resolution reads them as sets. A single string
+column would make a multi-region release unrepresentable.
+
+### 6.5 `systems`
+
+**Purpose.** The stable identity of a curated system, so that a persisted release
+can carry a `SystemId` without the database owning the curated catalogue
+(ADR 0004).
+
+**Identity.** `SystemId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `system_id` | UUIDv7 | no | Primary key |
+| `catalog_key` | TEXT | no | The curated slug, e.g. `gba`, `gbc`, `gb` |
+| `created_at` | timestamp | no | When this system was first materialized |
+
+**Unique constraints.** `system_id`; `catalog_key`.
+
+**Indexes.** `(catalog_key)` — resolving a curated key to its stable identity on
+every startup and scan.
+
+**Owner.** SQLite, for **identity binding only**. **Lifecycle.** Persistent.
+
+**Retention.** Never deleted while a release references it. Removing a curated
+system is a catalogue change that requires a migration, not a delete.
+
+**Invariant protected.** Paths and slugs are not domain identities (invariant 2).
+The curated slug is curated data; `SystemId` is the fachliche identity a persisted
+release carries (`bitarchive-domain::system` documents exactly this gap).
+
+**Decision — the app materializes one row per curated system lazily, on first
+need, and never stores curated metadata in it.** The system's display name,
+manufacturer, release year, artwork, accepted formats and recommended core stay
+in the curated catalogue (§12.2). Storing them here would create a second copy of
+curated data that a later catalogue update would have to keep in sync — the
+database would either go stale or start overriding reviewed data.
+
+### 6.6 `content_derivations`
+
+**Purpose.** Anything BitArchive derived from a content and wrote into its own
+data area — today the managed multi-disc `.m3u`
+(`ARCHITECTURE.md` §14.3, `PRODUCT.md` §9).
+
+**Identity.** Database row number. A derivation is not a fachliche entity.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `content_id` | UUIDv7 | no | The derived content |
+| `kind` | TEXT enum | no | `ManagedPlaylist` today |
+| `relative_path` | TEXT | no | Location **inside the BitArchive data area**, relative to the generated-files root |
+| `source_content_id` | UUIDv7 | no | One content the derivation was built from; one row per member |
+| `member_index` | INTEGER | no | The member's 1-based order in the derivation |
+| `created_at` | timestamp | no | When it was generated |
+
+**Primary key.** `(content_id, kind)`.
+
+**Foreign keys.** `content_id → contents.content_id` — `CASCADE` for the
+derivation row; `source_content_id → contents.content_id` — `RESTRICT`.
+
+**Unique constraints.** `(content_id, source_content_id)` — a playlist lists a
+disc once.
+
+**Indexes.** `(source_content_id)` — "which derived files depend on this disc"
+before deleting anything.
+
+**Owner.** SQLite (the row) / file system (the file, BitArchive-owned).
+**Lifecycle.** **Rebuildable** — the row and the file it names can both be
+recreated from the member contents.
+
+**Retention.** Deleted and regenerated freely. Deleting a derivation never
+touches `source_content_id`'s locations, because those are user files.
+
+**Invariant protected.** Original files are never modified (`PRODUCT.md` §9);
+generated files never become authoritative (`ARCHITECTURE.md` §53.7).
+
+### 6.7 The relationship model
+
+```text
+systems ──1:N──> releases <──N:1── games
+                     │                 ▲
+                     │                 │ default_release_id
+                     │ 1:N             │ (SET NULL)
+                     ▼                 │
+                  contents ────────────┘  (game_id, integrity only)
+                     │ 1:N
+                     ▼
+             content_locations ──N:1──> library_sources
+
+games ──1:N──> releases ──1:N──> contents ──1:N──> save_states
+```
+
+A game is **not** reachable from a location by a path. Every traversal goes
+through identities, which is what lets a file move without changing a single
+fachliche relationship (`PRODUCT.md` §7.6).
+
+---
+
+## 7. Content fingerprints
+
+### 7.1 `content_fingerprints`
+
+**Purpose.** Recognize a content again after it moves, is renamed, is copied, or
+reappears in another source (`PRODUCT.md` §7.6, §7.7). A fingerprint is evidence
+*about* a content, never the content's identity (invariant 3).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `content_id` | UUIDv7 | no | The content this fingerprint describes |
+| `fingerprint_kind` | TEXT enum | no | `Payload`, `Container`, `EntryList` |
+| `algorithm` | TEXT enum | no | `Sha256` (canonical, `ARCHITECTURE.md` §11); `Crc32`, `Md5`, `Sha1` only when an external provider or reference data requires them |
+| `digest` | `BLOB(32)` | no | The digest, raw bytes |
+| `entry_path` | TEXT | yes | The archive entry this digest belongs to; `NOT NULL` only for `EntryList` rows |
+| `byte_size` | INTEGER | yes | The size the digest covers; `NULL` = not recorded |
+| `computed_at` | timestamp | no | When it was computed |
+| `source_scan_run_id` | UUIDv7 | yes | The run that computed it; `NULL` = computed outside a persisted run |
+
+**Primary key.** `(content_id, fingerprint_kind, algorithm)` for `Payload` and
+`Container`; `(content_id, fingerprint_kind, algorithm, entry_path)` for
+`EntryList`.
+
+**Foreign keys.** `content_id → contents.content_id` — `CASCADE` (a fingerprint
+without its content is meaningless). `source_scan_run_id → scan_runs.id` —
+`RESTRICT`, nullable.
+
+**Unique constraints / indexes.**
+
+- `(algorithm, fingerprint_kind, digest, byte_size)` — **the recognition index.**
+  It answers "have I seen these bytes before?", which is what moved-file
+  recognition, duplicate detection, and content matching all need. `byte_size` is
+  part of the key because it is nearly free to compare and it removes almost all
+  hash collisions from consideration before a digest comparison happens.
+- `(content_id)` — reading a content's own fingerprints.
+
+**Owner.** SQLite (class A for the *link* to a content) / derived from class B
+bytes. **Lifecycle.** Persistent, but **recomputable**: a fingerprint row may be
+dropped and recomputed from the file at any time without changing a fachliche
+answer.
+
+**Retention.** Recomputation replaces the row. A fingerprint is deleted with its
+content. A fingerprint is **never** the target of a foreign key from anywhere
+else in the model.
+
+**Invariant protected.** Hashes are fingerprints, not identities or primary keys
+(invariant 3); SHA-256 is the canonical content hash
+(`ARCHITECTURE.md` §11).
+
+### 7.2 What each fingerprint kind means
+
+```text
+Payload      the playable content itself.
+             For a plain ROM/ISO: the file's bytes.
+             For a ZIP: the bytes of the one playable entry, NOT the container.
+             → This is the fingerprint that identifies a release's content.
+
+Container    the bytes of the archive file as a whole.
+             → Detects "the same ZIP file moved", cheaply, without re-reading members.
+
+EntryList    one digest per entry inside an archive, with its entry_path.
+             → Lets a change inside an archive be detected without hashing
+               everything, and makes an ambiguous archive's contents diagnosable.
+```
+
+`PRODUCT.md` §10 is explicit that the container is not the identity: **a
+release's content identity is always the `Payload` fingerprint**, and the
+`Container` fingerprint only ever identifies the file.
+
+### 7.3 Hashing and invalidation
+
+- Hashing is **streaming** (`ARCHITECTURE.md` §11). No implementation detail
+  belongs here, but `byte_size` and `observed_mtime` (§5.2) exist precisely so
+  that a re-scan can decide whether a full re-hash is necessary.
+- `(observed_size, observed_mtime)` is an **invalidation hint, not a truth**. If
+  it is unchanged, the existing fingerprint may be reused; the moment either
+  changes, the content MUST be re-hashed.
+- **Decision — the model does not treat size and mtime as proof.** A file can
+  change without its size changing, and mtime is user-settable. Treating them as
+  proof would make BitArchive report a stale fingerprint as current, which is
+  worse than re-hashing.
+
+### 7.4 Recognition, movement and duplication
+
+| Question | How the model answers it |
+|---|---|
+| Did this file move? | The scan computes the `Payload` fingerprint, looks it up in the recognition index, finds an existing content, and adds a `content_locations` row for the new path instead of creating a second game. |
+| Is this a duplicate? | Same `Payload` fingerprint, different `content_locations` rows. Duplicates are shown once in the library (`PRODUCT.md` §7.7). |
+| Which entry of this ZIP is the game? | The `Payload` row whose `content_id` is the `Content` of the release; the archive is the separate `ArchiveContainer` content. |
+| Is this the same archive I saw before? | The `Container` fingerprint. |
+
+Recognition is limited to **exact payload matches**. `PRODUCT.md` §11 excludes
+full ROM integrity verification against reference databases from the MVP, so:
+
+> **Rule (binding).** The model MUST NOT invent a reference ROM database, a
+> known-good hash set, or an integrity verdict that BitArchive cannot derive from
+> the user's own bytes.
+
+---
+
+## 8. Scan runs
+
+### 8.1 `scan_runs`
+
+**Purpose.** A scan is a fachliche event with a history, not a transient job:
+"when was this library last fully scanned successfully" is what decides whether
+reconciliation is allowed (invariant 18).
+
+**Identity.** `ScanRunId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `target_kind` | TEXT enum | no | `FullLibrary`, `LibrarySource`, `Rebuild` |
+| `target_source_id` | UUIDv7 | yes | Required for `LibrarySource`; `NULL` otherwise |
+| `status` | TEXT enum | no | `Running`, `Completed`, `Cancelled`, `Failed` |
+| `started_at` | timestamp | no | Run start |
+| `finished_at` | timestamp | yes | `NULL` while running |
+| `reconciliation_eligible` | boolean | no | Whether this run covered its whole target without a gap; default `0` |
+| `discovered_count` | INTEGER | no | Files observed |
+| `imported_count` | INTEGER | no | Contents newly indexed |
+| `updated_count` | INTEGER | no | Contents whose location or fingerprint changed |
+| `rediscovered_count` | INTEGER | no | Contents recognized at a new path |
+| `missing_count` | INTEGER | no | Locations this run marked missing |
+| `unknown_count` | INTEGER | no | Files not recognized as a supported content |
+| `unsupported_count` | INTEGER | no | Files of a known-unsupported kind |
+| `problem_count` | INTEGER | no | Entries in `scan_run_issues` |
+
+**Foreign keys.** `target_source_id → library_sources.id` — `RESTRICT`, nullable.
+
+**Unique constraints.** `id`. A run is an event: two identical runs are two
+events.
+
+**Indexes.** `(started_at)` — the activity view and "most recent successful full
+scan". `(target_source_id, started_at)` — the same question per source.
+`(status)` — recovery of a run that a crash left `Running`.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Scan runs are **kept**, because they are the evidence that a
+reconciliation was legitimate. §19.7 defines the pruning rule.
+
+**Invariant protected.** Destructive reconciliation only after a successful full
+scan (invariant 18). The `status` and `reconciliation_eligible` columns are what
+make that checkable instead of assumed:
+
+> **Rule (binding).** A run may perform destructive reconciliation only if
+> `status = Completed` **and** `reconciliation_eligible = 1`. A run that was
+> cancelled, failed, was interrupted, or skipped an unreadable subtree MUST leave
+> every location untouched.
+
+**Decision — coverage is a stored flag, not inferred from the counters.** A run
+can complete with plenty of unknown files and still be a complete observation of
+its target; conversely a run that never opened a permission-denied directory
+looks successful by counter alone. The flag records the fact that matters, and
+the reason a run is not eligible is recorded as a `scan_run_issues` row.
+
+**Decision — the run row is written when the run starts.** Writing it only at the
+end would mean an interrupted scan leaves no trace at all, so a crash would be
+indistinguishable from "no scan was running" — and the next startup could not
+tell whether reconciliation was ever completed.
+
+### 8.2 `scan_run_issues`
+
+**Purpose.** Per-item problems and the unknown/unsupported inventory of a run
+(`PRODUCT.md` §12 reports them separately in the scan result).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `scan_run_id` | UUIDv7 | no | The run |
+| `issue_index` | INTEGER | no | Stable order within the run |
+| `kind` | TEXT enum | no | `UnknownFile`, `UnsupportedFile`, `Unreadable`, `PermissionDenied`, `InvalidArchive`, `AmbiguousArchive`, `SourceOffline` |
+| `source_id` | UUIDv7 | yes | The source, when the issue is source-scoped |
+| `relative_path` | TEXT | yes | The path, when the issue is file-scoped |
+| `detail` | TEXT | yes | Machine-readable detail, e.g. the missing companion file of a `BIN/CUE` pair |
+| `byte_size` | INTEGER | yes | Observed size, when known |
+| `prevents_reconciliation` | boolean | no | Whether this issue is what made the run ineligible |
+
+**Primary key.** `(scan_run_id, issue_index)`.
+
+**Foreign keys.** `scan_run_id → scan_runs.id` — `CASCADE` (an issue has no
+meaning without its run). `source_id → library_sources.id` — `RESTRICT`,
+nullable.
+
+**Indexes.** `(scan_run_id, kind)` — the grouped scan summary. `(prevents_reconciliation)`
+— explaining why a run may not reconcile.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Follows its run (§19.7).
+
+**Invariant protected.** Unknown and unsupported files are reported, never
+silently absorbed (`PRODUCT.md` §12); uncertain classification is never
+guessed (`PRODUCT.md` §7.5).
+
+**Decision — the unknown/unsupported inventory is stored as run issues rather
+than as a permanent "unknown files" table.** The product shows the inventory as
+the result *of a run*. A permanent table would need its own reconciliation
+semantics and would become a second, competing answer to "what is in my
+library?"; a run-scoped row is exactly as long-lived as the fact it records.
+
+### 8.3 What a scan run is not
+
+A scan run is **not** the `JobManager`'s job state (`ARCHITECTURE.md` §30.4).
+`JobManager` persistence covers every job type and belongs to the Issue that
+implements job recovery. This model persists the *scan's fachliche history*
+because reconciliation depends on it, and deliberately does not pre-empt the
+generic job table.
+
+---
+
+## 9. Metadata and overrides
+
+### 9.1 The three layers
+
+```text
+provider_values  (what a provider said, with provenance)
+        +
+manual_overrides (what the user decided)
+        ↓
+effective metadata = resolve(manual override, then provider value, then local)
+```
+
+`ARCHITECTURE.md` §16.2 makes this the priority order. It is expressed in the
+model as **two tables plus a resolver**, never as one table with a "current
+value" column.
+
+### 9.2 `metadata_fields`
+
+**Purpose.** The closed set of metadata fields BitArchive understands, so that a
+metadata value can never be an arbitrary string key that nothing can render.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `field_key` | TEXT | no | Primary key, e.g. `title`, `description`, `genre`, `developer`, `publisher`, `release_date`, `players`, `region`, `alternate_title` |
+| `value_kind` | TEXT enum | no | `Text`, `Date`, `Integer`, `TagList` |
+| `is_multi_valued` | boolean | no | Whether several values may coexist for one subject and locale |
+| `is_localizable` | boolean | no | Whether the field may carry a locale |
+
+**Owner.** Populated from the curated field definition set shipped with the app.
+**Lifecycle.** Persistent (small, curated, migration-managed).
+
+**Invariant protected.** Provider data and user input are external; they MUST
+land in a known field, not in a free-form bag.
+
+### 9.3 `provider_values`
+
+**Purpose.** One value a metadata provider returned, with full provenance
+(`ARCHITECTURE.md` §16.3, `PRODUCT.md` §15.9).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `provider_id` | TEXT | no | e.g. `screenscraper` |
+| `subject_kind` | TEXT enum | no | `Game`, `Release` |
+| `subject_id` | UUIDv7 | no | The subject's identity; interpretation depends on `subject_kind` |
+| `field_key` | TEXT | no | One of `metadata_fields.field_key` |
+| `locale` | TEXT | yes | BCP-47 tag; `NULL` = language-neutral |
+| `value_text` | TEXT | yes | The value as text |
+| `value_number` | INTEGER | yes | The value when the field is numeric |
+| `provider_item_id` | TEXT | yes | The provider's own item identifier. **Provenance only** |
+| `fetched_at` | timestamp | no | When the provider returned it |
+| `scrape_run_id` | UUIDv7 | yes | The run that fetched it; `NULL` = fetched outside a persisted run |
+
+**Primary key.** `(provider_id, subject_kind, subject_id, field_key, locale,
+value_index)` — a provider may legitimately return several values for a
+multi-valued field, so `value_index` is part of the key.
+
+**Foreign keys.** `field_key → metadata_fields.field_key` — `RESTRICT`.
+`scrape_run_id → scrape_runs.id` — `RESTRICT`, nullable.
+
+**Unique constraints / indexes.**
+
+- Primary key as above.
+- `(subject_kind, subject_id, field_key)` — the resolver's read path.
+- `(scrape_run_id)` — reporting a run's effect.
+
+**Owner.** SQLite. **Lifecycle.** Persistent, **replaceable per provider**.
+
+**Retention.** A provider refresh **replaces** the rows of that provider for the
+subject and field it refreshed, and **never touches `manual_overrides`**.
+
+**Invariant protected.** Provider data never destroys manual overrides
+(`PRODUCT.md` §15.11); provenance is preserved (`ARCHITECTURE.md` §16.3).
+
+**Decision — a single polymorphic `subject_kind`/`subject_id` pair instead of
+separate game and release metadata tables.** The product scrapes games and shows
+release-specific values (`PRODUCT.md` §32), the resolver's logic is identical for
+both, and one table keeps the resolver, the effective-value view and the search
+projection from being written twice. The cost is that the subject reference
+cannot be a declarative foreign key. That cost is bounded deliberately:
+**only `Game` and `Release` are ever subjects**, and no other kind may be added
+without changing this section. §20.3 lists the referential check that replaces
+the foreign key, and it is a required test of schema v1.
+
+### 9.4 `manual_overrides`
+
+**Purpose.** A field the user set by hand (`PRODUCT.md` §15.11). This is user
+data and the single most protected class A content in the model.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `subject_kind` | TEXT enum | no | `Game`, `Release` |
+| `subject_id` | UUIDv7 | no | The subject's identity |
+| `field_key` | TEXT | no | One of `metadata_fields.field_key` |
+| `locale` | TEXT | yes | `NULL` = language-neutral |
+| `value_text` | TEXT | yes | The override value |
+| `value_number` | INTEGER | yes | The override value when numeric |
+| `created_at` | timestamp | no | When the user set it |
+| `updated_at` | timestamp | no | When it was last changed |
+
+**Primary key.** `(subject_kind, subject_id, field_key, locale)`.
+
+**Foreign keys.** `field_key → metadata_fields.field_key` — `RESTRICT`.
+
+**Indexes.** `(subject_kind, subject_id)` — the resolver's first lookup.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Removed only by an explicit user action: resetting the field to
+the provider value, or resetting the library (`PRODUCT.md` §15.11, §40).
+
+> **Rule (binding).** No scan, no scrape, no provider refresh, no migration, and
+> no cleanup routine may delete or overwrite a `manual_overrides` row. A
+> migration that cannot map an override to the current `metadata_fields` set MUST
+> preserve the row and report it, not drop it (invariant 19).
+
+**Invariant protected.** Invalid or stale user overrides are never silently
+deleted (invariant 19); manual metadata survives re-scans and re-scrapes.
+
+**Decision — "reset to provider value" is a delete of the override row, not a
+copy of the provider value.** Copying the provider value into the override would
+make the field permanently manual, so a later provider refresh could never
+improve it. Deleting the override restores the documented priority order.
+
+### 9.5 Effective metadata resolution
+
+Derived, in this order per `(subject, field_key, requested locale)`:
+
+```text
+1. manual_overrides   where locale = requested locale
+2. manual_overrides   where locale IS NULL                (language-neutral)
+3. provider_values    where locale = requested locale
+4. provider_values    where locale = fallback locale       (PRODUCT.md §15.12)
+5. provider_values    where locale IS NULL
+6. provider_values    where any locale, lowest locale tag  (deterministic tie-break)
+7. absent             → the field is simply not shown
+```
+
+**Rules.**
+
+- Each step is only consulted when the previous one produced nothing.
+- Every step that can return more than one row has a total tie-break: ascending
+  `locale`, then ascending `provider_id`, then ascending `value_index`. Reading
+  the same data twice MUST produce the same effective value
+  (`ARCHITECTURE.md` §36.3).
+- The effective value is **never written to a column**. There is no
+  `effective_title` field, because it would be a second truth that a later
+  override, locale change or provider refresh would have to remember to update.
+- Search indexes the **effective title** (§17), which is why the resolution order
+  above is part of the binding contract and not an implementation detail.
+
+### 9.6 `scrape_runs` and `scrape_run_items`
+
+**Purpose.** Scraping runs are persistent jobs with per-game status, and they can
+be paused and resumed (`ARCHITECTURE.md` §16.4, `PRODUCT.md` §15.5).
+
+**`scrape_runs`**
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `provider_id` | TEXT | no | The provider used |
+| `mode` | TEXT enum | no | `Automatic`, `Interactive` |
+| `scope_kind` | TEXT enum | no | `Library`, `System`, `Game` |
+| `scope_system_id` | UUIDv7 | yes | Required for `System` |
+| `scope_game_id` | UUIDv7 | yes | Required for `Game` |
+| `only_missing` | boolean | no | "only games without metadata" |
+| `fields_missing` | TEXT | yes | Field selection, stored as the canonical serialized field-key list; `NULL` = all fields |
+| `status` | TEXT enum | no | `Queued`, `Running`, `Paused`, `Completed`, `Cancelled`, `Failed` |
+| `started_at` | timestamp | no | Run start |
+| `finished_at` | timestamp | yes | `NULL` while unfinished |
+| `updated_count` | INTEGER | no | Games updated |
+| `no_match_count` | INTEGER | no | No match |
+| `multiple_match_count` | INTEGER | no | Several matches |
+| `error_count` | INTEGER | no | Network/API errors |
+| `skipped_count` | INTEGER | no | Skipped |
+| `override_protected_count` | INTEGER | no | Fields left alone because an override exists (`PRODUCT.md` §15.6) |
+
+**Foreign keys.** `scope_system_id → systems.system_id` — `RESTRICT`, nullable.
+`scope_game_id → games.id` — `RESTRICT`, nullable. `provider_id →
+metadata_providers.provider_id` — `RESTRICT`.
+
+**Indexes.** `(status)` — resume after a crash. `(started_at)`.
+
+**`scrape_run_items`**
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `scrape_run_id` | UUIDv7 | no | The run |
+| `game_id` | UUIDv7 | no | The game |
+| `status` | TEXT enum | no | `Pending`, `Updated`, `NoMatch`, `MultipleMatches`, `Error`, `Skipped` |
+| `candidate_count` | INTEGER | no | How many candidates the provider returned |
+| `accepted_provider_item_id` | TEXT | yes | The provider item the run accepted; provenance only |
+| `error_detail` | TEXT | yes | Machine-readable error detail; **never** a credential (§9.7) |
+| `updated_at` | timestamp | no | When the item reached this status |
+
+**Primary key.** `(scrape_run_id, game_id)`.
+
+**Foreign keys.** `scrape_run_id → scrape_runs.id` — `CASCADE`.
+`game_id → games.id` — `RESTRICT`.
+
+**Indexes.** `(scrape_run_id, status)` — the resume set and the run summary.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Scrape runs and their items are kept as job history (§19.7). They
+are the audit trail for "why did this field change", and provider values
+reference them.
+
+**Invariant protected.** Scraping is separate from library scanning
+(invariant 14); a paused run resumes per game (`PRODUCT.md` §15.5); a scrape
+never overwrites a manual override (invariant 19).
+
+**Decision — a run's status is persisted, and `Running` after a crash is
+recovered, not trusted.** The row records what the run *was doing*; the recovery
+step at startup converts a stale `Running` into `Paused` (resumable) or `Failed`.
+Without the persisted status, resuming a multi-hour scrape would be impossible
+without re-scraping everything already done.
+
+### 9.7 `metadata_providers`
+
+**Purpose.** The providers BitArchive may use, so that a stored
+`provider_id` is a known key rather than a free string.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `provider_id` | TEXT | no | Primary key, e.g. `screenscraper` |
+| `display_name` | TEXT | no | User-visible name |
+| `is_enabled` | boolean | no | Whether the provider may be used |
+
+**Owner.** Populated from the curated provider list. **Lifecycle.** Persistent.
+
+**Invariant protected.** `ARCHITECTURE.md` §53.15: network activity belongs to
+explicit subsystems. A provider that is not in this table cannot be referenced.
+
+> **Rule (binding).** **No credential, API key, token, password or secret of any
+> kind is ever stored in the database.** Provider credentials live only in the
+> `SecretStore` boundary (`ARCHITECTURE.md` §32, `PRODUCT.md` §15.8). These tables
+> may reference a provider by `provider_id`; they MUST NOT carry a secret column,
+> a secret value, or a secret passed through in `error_detail`.
+
+---
+
+## 10. Media assets
+
+### 10.1 `media_assets`
+
+**Purpose.** Metadata and a reference for one media file in the managed media
+store. **SQLite stores no media bytes** (`ARCHITECTURE.md` §18.1).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `media_type` | TEXT enum | no | `Cover`, `Screenshot`, `SaveStateThumbnail` |
+| `locale` | TEXT | yes | Locale the asset belongs to; `NULL` = locale-neutral |
+| `provider_id` | TEXT | yes | Where it came from; `NULL` = user-supplied |
+| `source_provider_item_id` | TEXT | yes | Provider's own identifier; provenance only |
+| `managed_relative_path` | TEXT | yes | Location inside the managed media store; `NULL` = not materialized yet |
+| `content_digest` | `BLOB(32)` | yes | SHA-256 of the stored bytes; `NULL` = not hashed yet |
+| `byte_size` | INTEGER | yes | Size of the stored file |
+| `pixel_width` | INTEGER | yes | Intrinsic width, when known |
+| `pixel_height` | INTEGER | yes | Intrinsic height, when known |
+| `state` | TEXT enum | no | `Pending`, `Available`, `Missing`, `Unusable` |
+| `created_at` | timestamp | no | When the asset record was created |
+| `last_verified_at` | timestamp | yes | When the file was last confirmed present |
+
+**Foreign keys.** `provider_id → metadata_providers.provider_id` — `RESTRICT`,
+nullable.
+
+**Unique constraints.**
+
+- `id`.
+- `(media_type, locale, provider_id, content_digest)` — the same logical asset
+  from the same provider with the same bytes is one record. Note that the same
+  bytes may legitimately appear under two locales or two providers, which is why
+  the digest alone is not the key.
+- **`content_digest` is deliberately not unique.** The managed media store is
+  content-addressed (`ARCHITECTURE.md` §18.1), so two records may point at one
+  blob; deduplicating the *file* MUST NOT force deduplicating the *record*, or a
+  release-scoped screenshot and a game-scoped cover of the same image would
+  collapse into one row that can only belong to one of them.
+
+**Indexes.** `(media_type)`, `(content_digest)`, `(state)` — the garbage
+collector walks unreferenced available assets.
+
+**Owner.** SQLite (class A for the record) / managed media store (class B for the
+bytes). **Lifecycle.** Persistent record, **Rebuildable** bytes.
+
+**Retention.** The record survives a missing file (`state = Missing`) so that a
+later re-scrape or a restored media store can reattach to it. The bytes are
+removed only by the controlled garbage-collection step
+(`ARCHITECTURE.md` §18.3), which runs **after** the reference rows are gone.
+
+**Invariant protected.** No media bytes in SQLite; media files live in the managed
+store, never beside the user's ROMs (`PRODUCT.md` §15.10).
+
+### 10.2 `media_asset_references`
+
+**Purpose.** Which game or release an asset belongs to, and in which logical slot.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `media_asset_id` | UUIDv7 | no | The asset |
+| `subject_kind` | TEXT enum | no | `Game`, `Release` |
+| `subject_id` | UUIDv7 | no | The subject |
+| `logical_key` | TEXT | no | The slot, e.g. `box-front`, `screen-1` |
+
+**Primary key.** `(subject_kind, subject_id, logical_key)` — one asset per slot
+per subject, which is what makes "replace the cover" a replace rather than an
+append.
+
+**Foreign keys.** `media_asset_id → media_assets.id` — `RESTRICT`: the reference
+is protected, but see the deletion rule below.
+
+**Indexes.** `(media_asset_id)` — finding unreferenced assets for garbage
+collection. `(subject_kind, subject_id)` — loading a game's or release's media.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** A reference for a subject that is deleted is deleted **with** that
+subject (§19.3), and the asset record it pointed at becomes a garbage-collection
+candidate but is not removed immediately — the same bytes may still be
+referenced elsewhere.
+
+**Invariant protected.** One logical slot has one asset; content-addressed
+deduplication does not become content-identity confusion.
+
+### 10.3 The transient image cache
+
+Thumbnails and render caches live under the OS cache path
+(`ARCHITECTURE.md` §18.2) and are **not modelled at all**. They are `Temporary`,
+have no rows, and may be deleted at any time. A derived thumbnail is never a
+`media_assets` row, because a row would make a disposable file look like user
+state.
+
+---
+
+## 11. Firmware index
+
+### 11.1 `firmware_entries`
+
+**Purpose.** An index of the user's one central firmware folder
+(`ARCHITECTURE.md` §25.1, `PRODUCT.md` §20.1). Firmware remains an external,
+user-owned resource; this table is an **index over it**.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `relative_path` | TEXT | no | Path relative to the configured firmware root |
+| `filename` | TEXT | no | The file name as observed |
+| `byte_size` | INTEGER | no | Size in bytes |
+| `mtime` | timestamp | no | Modification time |
+| `digest` | `BLOB(32)` | yes | SHA-256; `NULL` = not hashed yet (see decision below) |
+| `digest_computed_at` | timestamp | yes | When the digest was computed |
+| `state` | TEXT enum | no | `Present`, `Missing`, `Unreadable` |
+| `first_seen_at` | timestamp | no | When the entry was first indexed |
+| `last_seen_at` | timestamp | no | When it was last observed present |
+
+**Primary key.** `(relative_path)`. The relative path is the index's key **and
+explicitly not a domain identity**: no fachliche entity references a firmware
+entry, and the whole table may be deleted and rebuilt.
+
+**Foreign keys.** None. The table is self-contained and points at nothing.
+
+**Unique constraints.** `(relative_path)` (the primary key); `(digest)` is
+**not** unique — two identical firmware dumps under different names are a
+legitimate, reportable state ("content correct, file name wrong",
+`PRODUCT.md` §20.4).
+
+**Indexes.** `(filename)` — matching a core's `expected_filenames`;
+`(digest)` — matching a requirement's accepted hashes; `(state)`.
+
+**Owner.** Index over class B. **Lifecycle.** **Rebuildable** — drop and rescan.
+
+**Retention.** Removed when the file disappears (`state = Missing` first, then
+pruned on the next successful firmware scan), and never the other way round.
+BitArchive **never** copies, renames, moves, downloads, repairs or distributes a
+firmware file (`PRODUCT.md` §20.2, §20.3, invariant 20).
+
+**Invariant protected.** Firmware requirements belong to the core
+(invariant 9); firmware rows are not the firmware (invariant 4).
+
+**Decision — `digest` is nullable, and that is deliberate.** `ARCHITECTURE.md`
+§25.1 lists `SHA-256` among the indexed fields, but ADR 0004 records that
+BitArchive has **no reviewed source for the SHA-256 of a commercial BIOS dump**,
+and Issue #89 is the open decision that will supply one. Hashing every file in
+the user's firmware folder is also expensive and reveals nothing while no
+requirement can be compared against it. The column therefore exists, is filled
+once a reviewed hash source exists, and readiness falls back to
+filename-presence matching until then. **This document does not pre-empt #89**,
+and a `NULL` digest MUST NOT be read as "wrong content".
+
+### 11.2 `firmware_index_state`
+
+**Purpose.** When the firmware folder was last successfully scanned, so that
+readiness can report "stale index" instead of guessing, and so that an
+unscanned folder is distinguishable from an empty one.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `singleton` | INTEGER | no | Primary key, `CHECK (singleton = 1)` — one row only |
+| `last_scan_at` | timestamp | yes | `NULL` = never scanned |
+| `root_location` | TEXT | yes | The root that was scanned; detects "the user moved the folder" |
+| `entry_count` | INTEGER | no | Entries found |
+| `scan_status` | TEXT enum | no | `Never`, `Complete`, `Partial`, `Failed` |
+
+**Owner.** SQLite. **Lifecycle.** **Rebuildable.**
+
+**Retention.** Reset on the next firmware scan.
+
+**Invariant protected.** Readiness is derived from the index and the core
+requirements (`ARCHITECTURE.md` §25.3), never from the existence of a file the
+index has not observed.
+
+---
+
+## 12. Managed components
+
+### 12.1 `managed_components`
+
+**Purpose.** A database-visible **index** of the component store, for queries
+like "which cores are installed", "which runtime versions are still present",
+and "which save states would become a version mismatch if this core version were
+removed". The store itself remains authoritative.
+
+The store layout this index describes (ADR 0001 §4, ADR 0002 §6):
+
+```text
+<component root>/
+├── runtime/<platform>/<version>/…                ← installed runtime
+├── runtime/<id>/active                           ← the activation record
+├── cores/<component-key>/<platform>/<build-id>/… ← installed core
+├── staging/install-…/                            ← transient, removed on every path
+└── artifacts/<…>                                 ← verified downloads, rebuildable
+```
+
+**Identity.** `ManagedComponentId` — a UUIDv7 minted **once** the first time an
+artifact is observed in the store, and stored nowhere else. It exists so that a
+row can be referenced stably by `core_option_schemas`, `core_option_overrides`,
+`save_states` and `sessions`; it MUST NOT be treated as the component's name.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `component_id` | UUIDv7 | no | Primary key (`ManagedComponentId`) |
+| `component_class` | TEXT enum | no | `Runtime`, `Core` |
+| `component_key` | TEXT | no | The distribution slug, e.g. `retroarch`, `mgba` (`bitarchive-domain::ComponentId`) |
+| `platform` | TEXT | no | The platform segment of the store layout, e.g. `macos-universal`, `macos-arm64` |
+| `version` | TEXT | no | The store's version segment **verbatim**: the runtime version (`1.22.2`) or the core **build id** (`mgba-0.11-212-7a12d6d`) |
+| `revision` | TEXT | yes | For a core: the upstream revision the build id names; `NULL` for a runtime |
+| `relative_path` | TEXT | no | Location inside the component store |
+| `executable_relative_path` | TEXT | yes | For a runtime: the executable below `relative_path` |
+| `library_relative_path` | TEXT | yes | For a core: the loadable library below `relative_path` |
+| `libretro_core_name` | TEXT | yes | For a core: how RetroArch addresses it, e.g. `mgba_libretro` |
+| `artifact_digest` | `BLOB(32)` | yes | The verified artifact digest the install was validated against |
+| `integrity_state` | TEXT enum | no | `Verified`, `Unknown`, `Missing`, `Unusable` |
+| `first_seen_at` | timestamp | no | When the index first observed it |
+| `last_seen_at` | timestamp | no | When the store was last confirmed to contain it |
+
+**Unique constraints.**
+
+- `(component_class, component_key, platform, version)` — **one index row per
+  installed artifact.** This is the rule that keeps a re-scan idempotent instead
+  of minting a new `ComponentId` for every pass.
+- `component_id` (primary key).
+
+**Foreign keys.** None. A component index row references nothing and nothing
+references it by `ComponentId`; assignments reference cores
+(`cores.core_id`, §12.3), which is the fachliche identity.
+
+**Indexes.** `(component_class, component_key, platform)` — "which builds of this
+core are installed". `(integrity_state)`.
+
+**Owner.** Index over class B. **Lifecycle.** **Rebuildable**.
+
+**Retention.** An entry whose directory no longer exists is removed or marked
+`Missing` on the next reconciliation, and a full rebuild may drop the whole table
+(§12.4).
+
+**Invariant protected.** Runtime and cores are separately versioned components
+(invariant 10); app updates never update them implicitly (invariant 11).
+
+**Decision — a persisted component index is not a contradiction of ADR 0001/0002,
+because it is `Rebuildable` and off the critical path.** ADR 0001 rejected
+"introduce SQLite for the component registry **now**" and ADR 0002 rejected a
+database core registry because "the installed set is derivable from the store
+layout". Both stay true: the store is authoritative, the installed set is derived
+by listing directories, and this table is a *cache* that may be dropped at any
+time. It exists because two questions genuinely need a join that the file system
+cannot answer — the core-update impact report of `ARCHITECTURE.md` §23.2 ("how
+many save states become a version mismatch") and orphan detection across the
+session and save-state history. A caller that finds this table empty must fall
+back to the store, never to an error.
+
+**Decision — for a core, the version segment is the build id, and both the build
+id and the revision are stored.** ADR 0002 established that the observed version
+string is **not monotonic** (a rebuild produced a lower number) and that "the
+commit count inside it is not identity: the revision is". `version` therefore
+holds the store's directory name verbatim — which is the only thing that can
+resolve a path — and `revision` holds the upstream revision separately, so
+"is this the build I reviewed?" is answerable without parsing a directory name.
+
+**Decision — there is no `is_active` column for runtimes and no "active core"
+concept at all.** ADR 0001 makes the active runtime a **file-system registry**
+(`components/runtime/<id>/active`) that may only point at an installed version;
+ADR 0002 states there is no activation record, no "current core", and no default
+core, because core selection is answered by `System → Game → optional Release`
+(invariant 21). A database `is_active` column would be a **second, contradictory
+answer** to both questions. The runtime's active version is therefore read from
+the store, exactly like the installed set.
+
+**Decision — `ManagedComponentId` is a UUIDv7 because rows are referenced, and it
+is explicitly not a `bitarchive-domain` identity type.** Nothing about a managed
+component is a domain entity; the referenced rows are the only reason an identity
+exists here. It is listed in §3.1 for completeness and MUST NOT be persisted into
+a UI contract, a cover-rail anchor or a user preference — those use `GameId`,
+`ReleaseId`, `ContentId`, `SystemId`, `CoreId` and `SaveStateId`.
+
+**Decision — no shared "component" row for runtime and core together.** They
+share download/verify/stage/install/activate/rollback infrastructure but are
+different fachliche component types (`ARCHITECTURE.md` §23.4). One table with a
+class discriminator is used because the *index* genuinely stores the same
+artifact observations for both; the fachliche separation is preserved by the
+`component_class` constraint and by the fact that only cores have a `cores` row
+(§12.3) and only runtimes have an activation registry.
+
+### 12.2 The curated catalogue is not in the database
+
+> **Rule (binding).** The curated system/format/core catalogue — systems,
+  manufacturers, release years, accepted formats, detection rules, recommended
+  and alternative cores, capabilities, firmware requirements, launch rules,
+  component definitions and their pins — is **shipped with the app as reviewed
+  data and constants**. It is **not** stored in SQLite.
+
+Consequences:
+
+- There are no `catalog_systems`, `catalog_cores`, `capabilities` or
+  `detection_rules` tables.
+- `systems` and `cores` exist only to **bind a stable identity** to a curated key
+  (§6.5, §12.3), which a persisted row needs and the catalogue cannot supply.
+- The database never overrides a curated definition. A user's preference is a
+  *scope assignment* (§13, §14, §12.3), never an edited catalogue entry.
+
+**Why.** `ARCHITECTURE.md` §15 makes the catalogue versioned, data-driven, CI
+validated, and delivered with the app. Mirroring it into SQLite would create a
+second copy that a catalogue update could not reliably refresh, and the curation
+would stop being reviewable in one place. The separation is also exactly the
+"Curated Catalog vs. Online Distribution Manifest" line from the backlog audit,
+extended to the database: **curated catalogue, distribution manifest and database
+are three separate things.**
+
+### 12.3 `cores` and core selection overrides
+
+**`cores`** binds a `CoreId` to a curated core component so that a scope can
+select it.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `core_id` | UUIDv7 | no | Primary key — the fachliche core identity |
+| `component_key` | TEXT | no | The curated core component, e.g. `mgba` |
+| `platform` | TEXT | no | The platform the assignment targets |
+| `created_at` | timestamp | no | When the binding was first needed |
+
+**Unique constraints.** `core_id`; `(component_key, platform)` — one fachliche
+core per distributable component per platform, which is precisely the distinction
+ADR 0002 draws between `CoreId` and `CoreComponentId`.
+
+**Foreign keys.** `(component_key, platform)` →
+`managed_components(component_key, platform)` — `RESTRICT`, **not** to a specific
+version. A core assignment names *which core*, never *which build*; which build
+is active follows from the store and the core-version pin. Binding an assignment
+to a version would make a core update silently invalidate every assignment.
+
+**`core_selection_overrides`** — the persisted core selection.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `scope_kind` | TEXT enum | no | `System`, `Game`, `Release` |
+| `scope_system_id` | UUIDv7 | yes | Required for `System` |
+| `scope_game_id` | UUIDv7 | yes | Required for `Game` |
+| `scope_release_id` | UUIDv7 | yes | Required for `Release` |
+| `core_id` | UUIDv7 | no | The selected core |
+| `created_at` | timestamp | no | When it was set |
+
+**Primary key.** Three partial unique indexes, mirroring the shape used for
+settings (§13.1):
+
+- `(scope_system_id)` where `scope_kind = 'System'`
+- `(scope_game_id)` where `scope_kind = 'Game'`
+- `(scope_release_id)` where `scope_kind = 'Release'`
+
+**Foreign keys.** `scope_system_id → systems.system_id` — `CASCADE`;
+`scope_game_id → games.id` — `CASCADE`; `scope_release_id → releases.id` —
+`CASCADE`; `core_id → cores.core_id` — `RESTRICT`.
+
+**Indexes.** `(core_id)` — "which assignments use this core" before removing one.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Removed by an explicit user reset, or with the scope it belongs
+to.
+
+**Invariant protected.** Invariant 21: core resolution follows
+`System → Game → optional Release` and there is no global core default. There is
+deliberately **no `Global` scope value in the enum**, so a global default is not
+merely unimplemented — it is unrepresentable.
+
+> **Rule (binding).** A `Release`-scoped override may only exist while the
+> selected core is compatible with the release's system and content
+> (`ARCHITECTURE.md` §23.5). Compatibility is checked by the resolver; the model
+> records the assignment, and an assignment that is no longer compatible is
+> **reported, not deleted** (invariant 19).
+
+**Decision — core selection gets its own table, not a row in the settings
+table.** `ARCHITECTURE.md` §23.5 requires core selection to be persisted
+separately from RetroArch settings and core options. They also differ in shape:
+core selection has a `Release` scope and RetroArch settings deliberately do not
+(§13.4).
+
+### 12.4 Reconciliation with the component store
+
+> **Rule (binding).** For every managed component the **component store is
+> authoritative**. The database index is reconciled to it, never the reverse.
+
+```text
+store directory present, index row absent   → add index row (Verified after check)
+index row present, store directory absent   → mark Missing, then remove on rebuild
+store directory present, index row stale    → update from the store
+```
+
+A component directory is **never** deleted because a database row says so, and
+BitArchive never deletes, rewrites or repoints an installed component to satisfy
+the index. The only deletions in the component store are the explicit
+retention/rollback rules of `ARCHITECTURE.md` §23.3 (keep active and previous),
+which belong to the component subsystem and not to the database.
+
+`component_index_state` records `last_scan_at` and `last_scan_status` so that
+"the index has never been built" is distinguishable from "the store is actually
+empty".
+
+---
+
+## 13. RetroArch settings
+
+### 13.1 `retroarch_setting_overrides`
+
+**Purpose.** The structured, typed RetroArch settings BitArchive manages, with
+the inheritance hierarchy `Global → System → Game`
+(`ARCHITECTURE.md` §26.1, `PRODUCT.md` §21.1). **No `.cfg` file is the source of
+truth** (`ARCHITECTURE.md` §53.7).
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `scope_kind` | TEXT enum | no | `Global`, `System`, `Game` |
+| `scope_system_id` | UUIDv7 | yes | Required for `System`, otherwise `NULL` |
+| `scope_game_id` | UUIDv7 | yes | Required for `Game`, otherwise `NULL` |
+| `setting_key` | TEXT | no | The technical key, e.g. `video_vsync` |
+| `value_type` | TEXT enum | no | `Bool`, `Integer`, `Float`, `Choice`, `Text` |
+| `value_bool` | INTEGER | yes | Set only for `Bool`; `0`/`1` |
+| `value_integer` | INTEGER | yes | Set only for `Integer` |
+| `value_float` | REAL | yes | Set only for `Float` |
+| `value_text` | TEXT | yes | Set for `Choice` and `Text` |
+| `created_at` | timestamp | no | When the override was set |
+| `updated_at` | timestamp | no | When it was last changed |
+
+**Primary key.** Three partial unique indexes:
+
+- `(setting_key)` where `scope_kind = 'Global'`
+- `(scope_system_id, setting_key)` where `scope_kind = 'System'`
+- `(scope_game_id, setting_key)` where `scope_kind = 'Game'`
+
+**Foreign keys.** `scope_system_id → systems.system_id` — `CASCADE`;
+`scope_game_id → games.id` — `CASCADE`.
+
+**Indexes.** `(scope_kind, scope_system_id)`, `(scope_kind, scope_game_id)`.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Removed when the user resets a value to "inherited", or with the
+scope it belongs to. **Not** removed because it became invalid.
+
+**Invariant protected.** `Global → System → Game` inheritance with explicit
+overrides only (`ARCHITECTURE.md` §26.1, §53.7).
+
+### 13.2 Typed values
+
+The `value_type` discriminator plus one populated value column is what keeps a
+boolean from being stored three ways (`true`, `yes`, `1`) and keeps a generator
+from having to guess how to render a value. `bitarchive-domain::config` already
+models exactly this set (`Bool`, `Integer`, `Float`, `Choice`, `Text`) and the
+scope precedence as a property of the scope rather than of the caller's order; the
+column set above is its storage form.
+
+**Rule (binding).** Exactly one value column is populated, matching
+`value_type`. The schema MUST enforce this, not merely document it.
+
+### 13.3 No definition table
+
+`ARCHITECTURE.md` §26.2 mentions a `SettingDefinition` describing type, default
+and supported scopes. **That registry is curated code, not database content**
+(§12.2), so there is no `setting_definitions` table. `setting_key` is validated
+against the curated registry when a value is written and when it is read.
+
+**Decision — validity is derived at load time and not stored.** A stored
+`is_valid` column would freeze the verdict of whatever registry version wrote the
+row, so a RetroArch or BitArchive update that *fixes* a definition could never
+make an existing override usable again without a data migration, and one that
+*breaks* a definition would leave a stale "valid" flag behind. Validation is a
+pure function of (stored value, current definition, current core version), which
+is exactly the shape §2.2 says to derive.
+
+### 13.4 Release scope
+
+> **Rule (binding).** There is **no `Release` scope for RetroArch settings and no
+> `Release` scope for core options.** The `scope_kind` enums of §13.1 and §14.1
+> MUST NOT contain a `Release` variant.
+
+`ARCHITECTURE.md` §20.4 states this explicitly: a release-specific core override
+is part of core resolution only, and RetroArch settings and core options stay on
+their own `Global/System/Game` and `Core Defaults/System/Game` scopes.
+
+### 13.5 Generated configuration
+
+The `.cfg` files under `sessions/<session-id>/` are **session artifacts**
+(`ARCHITECTURE.md` §28) and are not modelled as data at all. They are generated
+from the effective configuration, and the effective configuration is derived from
+this table. `PRODUCT.md` §21.2 excludes a generic `.cfg` editor, so a `.cfg` is
+never an input.
+
+---
+
+## 14. Core options
+
+### 14.1 `core_option_overrides`
+
+**Purpose.** Core-specific options, a **separate configuration domain** from
+RetroArch settings (`ARCHITECTURE.md` §27, `PRODUCT.md` §21.4), with the
+hierarchy `Core Defaults → System → Game`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `core_version_id` | UUIDv7 | no | The concrete core version this override belongs to |
+| `scope_kind` | TEXT enum | no | `CoreDefaults`, `System`, `Game` |
+| `scope_system_id` | UUIDv7 | yes | Required for `System`, otherwise `NULL` |
+| `scope_game_id` | UUIDv7 | yes | Required for `Game`, otherwise `NULL` |
+| `option_key` | TEXT | no | The core's technical option key |
+| `value_text` | TEXT | no | The stored value, as text |
+| `created_at` | timestamp | no | When the override was set |
+| `updated_at` | timestamp | no | When it was last changed |
+
+**Primary key.** Three partial unique indexes:
+
+- `(core_version_id, option_key)` where `scope_kind = 'CoreDefaults'`
+- `(core_version_id, scope_system_id, option_key)` where `scope_kind = 'System'`
+- `(core_version_id, scope_game_id, option_key)` where `scope_kind = 'Game'`
+
+**Foreign keys.** `core_version_id → managed_components.component_id` —
+`RESTRICT`; `scope_system_id → systems.system_id` — `CASCADE`;
+`scope_game_id → games.id` — `CASCADE`.
+
+**Indexes.** `(core_version_id)`, `(scope_kind, scope_game_id)`.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Removed by an explicit user reset or with its scope. **Never**
+removed because a core update made it invalid.
+
+**Invariant protected.** Core options are not RetroArch settings
+(`ARCHITECTURE.md` §27); invalid stored overrides are preserved (invariant 19).
+
+**Decision — values are stored as text, with the schema supplying the typing.**
+A core option's value domain is defined by the *core*: its type and its allowed
+values come from the core's schema, which is only known after introspection and
+is not curated by BitArchive. Storing a guessed `value_type` would freeze a
+guess. Text plus the schema's own validation is the honest form, and it is the
+one shape that survives a core version whose option changed type.
+
+### 14.2 `core_option_schemas` and `core_option_definitions`
+
+**Purpose.** The options a concrete core version actually offers
+(`ARCHITECTURE.md` §27.1). Schemas belong to a **concrete core version**.
+
+**`core_option_schemas`**
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `core_version_id` | UUIDv7 | no | Primary key — one schema per core version |
+| `introspected_at` | timestamp | no | When introspection ran |
+| `definition_count` | INTEGER | no | Options found |
+| `introspection_status` | TEXT enum | no | `Complete`, `Partial`, `Failed` |
+
+**`core_option_definitions`**
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `core_version_id` | UUIDv7 | no | The core version |
+| `option_key` | TEXT | no | The core's technical option key |
+| `value_type` | TEXT enum | no | `Bool`, `Integer`, `Float`, `Choice`, `Text` |
+| `default_value` | TEXT | yes | The core's own default |
+| `allowed_values` | TEXT | yes | Canonical serialized list of allowed values for a `Choice`; `NULL` otherwise |
+| `display_name` | TEXT | yes | The core's label, if it provides one |
+| `definition_index` | INTEGER | no | The option's order in the core's own list |
+
+**Primary key.** `(core_version_id)` and `(core_version_id, option_key)`.
+
+**Foreign keys.** `core_version_id → managed_components.component_id` —
+`CASCADE` (a schema without its core version is meaningless).
+
+**Note on `core_version_id`.** It references one `managed_components` row, whose
+`version` column holds the store's build-id segment for a core (ADR 0002 §6,
+§12.1). An option schema is therefore bound to a build, not to a core and not to
+a floating version string, which is what `ARCHITECTURE.md` §27.1 requires.
+
+**Owner.** SQLite (the introspection *result* is BitArchive state; its
+*authority* is the core binary). **Lifecycle.** Persistent, and **rebuildable**
+by re-running introspection against the installed core version.
+
+**Retention.** Schemas are **kept per version**, not replaced on core update, so
+that overrides of an older version stay interpretable in diagnosis. They are
+removed when the core version itself is removed from the store
+(`ARCHITECTURE.md` §23.3).
+
+**Invariant protected.** Core options belong to a concrete core version
+(`ARCHITECTURE.md` §27.1); introspection happens after
+installation/activation, not when the settings screen opens
+(`ARCHITECTURE.md` §27.2).
+
+### 14.3 Scope identity
+
+An option override is keyed by `(core_version_id, scope, option_key)` — **not**
+by core identity. That is the whole point of `ARCHITECTURE.md` §27.1: an option
+set is a property of a *version*, because a core update may rename, retype,
+re-default or remove options.
+
+`CoreDefaults` is the bottom of the hierarchy and therefore needs no
+`scope_system_id`/`scope_game_id`: it is already version-scoped.
+
+### 14.4 Inheritance and effective value
+
+```text
+Game  >  System  >  CoreDefaults
+```
+
+The most specific scope that offers a **defined** option for this core version
+wins. An override for an option the core version does not define is simply not
+applied.
+
+### 14.5 Invalid overrides
+
+> **Rule (binding).** A stored override that no longer validates against the
+> current schema for its core version is:
+>
+> 1. **kept** — not deleted, not migrated away, not nulled;
+> 2. **not applied** — it does not become an effective value;
+> 3. **reported** — surfaced as a warning the user can see and resolve
+>    (`ARCHITECTURE.md` §27.3, invariant 19).
+
+Because validity is derived (§13.3), this needs no status column: both sides of
+the comparison are available at read time. A later core version that reintroduces
+a compatible option therefore heals the override automatically, which a stored
+`is_invalid` flag could not do.
+
+An invalid stored override is **not** a content problem. A launch that is blocked
+because of one is reported as `InvalidConfiguration` and never as
+`InvalidContent` (`ARCHITECTURE.md` §21).
+
+---
+
+## 15. Save states
+
+### 15.1 `save_states`
+
+**Purpose.** BitArchive's management and metadata layer over the save-state files
+**RetroArch** owns (`ARCHITECTURE.md` §29, `PRODUCT.md` §23). BitArchive indexes
+them; it does not own them.
+
+**Identity.** `SaveStateId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `release_id` | UUIDv7 | no | The release this state belongs to |
+| `core_id` | UUIDv7 | no | The core that wrote it |
+| `core_version_id` | UUIDv7 | yes | The concrete core version, when it is known |
+| `core_version_label` | TEXT | yes | The version as observed in the file name/label, when the version cannot be bound to an installed build |
+| `slot` | TEXT | yes | The technical slot/identifier RetroArch uses; `NULL` = not slot-derived |
+| `state_name` | TEXT | yes | The name RetroArch's state is addressed by |
+| `created_at` | timestamp | no | The state's timestamp as observed |
+| `file_relative_path` | TEXT | no | The state file's location, relative to the RetroArch save-state root |
+| `file_size` | INTEGER | yes | Observed size |
+| `file_mtime` | timestamp | yes | Observed modification time |
+| `display_name` | TEXT | yes | The user's name for this state. **BitArchive-only** |
+| `thumbnail_media_asset_id` | UUIDv7 | yes | The optional thumbnail; `NULL` = none |
+| `state` | TEXT enum | no | `Present`, `Missing`, `Unreadable` |
+| `last_seen_at` | timestamp | no | When the file was last confirmed present |
+| `last_scan_run_id` | UUIDv7 | yes | The discovery pass that last saw it |
+
+**Foreign keys.**
+
+- `release_id → releases.id` — `RESTRICT`.
+- `core_id → cores.core_id` — `RESTRICT`.
+- `core_version_id → managed_components.component_id` — `RESTRICT`, nullable.
+- `thumbnail_media_asset_id → media_assets.id` — `SET NULL`, nullable.
+- `last_scan_run_id → scan_runs.id` — `RESTRICT`, nullable.
+
+**Unique constraints.**
+
+- `(release_id, core_id, core_version_id, slot)` — **one state per slot per
+  release per core version.** This is the rule that makes discovery idempotent
+  and keeps a re-scan from stacking duplicate rows for the same physical file.
+- `(release_id, core_id, core_version_label, slot)` where `core_version_id IS
+  NULL` — the same rule for states whose core version could not be bound to an
+  installed build.
+- `(file_relative_path)` — one index row per physical state file.
+
+**Indexes.**
+
+- `(release_id, created_at DESC)` — the timeline of a release, which is the
+  product's primary presentation (`PRODUCT.md` §23.5).
+- `(core_id, core_version_id)` — version-mismatch counting for the core-update
+  impact report (`ARCHITECTURE.md` §23.2).
+- `(state)` — the "state file vanished" maintenance query.
+
+**Owner.** SQLite (metadata) / RetroArch and the file system (the files).
+**Lifecycle.** Persistent metadata over class B files.
+
+**Retention.** A state row is removed when the user confirms deletion, **and only
+after** the file operations succeeded (§19.5). A missing file sets
+`state = Missing`; it does not delete the row, because the user's state may be
+temporarily unavailable (an unmounted volume) and a silently forgotten save state
+is the worst possible outcome for a user.
+
+**Invariant protected.** Save states belong to `Release + Core + Core Version`
+(invariant 12). Normal RetroArch saves are outside the model (invariant 13).
+
+> **Rule (binding).** This model covers save states only. SRAM, memory cards and
+> every other regular RetroArch save file MUST NOT be modelled, indexed, listed or
+> deleted by BitArchive (`PRODUCT.md` §23).
+
+### 15.2 Which core version a state belongs to
+
+A save-state file does not carry a machine-readable core version. The model
+therefore allows both:
+
+- `core_version_id` — set when the state can be bound to an installed managed
+  core version (from RetroArch's own naming and the installed set);
+- `core_version_label` — the version text as observed, used when no binding is
+  possible.
+
+**Decision — an unbound version label is stored as text rather than forcing a
+binding.** Inventing a `core_version_id` would attribute a state to a version
+that did not write it, and the compatibility verdict would then be confidently
+wrong. Keeping the observed label lets the UI say "version unknown, treat as
+potentially incompatible", which is the conservative answer the product asks for
+(`PRODUCT.md` §23.4).
+
+### 15.3 Compatibility is derived, never stored
+
+```text
+core_id equals the active core AND core_version_id equals the active version
+        → Compatible
+core_id equals the active core AND version differs (or is unknown)
+        → VersionMismatch
+core_id differs
+        → IncompatibleCore
+```
+
+> **Rule (binding).** Compatibility MUST be computed from `core_id` and the core
+> version. There is **no** stored compatibility column, and no stored
+> "compatible" list.
+
+A stored verdict would become a second truth the moment the active core or its
+version changed, and it would be unverifiable: nothing could tell whether it was
+still true. Deriving it makes `Continue` — "the newest `Compatible` state for the
+active release, core and core version" — a query instead of a synchronization
+problem.
+
+### 15.4 Thumbnails and display names
+
+- The thumbnail is a `SaveStateThumbnail` media asset (§10), referenced by
+  `thumbnail_media_asset_id`. Thumbnails remain **technically separate files**
+  (`ARCHITECTURE.md` §29.5).
+- `display_name` lives **only** in BitArchive. Physical state files are never
+  renamed to carry it (`PRODUCT.md` §23.2, `ARCHITECTURE.md` §29.5).
+
+### 15.5 Discovery
+
+Discovery runs at startup, after a session ends, and on explicit refresh
+(`ARCHITECTURE.md` §29.2). It reconciles the index with the file system with the
+same authority rule as §12.4: the **file system wins**. No permanent file watcher
+exists in the MVP, so the index is only ever as fresh as the last discovery pass.
+
+---
+
+## 16. Sessions and statistics
+
+### 16.1 `sessions`
+
+**Purpose.** One emulation session — the record that makes exclusivity,
+recovery, playtime and statistics possible (`ARCHITECTURE.md` §22).
+
+**Identity.** `SessionId`.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `id` | UUIDv7 | no | Primary key |
+| `game_id` | UUIDv7 | no | The launched game |
+| `release_id` | UUIDv7 | yes | The release that was launched |
+| `content_id` | UUIDv7 | yes | The content that was launched |
+| `content_location_kind` | TEXT enum | yes | `File` or `ArchiveEntry`, mirroring the resolved launch content |
+| `core_id` | UUIDv7 | yes | The core that was used |
+| `core_version_id` | UUIDv7 | yes | The concrete core version |
+| `core_version_label` | TEXT | yes | The observed version, when it could not be bound (§15.2) |
+| `runtime_version` | TEXT | yes | The managed runtime version |
+| `started_at` | timestamp | no | Session start |
+| `ended_at` | timestamp | yes | `NULL` while active |
+| `state` | TEXT enum | no | `Active`, `Finalized`, `Recovered`, `Abandoned` |
+| `duration_ms` | INTEGER | yes | Total session duration; `NULL` while active |
+| `active_duration_ms` | INTEGER | yes | Foreground/observed play time when it differs from wall clock |
+| `process_id` | INTEGER | yes | PID of the emulator process |
+| `process_started_at` | timestamp | yes | Process start time, for identity |
+| `process_executable` | TEXT | yes | Executable identity, for recovery |
+| `exit_kind` | TEXT enum | yes | `ClosedGracefully`, `ForceKilled`, `Crashed`, `ProcessGone`, `Unknown` |
+| `exit_code` | INTEGER | yes | Raw exit code when available |
+| `exit_signal` | TEXT | yes | Terminating signal, when that is how it ended |
+| `recovery_note` | TEXT | yes | Machine-readable note about how a stale session was resolved |
+| `session_directory` | TEXT | yes | Location of the session's generated artifacts, relative to the generated-files root |
+| `created_at` | timestamp | no | Row creation |
+
+**Foreign keys.** `game_id → games.id` — `RESTRICT`. `release_id →
+releases.id` — `RESTRICT`, nullable. `content_id → contents.content_id` —
+`RESTRICT`, nullable. `core_id → cores.core_id` — `RESTRICT`, nullable.
+`core_version_id → managed_components.component_id` — `RESTRICT`, nullable.
+
+**Unique constraints.**
+
+- `id`.
+- **At most one active session:**
+  `(state)` unique where `state = 'Active'`. A partial unique index over a
+  constant means "there may be at most one row in this state", which is exactly
+  the MVP rule (`ARCHITECTURE.md` §22, `PRODUCT.md` §27.1). It is enforced by the
+  database rather than by application discipline, so a second concurrent start
+  cannot succeed even if a caller forgets to check.
+
+**Indexes.**
+
+- `(game_id, started_at DESC)` — the per-game session history and the derived
+  statistics (§16.3).
+- `(state)` — the active-session lookup at startup and before every launch.
+- `(started_at)` — the activity view and retention.
+
+**Owner.** SQLite. **Lifecycle.** Persistent.
+
+**Retention.** Sessions are user history and are the source of playtime, so they
+are kept (§19.7).
+
+**Invariant protected.** Exactly one active session; a session is persistent so
+recovery is possible (`PRODUCT.md` §27.6).
+
+**Decision — the active session is also the recovery record, and `state`
+distinguishes it from a stale row.** A session that has started is written
+immediately with `state = 'Active'` and `ended_at = NULL`. At startup the process
+identity (`process_id` + `process_started_at` + `process_executable`,
+`ARCHITECTURE.md` §22.1) decides:
+
+```text
+process still running  → keep Active, resume
+process gone           → finalize: state = Recovered, ended_at = now, exit_kind = ProcessGone
+```
+
+A separate `active_session` table would be a second truth that could disagree
+with the session history, and it would make "exactly one active session" a rule
+two tables have to keep.
+
+**Decision — `runtime_version` is stored as text on the session, not as a
+`ComponentId` link.** The runtime a session ran on is a historical fact: the
+build may be removed by retention long before the session row is ever pruned, and
+a foreign key would either block that removal or erase the fact. The version
+string is what the session actually needs to report.
+
+**Decision — recovery never invents an end time.** A session whose process is
+gone is finalized with the time of the recovery and `state = Recovered`, not with
+a guessed end. `duration_ms` therefore means "observed or recovery-bounded
+duration", and `recovery_note` says so. A fabricated exact end time would be
+unverifiable and would silently distort playtime.
+
+### 16.2 Generated session artifacts
+
+`retroarch.cfg`, `core-options.cfg`, `launch.json`, `stdout.log` and `stderr.log`
+live under `sessions/<session-id>/` (`ARCHITECTURE.md` §28) and are
+**SessionScoped artifacts, not fachliche data**.
+
+> **Rule (binding).** No table stores the *content* of a generated session
+> artifact. The session row references the **directory**
+> (`session_directory`) at most. A generated `.cfg` MUST NOT be read back as an
+> authoritative setting, and a log MUST NOT be parsed as domain state.
+
+**Decision — the artifact directory is referenced from the session row rather
+than modelled by its own rows.** The directory is derived from the session
+identity, and a row per artifact would be a table of files whose authority is
+explicitly denied. Keeping the path on the session row is enough to find the
+artifacts for diagnosis and to delete them with the session under the
+`SessionScoped` rule.
+
+### 16.3 Statistics are derived from sessions
+
+`PRODUCT.md` §27.4 requires `lastPlayedAt`, `totalPlayTime`, `playCount` and the
+duration of the last session. All four are **pure functions of the session rows**:
+
+| Value | Derivation |
+|---|---|
+| `lastPlayedAt` | `MAX(started_at)` over the game's finalized sessions |
+| `totalPlayTime` | `SUM(COALESCE(active_duration_ms, duration_ms))` over the same |
+| `playCount` | `COUNT(*)` over the same |
+| `lastSessionDuration` | `duration_ms` of the session with the greatest `started_at` |
+
+> **Rule (binding).** There is **no statistics table**. Statistics MUST be
+> derived from `sessions`.
+
+**Decision and its reason — derived, not stored.** A materialized statistics
+table would be a second truth that every session write, crash recovery, session
+deletion and library reset would have to keep in step, and its most likely
+failure mode is silent: a playtime that is slightly wrong forever, with no way to
+tell which of the two values is right. Deriving makes a wrong statistic
+impossible by construction; the cost is an aggregate query. That cost is
+acceptable because the query is a per-game `GROUP BY` over a table with a
+`(game_id, started_at)` index, and the library views that need cross-game ranking
+(`RecentlyPlayed`, `Playtime` in `ARCHITECTURE.md` §36.1) can be answered by the
+same indexed aggregate.
+
+The retained history is what makes this decision safe: **because sessions are
+kept, the derivation stays total.** Pruning sessions would silently reduce
+lifelong playtime, so §19.7 only permits pruning that preserves the lifetime
+totals.
+
+### 16.4 What is deliberately not modelled
+
+- **No normal saves.** SRAM, memory cards and other regular RetroArch saves are
+  outside BitArchive scope (`ARCHITECTURE.md` §53.13,
+  `PRODUCT.md` §23). No table, no index, no reference.
+- **No `JobManager` job table.** `ARCHITECTURE.md` §30.4 keeps job persistence
+  with the Issue that implements job recovery; this document models the
+  *fachliche* run histories that reconciliation and resume actually need (§8.3).
+- **No window/focus/presentation state.** Focus is stored as a fachliche
+  identity (`ARCHITECTURE.md` §36.3), never as a list index, and it belongs to
+  UI state, not to this model.
+- **No telemetry, no analytics, no user account, no sync state**
+  (`ARCHITECTURE.md` §53.16).
+
+---
+
+## 17. Search / FTS projection
+
+### 17.1 What is indexed
+
+One FTS5 index over the library, providing title search
+(`ARCHITECTURE.md` §36.4) and the filter/sort columns the library views need
+(`ARCHITECTURE.md` §36.1).
+
+| Indexed value | Derived from |
+|---|---|
+| Effective title | §9.5, layers 1–7 on `metadata_fields.field_key = 'title'` (and `alternate_title` as secondary text) |
+| Effective release title | the same resolution for the release-scoped `title` field, when it differs |
+| System display name | the curated catalogue, via `releases.system_id → systems.catalog_key` |
+| Release region and language tags | `release_regions`, `release_languages` |
+| Release type | `releases.release_type` |
+| Favorite / hidden / ignored | `games.is_favorite`, `games.is_hidden`, `games.is_ignored` |
+| Release date | `releases.release_date` |
+
+### 17.2 Rules
+
+> **Rules (binding).**
+>
+> 1. The index contains the **effective** title, including manual overrides.
+>    A user who renames a game finds it under the new name.
+> 2. FTS5 is a **projection and MUST NOT be a fachliche truth**. Nothing reads
+>    the index to answer a fachliche question; the index only *locates* rows.
+> 3. `search_index` MUST be rebuildable from class A tables alone, at any time,
+>    with no user-visible loss of meaning. It is therefore `Rebuildable`.
+> 4. The index returns a **stable `GameId`**, and the query layer joins back to
+>    `games` for the authoritative row. Results MUST carry the `GameId`, never a
+>    row offset or a list position (`ARCHITECTURE.md` §53.22).
+> 5. Every sort has a deterministic tie-breaker over stable identities, so the
+>    same query returns the same order twice (`ARCHITECTURE.md` §36.3).
+
+### 17.3 Rebuild triggers
+
+Rebuilding is required when:
+
+- a `manual_overrides` row is created, changed or deleted;
+- `provider_values` change for `title` or `alternate_title`;
+- a release is added, removed, or has its region/language/type/date changed;
+- `games.is_favorite`, `is_hidden` or `is_ignored` changes;
+- the locale preference changes (the effective title may change with it);
+- the index is missing or its version marker does not match the schema version;
+- a migration changes any input to the projection.
+
+**Decision — incremental maintenance is allowed, full rebuild is the contract.**
+Triggers or explicit writes may keep the index warm for responsiveness, but the
+binding guarantee is that a full rebuild from class A always reproduces the same
+index. An incrementally maintained index whose full rebuild is untested would be
+a truth of its own, which rule 2 forbids.
+
+**Decision — the projection is keyed by `GameId`, and a game appears once.** A
+game with six releases is one library entry (`PRODUCT.md` §7.7), so the index must
+carry exactly one row per game for title search. Release-level attributes are
+used for filtering and for display, not for multiplying search results.
+
+### 17.4 No SQL
+
+This section defines the projection conceptually. The FTS5 object, its tokenizer,
+its columns and its triggers are schema-v1 work (Issue #109).
+
+---
+
+## 18. Schema versioning and migration rules
+
+### 18.1 The migration ledger
+
+`schema_migrations` is the single authoritative record of what has been applied.
+
+| Column | Logical type | Null | Meaning |
+|---|---|---|---|
+| `version` | INTEGER | no | Primary key; sequential, starting at 1 |
+| `description` | TEXT | no | Human-readable purpose |
+| `checksum` | TEXT | no | Digest of the migration's own definition, to detect an edited released migration |
+| `applied_at` | timestamp | no | When it was applied |
+| `bitarchive_version` | TEXT | no | The app version that applied it |
+
+**Owner.** SQLite. **Lifecycle.** Persistent. **Retention.** Never pruned; the
+ledger is the history.
+
+### 18.2 Binding rules
+
+> **Rules (binding).**
+>
+> 1. Migrations are **sequential and versioned**. Version `n+1` may only be
+>    applied after version `n`.
+> 2. Migrations are **forward-only**. There is **no down-migration as a product
+>    mechanism** (`ARCHITECTURE.md` §9).
+> 3. An **older application MUST refuse** to open a database whose schema version
+>    is newer than the newest migration that application knows.
+> 4. Migrations run **before** any repository or service is constructed: the
+>    database is migrated to the version the binary expects as part of bootstrap,
+>    so no repository can ever observe a partially migrated database.
+> 5. **Backup restore reuses the same migration runner.** A restored database is
+>    migrated by the same code path as a freshly opened one
+>    (`ARCHITECTURE.md` §9, §34.2).
+> 6. Migrations may combine SQL and Rust-based data transformation.
+> 7. A **released migration MUST NOT be edited** to be prettier. A correction is
+>    a new migration (`AGENTS.md` §9). The `checksum` column makes a violation
+>    detectable.
+> 8. A migration that cannot map existing data MUST preserve it and report the
+>    problem rather than dropping rows — in particular `manual_overrides`
+>    (§9.4) and stored overrides (§14.5).
+
+### 18.3 Refusing a newer database
+
+The refusal is a **hard startup failure with an explicit message**, naming the
+database's schema version and the application's supported version. It MUST NOT:
+
+- open the database read-only and continue,
+- ignore unknown tables or columns,
+- attempt a best-effort partial read.
+
+A newer database may contain rows whose meaning this application would
+misinterpret, and a misinterpretation that writes is far worse than a refusal. The
+failure is reported to the user as an actionable condition ("this library was
+created by a newer BitArchive version"), not as a crash.
+
+### 18.4 What the version number means
+
+The **schema version** is the `MAX(version)` in `schema_migrations`. It is:
+
+- recorded in the backup manifest (`ARCHITECTURE.md` §34), so a restore knows what
+  it is restoring;
+- **not** the app version. The two are independent, and a release that adds no
+  migration keeps the schema version;
+- the marker the FTS projection and the component index compare against to decide
+  whether they need a rebuild (§17.3).
+
+**Decision — the ledger is a table of applied migrations, not a single version
+row.** A single row answers "what version is this?", which is all the refusal rule
+needs, but it cannot answer "was migration 7 applied with a definition that has
+since been edited?" or "in what order were Rust-based transformations applied?".
+The log costs one small table and makes the migration history auditable, which is
+the property `ARCHITECTURE.md` §9 is protecting.
+
+---
+
+## 19. Deletion and retention rules
+
+### 19.1 The governing principles
+
+1. **The database never deletes an external user file** (invariant 20). Every
+   deletion of a file outside BitArchive's own data area requires an explicit,
+   confirmed user action.
+2. **Losing a file never deletes fachliche identity.** Going offline, unplugging
+   a volume, moving a file and revoking a permission all change *observations*,
+   never identities.
+3. **Invalid user data is preserved** (invariant 19). A row that no longer
+   validates is reported, not removed.
+4. **A cascade must be justified by the parent owning the child.** No unnamed
+   `ON DELETE CASCADE` (§3.7).
+5. **Derived data may always be rebuilt, so it may always be dropped** — as long
+   as the rebuild is from class A and reproduces the same answer.
+6. **Destructive reconciliation requires a successful complete scan**
+   (invariant 18).
+
+### 19.2 Removing a Library Source
+
+```text
+1. Set library_sources.removed_at                    (the source is no longer active)
+2. Delete its content_locations rows                 (they were paths under its root)
+3. Diff each affected content against its remaining locations
+4. A content with no location left            → keep the row; it is now "not found"
+5. A game/release with no located content     → keep every row; it leaves the
+                                                active library view, and its
+                                                metadata, overlays, favorites and
+                                                statistics all survive
+6. Delete nothing outside the database
+```
+
+`PRODUCT.md` §7.3 is the specification: source files stay untouched, games that
+came *only* from that source leave the active library, and metadata, favorites and
+statistics survive so that re-adding the source can recognize the content again.
+
+> **Rule (binding).** A source removal MUST NOT delete a `games`, `releases`,
+> `contents`, `manual_overrides`, `provider_values`, `sessions`, `save_states` or
+> `media_assets` row.
+
+**Removing a source ≠ rebuilding the library.** A rebuild (`PRODUCT.md` §40) is
+an explicit "forget everything and scan again": it resets the index — contents,
+locations, scan history, scraped provider values — and then re-scans. It still
+never touches user files, and it is not reachable from a source removal.
+
+### 19.3 Deleting a Game
+
+A game is deleted only by an explicit user action. The order is:
+
+```text
+1. Delete its manual overrides and provider values
+2. Delete its media references (§10.2) and sessions
+3. Delete its save-state rows (metadata only; the files stay)
+4. Delete its core-option and setting overrides, core selection overrides
+5. Delete its contents and their locations and fingerprints
+6. Delete its releases (and their region/language tags)
+7. Delete the game row
+8. Never delete a ROM, ISO, ZIP, firmware or save-state file
+```
+
+**Rule (binding).** Step 8 is unconditional. `PRODUCT.md` §41 states that
+BitArchive never deletes the underlying ROM/ISO files; even the explicit
+"BitArchive vollständig zurücksetzen" resets BitArchive's own data only.
+
+**Decision — "hide" and "ignore" are flags, not deletions.** `PRODUCT.md` §41
+offers exactly three MVP actions besides playing: hide from the library, ignore,
+and reset the index entry. None of them deletes user data, so none of them needs
+a destructive implementation, and all three are reversible. Deletion only ever
+removes BitArchive's own rows.
+
+### 19.4 Missing content
+
+| Observation | Effect |
+|---|---|
+| A location is not seen by an eligible scan | `content_locations.state = 'Missing'`; `last_seen_at` is not advanced |
+| A source is `Offline` / `PermissionDenied` / `Missing` | **No** location is marked missing at all |
+| A content has no `Present` location | It is "not found": it leaves the launchable set but keeps its identity, fingerprints and every referencing row |
+| The file reappears | The next scan sets `state = 'Present'` and advances `last_seen_at`; because the identity was never dropped, all metadata and statistics are still attached |
+
+> **Rule (binding).** A missing content never deletes a game, a release, or a
+> content. Only an explicit user action or a library rebuild removes those rows,
+> and neither touches the file system outside BitArchive.
+
+### 19.5 Deleting a Save State
+
+The order is fixed by `ARCHITECTURE.md` §29.6 and is **file-system operation
+first**:
+
+```text
+1. Delete the actual RetroArch state file
+2. Delete the thumbnail file, if present
+3. Only then update the database index
+```
+
+> **Rule (binding).** If step 1 or step 2 fails, the database row MUST remain and
+> the failure MUST be reported. A row is never deleted for a file that still
+> exists, because the next discovery pass would simply rediscover the state and
+> the user's deletion would look like it silently failed.
+
+**Note on the thumbnail.** Because the same bytes may back several media records
+(§10.1), deleting the thumbnail *file* is only correct once no other media
+reference still needs it. The deletion step therefore removes the reference and
+lets the controlled garbage collection (`ARCHITECTURE.md` §18.3) drop the file
+when the last reference is gone. Observed behavior for the user is unchanged — the
+thumbnail disappears from BitArchive — and no other asset breaks.
+
+### 19.6 Provider refresh and overrides
+
+> **Rule (binding).** A provider refresh may **create, update and delete
+> `provider_values` rows**. It MUST NOT create, update or delete a
+> `manual_overrides` row. A field that has an override is reported as
+> "override protected" (`PRODUCT.md` §15.6) instead of being overwritten.
+
+### 19.7 Retention summary
+
+| Structure | Lifetime | Retention rule |
+|---|---|---|
+| `library_sources` | Persistent | Kept; removal sets `removed_at` |
+| `content_locations` | Persistent | Kept while the content exists; `Missing` is a state, not a deletion |
+| `games`, `releases`, `contents` | Persistent | Only an explicit user action or a library rebuild |
+| `release_regions`, `release_languages` | Persistent | Cascade with their release (intrinsic parts) |
+| `content_fingerprints` | Persistent, recomputable | Replaced on recompute; deleted with the content |
+| `content_derivations` | Rebuildable | Deleted and regenerated freely |
+| `systems`, `cores` | Persistent | Never deleted while referenced |
+| `core_selection_overrides`, `retroarch_setting_overrides`, `core_option_overrides` | Persistent | Explicit reset or scope deletion; never for invalidity |
+| `metadata_fields`, `metadata_providers` | Persistent | Curated; changed by migration |
+| `provider_values` | Persistent | Replaced per provider refresh; deleted with the subject |
+| `manual_overrides` | Persistent | **Explicit user action only** |
+| `scrape_runs`, `scrape_run_items` | Persistent | Job history; pruned only as a whole run after 90 days |
+| `scan_runs`, `scan_run_issues` | Persistent | The most recent successful full scan and the most recent run per source are **always** kept; older runs pruned after 90 days |
+| `media_assets`, `media_asset_references` | Persistent record / Rebuildable bytes | Bytes via controlled garbage collection only |
+| `firmware_entries`, `firmware_index_state` | Rebuildable | Dropped and rebuilt on a firmware scan |
+| `managed_components`, `component_index_state` | Rebuildable | Reconciled to the component store |
+| `save_states` | Persistent (metadata) | Only after a successful file deletion; `Missing` is a state |
+| `sessions` | Persistent | **Not pruned** (lifetime totals, §16.3) |
+| `search_index` | Rebuildable | Dropped and rebuilt (§17.3) |
+| `schema_migrations` | Persistent | Never |
+
+**Decision — the pruning horizon is 90 days for run history.** Run history exists
+to make reconciliation and resume legitimate and to explain a scan to the user.
+Both needs are bounded by recent history, so keeping every run of a library
+scanned nightly forever would grow the database without adding an answer. The two
+carve-outs are non-negotiable: the most recent **successful full scan** is the
+evidence that the *next* reconciliation may be destructive, and the most recent
+run per source is what the UI reports after a restart.
+
+**Decision — sessions are never pruned.** §16.3 derives `totalPlayTime` and
+`playCount` from them. Pruning would make lifelong statistics shrink, which is
+user-visible data loss. If the table ever needs bounding, the correct change is a
+separate lifetime-totals store written *before* any pruning — a future Issue, not
+a silent retention rule.
+
+### 19.8 Generated artifacts
+
+| Artifact | Lifetime | Rule |
+|---|---|---|
+| `sessions/<session-id>/retroarch.cfg`, `core-options.cfg`, `launch.json` | SessionScoped | Deleted with the session's artifacts; never read back as truth |
+| `sessions/<session-id>/stdout.log`, `stderr.log` | SessionScoped | Prorated by the log retention policy; never parsed as domain state |
+| Managed `.m3u` playlists | Rebuildable | Regenerated on demand |
+| `Cache/downloads`, `Cache/staging`, `Cache/extracted`, `Cache/images` | Temporary | Removable by startup cleanup |
+| Managed media blobs | Rebuildable | Removed only by the controlled garbage collector |
+
+> **Rule (binding).** Startup cleanup removes only artifacts that are
+> unambiguously BitArchive-owned, temporary, or expired (invariant 20,
+> `ARCHITECTURE.md` §35.1). It MUST NOT touch a configured library source, the
+> firmware folder, the managed component store, or a save-state file.
+
+---
+
+## 20. Schema-v1 derivation checklist
+
+### 20.1 Tables
+
+| # | Table | Section | Identity |
+|---|---|---|---|
+| 1 | `schema_migrations` | §18.1 | `version` |
+| 2 | `systems` | §6.5 | `SystemId` |
+| 3 | `library_sources` | §5.1 | `LibrarySourceId` |
+| 4 | `games` | §6.1 | `GameId` |
+| 5 | `releases` | §6.2 | `ReleaseId` |
+| 6 | `release_regions` | §6.4 | `(release_id, region)` |
+| 7 | `release_languages` | §6.4 | `(release_id, language)` |
+| 8 | `contents` | §6.3 | `ContentId` |
+| 9 | `content_locations` | §5.2 | none (a location is not an entity) |
+| 10 | `content_derivations` | §6.6 | `(content_id, kind)` |
+| 11 | `content_fingerprints` | §7.1 | `(content_id, kind, algorithm[, entry_path])` |
+| 12 | `scan_runs` | §8.1 | `ScanRunId` |
+| 13 | `scan_run_issues` | §8.2 | `(scan_run_id, issue_index)` |
+| 14 | `metadata_fields` | §9.2 | `field_key` |
+| 15 | `metadata_providers` | §9.7 | `provider_id` |
+| 16 | `provider_values` | §9.3 | `(provider_id, subject, field, locale, value_index)` |
+| 17 | `manual_overrides` | §9.4 | `(subject, field, locale)` |
+| 18 | `scrape_runs` | §9.6 | `ScrapeRunId` |
+| 19 | `scrape_run_items` | §9.6 | `(scrape_run_id, game_id)` |
+| 20 | `media_assets` | §10.1 | `MediaAssetId` |
+| 21 | `media_asset_references` | §10.2 | `(subject, logical_key)` |
+| 22 | `firmware_entries` | §11.1 | `(relative_path)` (an index key, not an identity) |
+| 23 | `firmware_index_state` | §11.2 | `singleton` |
+| 24 | `managed_components` | §12.1 | `ManagedComponentId` |
+| 25 | `component_index_state` | §12.4 | `singleton` |
+| 26 | `cores` | §12.3 | `CoreId` |
+| 27 | `core_selection_overrides` | §12.3 | scope partial uniques |
+| 28 | `retroarch_setting_overrides` | §13.1 | scope partial uniques |
+| 29 | `core_option_schemas` | §14.2 | `core_version_id` |
+| 30 | `core_option_definitions` | §14.2 | `(core_version_id, option_key)` |
+| 31 | `core_option_overrides` | §14.1 | scope partial uniques |
+| 32 | `save_states` | §15.1 | `SaveStateId` |
+| 33 | `sessions` | §16.1 | `SessionId` |
+| 34 | `search_index` (FTS5 + its external-content/source tables) | §17 | projection keyed by `GameId` |
+
+### 20.2 Referential creation order
+
+Tables 26 and 27 reference `managed_components(component_key, platform)`, and
+table 8 references `releases(id, game_id)`. Schema v1 therefore has two
+order-of-creation constraints that a naive alphabetical script would violate:
+
+```text
+managed_components  before  cores
+releases (with a UNIQUE (id, game_id))  before  contents
+scan_runs           before  content_locations, content_fingerprints, save_states
+```
+
+### 20.3 Required integrity tests for schema v1
+
+Each rule below is stated as a test that MUST fail when the rule is broken:
+
+1. A 16-byte value that is not a UUIDv7 is **rejected** on read, per table, and
+   never silently replaced (§3.3).
+2. A digest column is never a primary key and never a foreign key target (§3.4).
+3. `content_locations` rejects two contents claiming the same archive entry
+   (§5.2).
+4. `contents` rejects a `release_id` whose release belongs to a different
+   `game_id` (§6.3).
+5. `release_regions`/`release_languages` reject a duplicate tag and cascade only
+   with their release (§6.4).
+6. Every partial unique index rejects a duplicate and accepts a row that differs
+   only in the discriminating column (`scan_runs` per source, scope partial
+   uniques, fingerprint kinds).
+7. `sessions` rejects a second `Active` row (§16.1).
+8. `media_asset_references` rejects two assets in one logical slot and allows one
+   asset in several slots (§10.2).
+9. `cores` rejects two `CoreId`s for one `(component_key, platform)` (§12.3).
+10. `managed_components` rejects a duplicate artifact and mints exactly one
+    `ComponentId` per artifact (§12.1).
+11. Exactly one value column is populated per settings/override row, matching its
+    `value_type` (§13.2).
+12. A `Release` scope is **impossible** for RetroArch settings and core options
+    (§13.4).
+13. A `Global` scope is **impossible** for core selection (§12.3).
+14. Deleting a `manual_overrides` row is never a side effect of any other
+    deletion in this model (§19.6).
+15. `provider_values.subject_id` and `manual_overrides.subject_id` reference an
+    existing `games` or `releases` row according to `subject_kind` (§9.3). Because
+    the reference is deliberately polymorphic, this MUST be enforced by the write
+    path **and** verified by a test.
+16. `search_index` rebuilds from class A tables to an identical index (§17).
+17. `firmware_entries` and `managed_components` rebuild from the file system to an
+    equivalent index (§11, §12.4).
+18. Opening a database whose `MAX(schema_migrations.version)` exceeds the
+    application's supported version **fails** (§18.3).
+
+### 20.4 Open points this document deliberately does not decide
+
+These are product or cross-cutting questions owned elsewhere. They are recorded
+here with their status so that schema v1 does not silently resolve them.
+
+| Point | Status | Owner |
+|---|---|---|
+| The reviewed source for curated firmware hashes, and therefore whether `firmware_entries.digest` is ever populated | **OPEN** — explicitly deferred | ADR 0004 §5 names no Issue; tracked as #89 |
+| How `previous` is represented for the one-step rollback of `ARCHITECTURE.md` §23.3 | **OPEN** — no document defines a record, a column or a derivation for it | The runtime/core update Issue; §12.1 deliberately stores no `is_active`/`is_previous` flag |
+| Support for archive formats beyond `.zip` | **DECIDED out of MVP** | `PRODUCT.md` §10, §43 |
+| `JobManager` job persistence and job recovery | **OPEN** | The Issue implementing job recovery; §8.3 and §16.4 keep it out of scope here |
+| Core option introspection mechanism (libretro host vs. RetroArch introspection) | **OPEN, internally interchangeable** | `ARCHITECTURE.md` §27.2 |
+| Controller/input mapping persistence | **OPEN** | `PRODUCT.md` §22 keeps full remapping out of MVP |
+| Whether `active_duration_ms` is ever distinct from `duration_ms` | **FAVORED** — the column exists so that a later session implementation can distinguish foreground time from wall clock without a migration | The session lifecycle Issue; not a product decision, and no structure depends on it |
+| Cloud sync, accounts, RetroAchievements and any second device | **DECIDED out of MVP** | `ARCHITECTURE.md` §51 |
+
+**Rule (binding).** No structure in this document may depend on an **OPEN**
+point. Where an open point reaches the schema, the model stores the observation
+(the `NULL`-able digest, the unbound version label) rather than a verdict.
+
+### 20.5 Deliberate choice of scope key types
+
+Three anchors appear in the source documents for "which system" and "which core",
+and this document had to pick one per use. The choices are recorded here because
+they are the kind of detail schema v1 would otherwise re-decide:
+
+| Reference | Chosen key | Reason |
+|---|---|---|
+| A release's system (`releases.system_id`) | `SystemId` (UUIDv7) | `ARCHITECTURE.md` §7 makes it a domain identity, and a release is persisted fachliche data. `bitarchive-domain::system` records the same gap: "turning a system key into a release's `SystemId` is a persistence question". |
+| A library source's fixed system (`library_sources.fixed_system_id`) | `SystemId` (UUIDv7) | `ARCHITECTURE.md` §10.1 declares `fixed_system: Option<SystemId>`. |
+| A configuration or core-selection scope anchor | `SystemId` (UUIDv7) | All three scopes must resolve to the same stable anchor a release carries, or a system-scoped setting could not be found from a release. |
+| The curated catalogue's naming of a system | `catalog_key` slug in `systems` | ADR 0004 §7 is explicit that the slug is not a `SystemId`; the slug is the bridge, not the identity. |
+| A selected core (`core_selection_overrides.core_id`) | `CoreId` (UUIDv7) | ADR 0002 §7: `CoreId` answers "which core did the user configure for this game". |
+| The distributable core a `CoreId` binds to (`cores.component_key`) | distribution slug | ADR 0002 §7: `CoreComponentId` (`mgba`) answers "which distributable thing does BitArchive install". The two are different types with no conversion, so the model stores both and lets the write path bind them. |
+
+---
+
+## Appendix A — Traceability to `ARCHITECTURE.md` §54
+
+| §54 area | This document |
+|---|---|
+| Tables | §20.1 |
+| Foreign keys | §5.2, §6.1–§6.6, §7.1, §8, §9, §10, §11, §12, §13.1, §14.1, §15.1, §16.1 |
+| Unique constraints | §3.5 and every table's constraint list |
+| Game/Release/Content relationships | §6, §6.7 |
+| Provider Metadata | §9.3, §9.7 |
+| Manual Overrides | §9.4, §9.5 |
+| FTS5 | §17 |
+| Scan Runs | §8 |
+| Scrape Runs | §9.6 |
+| Firmware Index | §11 |
+| Components | §12 |
+| Config Overrides | §13 |
+| Core Option Schemas | §14.2 |
+| Save States | §15 |
+| Sessions | §16.1 |
+| Statistics | §16.3 |
+| Media Assets | §10 |
+| Schema-Versionierung | §18 |
+
+## Appendix B — Traceability to `ARCHITECTURE.md` §53 invariants
+
+| Invariant | Where this document protects it |
+|---|---|
+| 1. `Game != Release != Content` | §2.1, §6 |
+| 2. Paths are not domain IDs | §3.4, §5.2, §6.7 |
+| 3. Hashes are not primary keys | §3.4, §7.1, §6.2 |
+| 4. ROMs/BIOS are external resources | §2.3, §11.1, §19 |
+| 5. Slint calls no infrastructure | not a persistence concern; no table stores presentation state (§16.4) |
+| 6. Domain knows no SQLite/Slint/OS types | §1.4, §3.2 (storage types are a persistence concern, not a domain one) |
+| 7. Generated config is never source of truth | §13.5, §16.2, §19.8 |
+| 8. Emulation stays backend-neutral | §16.1 stores `runtime_version` as a fact, not a backend type |
+| 9. Firmware requirements belong to the core | §11.1 (no firmware-requirement table; requirements are curated per core) |
+| 10. Runtime and cores are separately versioned | §12.1 (`component_class`), §12.3 |
+| 11. App updates never update runtime/cores implicitly | §12.4 |
+| 12. Save states belong to Release + Core + Core Version | §15.1, §15.3 |
+| 13. Normal saves stay outside the model | §2.1, §15.1, §16.4 |
+| 14. Scraping is not library scanning | §8, §9.5, §9.7 |
+| 15. Network belongs to explicit subsystems | §9.7 |
+| 16. No telemetry or crash upload | §16.4 |
+| 17. Background tasks never block the UI | not a persistence concern |
+| 18. Destructive reconciliation only after a successful scan | §8.1, §19.1, §19.4 |
+| 19. Invalid user overrides are not silently deleted | §9.4, §13.3, §14.5, §19.1 |
+| 20. Internal cleanup never deletes external user files | §4.3, §19.1, §19.2, §19.3, §19.8 |
+| 21. Core resolution `System → Game → optional Release`, no global default | §12.3 |
+| 22. Focus uses stable IDs, not list indices | §3.1, §17.2 |
+| 23. No app-navigation input during a foreground session | §16.1 records the active session that makes the rule enforceable |

@@ -221,7 +221,7 @@ BitArchive indexiert und verwaltet darüber Metadaten, Kompatibilität, Timeline
 
 ## Projektstatus
 
-Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind dokumentiert. Die Implementierung hat begonnen.
+Produktanforderungen, Architektur, Datenmodell, UI/UX-Konzept und Entwicklungsprozess sind dokumentiert. Die Implementierung hat begonnen.
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
@@ -251,6 +251,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 ├── AGENTS.md
 ├── PRODUCT.md
 ├── ARCHITECTURE.md
+├── DATA_MODEL.md
 ├── apps/
 │   └── bitarchive-desktop/
 ├── crates/
@@ -274,6 +275,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 | [`PRODUCT.md`](./PRODUCT.md) | Produktfähigkeiten, MVP, Verhalten und Scope |
 | [`docs/UI_UX_CONCEPT.md`](./docs/UI_UX_CONCEPT.md) | Informationsarchitektur, Interaktion, Navigation und UI/UX-Entscheidungsstatus |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Technische Architektur, Subsystemgrenzen und Invarianten |
+| [`DATA_MODEL.md`](./DATA_MODEL.md) | Konkretes Datenmodell: Identitäten, Tabellen, Constraints, Ownership, Lifecycle und Retention-Regeln |
 | [`AGENTS.md`](./AGENTS.md) | Regeln und Kontext für AI-gestützte Entwicklung |
 | [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) | Entwicklungsworkflow, Git, Issues, Tests, PRs und Reviews |
 | [`docs/decisions/`](./docs/decisions/) | Architecture Decision Records für langlebige Querschnittsentscheidungen |
