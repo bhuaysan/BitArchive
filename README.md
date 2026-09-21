@@ -261,6 +261,8 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 │   ├── bitarchive-infrastructure/
 │   ├── bitarchive-platform/
 │   └── bitarchive-ui/
+├── tools/
+│   └── check_data_model.py
 └── docs/
     ├── DEVELOPMENT.md
     ├── UI_UX_CONCEPT.md
@@ -311,6 +313,19 @@ Merge nach main
 Am Ende einer Implementierung wird ein **Handover-Protokoll** erstellt. Dieses dient insbesondere dem Review im ChatGPT-Chat und dokumentiert die vorgenommenen Änderungen, Tests, bekannte Einschränkungen und offene Punkte.
 
 Die vollständigen Entwicklungsregeln stehen in [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md).
+
+### Dokument- und Modellprüfung
+
+`DATA_MODEL.md` wird zusätzlich statisch geprüft. Das Skript validiert die
+Modellkonsistenz direkt aus dem Dokument — unter anderem, dass jeder Foreign Key
+eine existierende Child- und Parent-Spalte nennt, dass kein persistenter Datensatz
+auf eine rebuildbare Tabelle verweist, dass jede Struktur genau eine Lifetime
+besitzt, dass Retention-Regeln und FK-Verhalten zusammenpassen und dass ein
+Library Rebuild den Re-Identifikationspfad erhält:
+
+```bash
+python3 tools/check_data_model.py
+```
 
 ## Repository
 

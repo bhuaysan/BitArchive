@@ -14,6 +14,11 @@ installed state (§3, §4); the 90-day run retention and the run foreign keys we
 reconciled (§5); and the local firmware digest was separated from the trusted
 reference hashes owned by #89 (Consequences).*
 
+*Revised in review round 2: one lifetime per structure and the persistent
+introspection result (§1a, §2); and the library rebuild defined as an index reset
+that keeps the payload fingerprints as recognition evidence, distinct from a
+per-game index reset and from a full reset (§5a).*
+
 ## Context
 
 `DATA_MODEL.md` is the first document that fixes BitArchive's persisted shape.
@@ -99,6 +104,21 @@ Save states, sessions, core-option schemas and core-option overrides reference
 rebuilding the whole installed-state index therefore changes no persistent
 reference.
 
+**Two consequences that were settled in review round 2.**
+
+- **A structure carries exactly one lifetime.** Where one table genuinely spans two
+  owners, the split is by owner rather than by label: `media_assets` is a
+  `Persistent` record *referencing* a `Rebuildable` blob, a derivation header and
+  its members are both `Rebuildable`, and a save state's row is `Persistent` over a
+  file RetroArch owns. No row of `DATA_MODEL.md` describes one structure as two
+  lifetimes at once.
+- **An introspection result is history, not a cache.** `core_option_schemas` and
+  `core_option_definitions` are `Persistent`. The core binary remains the technical
+  authority for what introspection read, but the stored result is BitArchive's
+  record of that discovery, and it usually cannot be re-derived at all because the
+  build may no longer be installed. Re-introspecting the same build may refresh the
+  row; uninstalling the build may not delete it.
+
 **An earlier revision of this ADR's subject document violated the corollary** by
 minting a `ManagedComponentId` inside the rebuildable component index and
 referencing it from persistent tables. It was found in review and corrected by the
@@ -116,9 +136,19 @@ For every value the model asks: is it a pure function of other stored rows?
   component **installed-state** index.
 - **Stored even though it looks derived:** the local firmware SHA-256, because it
   is a measurement of the user's file that the index is required to hold, not a
-  judgement about it (see Consequences); and the `core_versions`/`runtime_versions`
+  judgement about it (see Consequences); the `core_versions`/`runtime_versions`
   anchors, because persistent history must be able to name the build it refers to
-  (decision 1a).
+  (decision 1a); the historical core-option schema of an uninstalled build, because
+  it cannot be re-introspected; and **the canonical payload fingerprint of a
+  content**, because it is the recognition evidence that lets a rebuilt library
+  reconnect a rediscovered payload to its existing `ContentId` (decision 5a).
+
+**Why derived does not mean "delete freely".** Two of the values above are
+technically recomputable *while their input exists* and still must be stored,
+because the point at which they matter is the point at which the input is gone: a
+schema outlives its uninstalled build, and a fingerprint outlives the location it
+was computed from. §2.2's rule is about who owns the answer, not about how cheap it
+would be to recompute in the happy case.
 
 A derived value MUST have a deterministic definition and a **total tie-breaker
 over stable identities**, so reading the same data twice produces the same answer
@@ -239,8 +269,8 @@ is the authority for "this build is installed".
   failed file deletion (`ARCHITECTURE.md` §29.6).
 - **The MVP has no user-facing per-game delete action.** `PRODUCT.md` §41 offers
   hide, ignore and reset index entry, all reversible and none destructive. A
-  `games` row is removed only by the whole-library operations of `PRODUCT.md` §40,
-  and even a full reset never touches a user file.
+  `games` row is removed only by the full reset of `PRODUCT.md` §40, and even a full
+  reset never touches a user file.
 - Startup cleanup touches only unambiguously BitArchive-owned temporary or expired
   artifacts (invariant 20).
 - **A retention rule and a foreign key must be able to hold at the same time.**
@@ -249,6 +279,38 @@ is the authority for "this build is installed".
   is an intrinsic part of its run, it cascades. Ownership relations keep
   `RESTRICT`. A `RESTRICT` on a provenance link would have made the 90-day run
   retention rule unexecutable, which is why the two were reconciled together.
+
+### 5a. Library rebuild clears the index but keeps the evidence that makes it rebuildable
+
+`PRODUCT.md` §40 and `ARCHITECTURE.md` §49.1 define a library rebuild as resetting
+the index and the scraped assignments and then rescanning, with original files
+untouched.
+
+> **Decision.** A library rebuild destroys no fachliche identity and no user or
+> history data. It clears what a rescan re-derives — the scanned locations, the run
+> history, the scraped provider values, generated playlists and the search
+> projection — and it **keeps the canonical `Payload` fingerprint of every
+> content**.
+
+**Why the fingerprint is kept rather than cleared with the rest of the index.**
+Clearing it would make the retained `ContentId`s unreachable. A rescan that finds
+the same bytes must be able to learn which content they already belong to;
+otherwise it either mints a new content — losing the metadata, favorites and
+statistics attached to the old one — or matches on a path or file name, which
+invariant 2 forbids. The fingerprint is therefore not scan index: it is the
+**recognition evidence** that makes "reset the index and rescan" a rebuild rather
+than a fresh start. `Container` and `EntryList` fingerprints describe a specific
+archive's packaging, are not needed for identification, and are re-derived.
+
+The lookup is a function rather than a guess because `DATA_MODEL.md` §7.1 makes
+`(algorithm, fingerprint_kind, digest, byte_size)` **unique** for `Payload` rows,
+so one payload digest maps to exactly one content.
+
+**Distinct from the other two operations.** A per-game index reset is not a library
+rebuild, and neither is a full reset: only the full reset removes `games`,
+`releases`, `contents`, `sessions` or `save_states` rows, and no operation of any
+kind deletes a ROM, ISO, firmware or save-state file. `DATA_MODEL.md` §19.3 defines
+all three.
 
 ## Consequences
 
@@ -270,6 +332,13 @@ is the authority for "this build is installed".
 - Where `ARCHITECTURE.md` wording is stale relative to an accepted ADR, the ADR
   wins and `DATA_MODEL.md` follows it: a core's store version segment is its
   **build id**, not a version string (ADR 0002 §6).
+- **A library rebuild is a reset of the index, not of the library.** It keeps
+  games, releases, contents, payload fingerprints, manual overrides, sessions,
+  statistics, media and configuration, clears the scan-derived index and the
+  scraped values, and then rescans. The retained payload fingerprint is what makes
+  the re-identification path deterministic.
+- **Only the full reset destroys all BitArchive-owned database state**, and it
+  destroys no external file.
 - **The local firmware SHA-256 and the trusted reference hashes are separate
   concerns.** `firmware_entries.digest` is the SHA-256 of the user's own file and
   is computed for every readable file, because `ARCHITECTURE.md` §25.1 asks the
@@ -302,6 +371,10 @@ is the authority for "this build is installed".
 | Allow `Crc32`/`Md5`/`Sha1` in the fingerprint table while fixing the digest at 32 bytes | Inconsistent on its face (4 and 16 byte digests), would need an algorithm-dependent length rule, and would admit a reference-ROM system the MVP excludes. SHA-256 alone is what `ARCHITECTURE.md` §11 makes canonical. |
 | Materialise the resolved preferred release into `games` | `PRODUCT.md` §8.6 puts an *explicit* default first precisely so that the automatic choice keeps being recomputed from the language and region preferences; a stored copy would silently stop honouring a later preference change. |
 | Define a user-facing "Delete Game" action | `PRODUCT.md` §41 enumerates the MVP's per-game operations as hide, ignore and reset index entry, all reversible. A delete action would be new product scope, and the model must not imply one. |
+| Clear the payload fingerprints on a library rebuild along with the rest of the index | Makes the retained `ContentId`s unreachable: the rescan could not tell which content a rediscovered payload belongs to, so it would either lose the attached metadata, favorites and statistics or fall back to matching by path, which invariant 2 forbids. |
+| Let a library rebuild remove games, releases or contents | Turns "rebuild the index" into a destructive reset of user-visible state; `PRODUCT.md` §40 names the index and the scraped assignments, and `ARCHITECTURE.md` §49.1 keeps the original files. Only the full reset destroys identities. |
+| Treat `core_option_schemas` as rebuildable because the core can be re-introspected | An uninstalled build cannot be re-introspected at all, so the "rebuild" would usually be impossible; and overrides must stay interpretable and diagnosable after a core update (invariant 19). |
+| Mint an identity for a rebuildable index row and reference it from persistent data | Violates the corollary of decision 1a: a rebuild could re-mint the identity and detach save states, sessions and overrides. The installed-state index is keyed by the artifact itself instead. |
 
 ## References
 
