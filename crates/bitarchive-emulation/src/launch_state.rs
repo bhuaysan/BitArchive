@@ -18,16 +18,16 @@
 //! # Why the translation exists
 //!
 //! A store error is not a readiness answer. [`RetroArchRuntimeError`] distinguishes
-//! "nothing installed" from "the store cannot be read" from "the installed version
-//! lost its executable", and only the caller of a *launch* can decide what those mean
-//! for a readiness result. The adapter therefore reports them as states —
-//! [`CoreUnusableReason::NotInstalled`] versus
-//! [`CoreUnusableReason::Unusable`] — and nothing here decides whether a launch may
-//! proceed.
+//! "nothing installed" from "the store cannot be read" from "the installed version lost
+//! its executable", and only the caller of a *launch* can decide what those mean for a
+//! readiness result. The adapter therefore reports them as typed states —
+//! [`RuntimeUnavailableReason`] for the runtime,
+//! [`CoreUnusableReason::NotInstalled`] versus [`CoreUnusableReason::Unusable`] for a
+//! core — and nothing here decides whether a launch may proceed.
 //!
 //! The distinction is deliberate: "not installed" is repaired by the existing
-//! acquisition command, while "install present but broken" needs diagnosis, and the
-//! store refuses to install a build it already has.
+//! acquisition command, while "installed but broken" needs diagnosis, and the stores
+//! refuse to install a component they already have.
 //!
 //! # No fallback, no acquisition
 //!
@@ -45,7 +45,7 @@ use bitarchive_application::managed_core::{CoreInstaller, ManagedCore};
 use bitarchive_application::managed_runtime::RuntimeInstaller;
 use bitarchive_application::{
     CoreAvailability, CoreUnusableReason, InstalledCore, LaunchRuntime, LaunchRuntimeResolution,
-    ManagedEmulationState, SystemCoreState,
+    ManagedEmulationState, RuntimeUnavailableReason, SystemCoreState,
 };
 use bitarchive_domain::runtime::{RuntimeDefinition, RuntimeId};
 use bitarchive_domain::system::{EmulatedSystemKey, SystemCore, resolve_system_core};
@@ -119,15 +119,43 @@ impl<'a> ManagedEmulation<'a> {
     }
 }
 
+/// Translates a store failure into the application's runtime reason.
+///
+/// The translation keeps the three answers apart and copies no message: the
+/// application layer names a condition, and phrasing it belongs to the presentation
+/// layer. The one piece of evidence carried across is the executable path a broken
+/// installation was expected to contain, because that is what a caller needs to name
+/// the incomplete installation.
+fn unavailable_reason(error: &RetroArchRuntimeError) -> RuntimeUnavailableReason {
+    match error {
+        RetroArchRuntimeError::NotInstalled { .. } => RuntimeUnavailableReason::NotInstalled,
+        RetroArchRuntimeError::ExecutableMissing { expected, version } => {
+            RuntimeUnavailableReason::ExecutableMissing {
+                expected: expected.clone(),
+                version: version.as_str().to_owned(),
+            }
+        }
+        RetroArchRuntimeError::StoreUnreadable { .. } => RuntimeUnavailableReason::StoreUnreadable,
+    }
+}
+
 impl ManagedEmulationState for ManagedEmulation<'_> {
     /// Resolves the active managed RetroArch runtime.
     ///
     /// The answer is [`LaunchRuntimeResolution::Resolved`] only for an activated
-    /// installation whose executable is actually present, and
-    /// [`LaunchRuntimeResolution::Missing`] for every other outcome. Both
-    /// "not installed" and "installed but broken" are reported as missing *here*,
-    /// because the runtime half of the readiness vocabulary has no separate state for
-    /// a broken installation: either a launch has a program to start or it has not.
+    /// installation whose executable is actually present. Every other outcome is
+    /// [`LaunchRuntimeResolution::Unavailable`] with a **typed reason**, because the
+    /// three failures need three different answers:
+    ///
+    /// ```text
+    /// NotInstalled       → the pinned runtime can be acquired (ADR 0001)
+    /// ExecutableMissing  → a broken installation; acquiring it again cannot repair it
+    /// StoreUnreadable    → the activation state is unknown; diagnosis, not a download
+    /// ```
+    ///
+    /// Collapsing them into one "missing" answer would make a caller offer the
+    /// acquisition command for a state that command cannot repair: the component store
+    /// refuses to install a version it already has.
     fn runtime(&self) -> LaunchRuntimeResolution {
         match self.resolved_runtime() {
             ResolvedRuntime::Runtime(runtime) => {
@@ -137,29 +165,10 @@ impl ManagedEmulationState for ManagedEmulation<'_> {
                     runtime.executable_path(),
                 ))
             }
-            ResolvedRuntime::Unusable(RetroArchRuntimeError::NotInstalled { id }) => {
-                LaunchRuntimeResolution::Missing {
-                    id: id.as_str().to_owned(),
-                }
-            }
-            ResolvedRuntime::Unusable(RetroArchRuntimeError::ExecutableMissing {
-                expected,
-                version,
-            }) => LaunchRuntimeResolution::Missing {
-                id: format!(
-                    "{} (the installed {version} has no executable at {})",
-                    RuntimeId::RETROARCH,
-                    expected.display()
-                ),
+            ResolvedRuntime::Unusable(error) => LaunchRuntimeResolution::Unavailable {
+                id: String::from(RuntimeId::RETROARCH),
+                reason: unavailable_reason(error),
             },
-            ResolvedRuntime::Unusable(RetroArchRuntimeError::StoreUnreadable { cause }) => {
-                LaunchRuntimeResolution::Missing {
-                    id: format!(
-                        "{} (the component store could not be read: {cause})",
-                        RuntimeId::RETROARCH
-                    ),
-                }
-            }
         }
     }
 

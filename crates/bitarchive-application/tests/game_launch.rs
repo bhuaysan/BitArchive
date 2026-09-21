@@ -24,10 +24,11 @@ use std::str::FromStr;
 
 use bitarchive_application::launch_state::{
     CoreAvailability, CoreUnusableReason, InstalledCore, LaunchRuntime, LaunchRuntimeResolution,
+    RuntimeUnavailableReason,
 };
 use bitarchive_application::{
     FirmwareChecker, GameLaunchContext, GameLaunchPlan, GameLaunchRequest, LaunchBlocker,
-    LaunchPreparation, ManagedEmulationState, PreparedGameLaunch, SystemCoreState,
+    ManagedEmulationState, PreparedGameLaunch, SystemCoreState, UnsupportedSystemOrCoreReason,
     prepare_game_launch,
 };
 use bitarchive_domain::component::{
@@ -70,6 +71,14 @@ fn installed_core() -> InstalledCore {
         "/components/cores/mgba/macos-arm64/mgba-0.11-212-7a12d6d",
         MANAGED_LIBRARY,
     )
+}
+
+/// A runtime resolution for a runtime that is not installed.
+fn runtime_not_installed() -> LaunchRuntimeResolution {
+    LaunchRuntimeResolution::Unavailable {
+        id: String::from("retroarch"),
+        reason: RuntimeUnavailableReason::NotInstalled,
+    }
 }
 
 /// A system key from the curated list.
@@ -143,6 +152,10 @@ fn definition_with_firmware(firmware: Vec<FirmwareRequirement>) -> CoreDefinitio
 }
 
 /// The managed state a test wants a negotiation to read.
+///
+/// [`Clone`] so that one fully resolved state can be varied several ways in one test,
+/// which is how the runtime reasons are compared against each other.
+#[derive(Clone)]
 struct FakeState {
     runtime: LaunchRuntimeResolution,
     core: Option<SystemCoreState>,
@@ -163,9 +176,7 @@ impl FakeState {
     /// A state in which nothing is installed.
     fn nothing_installed(definition: CoreDefinition) -> Self {
         Self {
-            runtime: LaunchRuntimeResolution::Missing {
-                id: String::from("retroarch"),
-            },
+            runtime: runtime_not_installed(),
             core: Some(SystemCoreState::Curated {
                 availability: CoreAvailability::Unusable {
                     reason: CoreUnusableReason::NotInstalled,
@@ -177,8 +188,29 @@ impl FakeState {
 
     /// The same state without a runtime.
     fn without_runtime(mut self) -> Self {
-        self.runtime = LaunchRuntimeResolution::Missing {
+        self.runtime = runtime_not_installed();
+
+        self
+    }
+
+    /// The same state with a runtime that is installed but broken.
+    fn with_broken_runtime(mut self) -> Self {
+        self.runtime = LaunchRuntimeResolution::Unavailable {
             id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::ExecutableMissing {
+                expected: PathBuf::from(MANAGED_EXECUTABLE),
+                version: String::from("1.22.2"),
+            },
+        };
+
+        self
+    }
+
+    /// The same state with a component store that cannot be read.
+    fn with_unreadable_runtime_store(mut self) -> Self {
+        self.runtime = LaunchRuntimeResolution::Unavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::StoreUnreadable,
         };
 
         self
@@ -388,8 +420,9 @@ fn a_missing_runtime_blocks_the_launch() {
     assert!(plan.prepared().is_none());
     assert_eq!(
         plan.blockers(),
-        [LaunchBlocker::RuntimeMissing {
-            id: String::from("retroarch")
+        [LaunchBlocker::RuntimeUnavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::NotInstalled,
         }]
     );
     assert_eq!(
@@ -482,7 +515,7 @@ fn missing_content_blocks_the_launch_and_is_reported_with_the_rest() {
     assert!(
         plan.blockers()
             .iter()
-            .any(|blocker| matches!(blocker, LaunchBlocker::RuntimeMissing { .. })),
+            .any(|blocker| matches!(blocker, LaunchBlocker::RuntimeUnavailable { .. })),
         "the missing runtime is still reported: {:?}",
         plan.blockers()
     );
@@ -516,7 +549,10 @@ fn an_unsupported_content_format_blocks_the_launch() {
     match plan.blockers() {
         [LaunchBlocker::UnsupportedSystemOrCore { system, reason }] => {
             assert_eq!(system, &None);
-            assert!(!reason.is_empty(), "the blocker explains itself");
+            assert_eq!(
+                reason,
+                &UnsupportedSystemOrCoreReason::UnsupportedContentFormat
+            );
         }
         blockers => panic!("the format must be reported as unsupported: {blockers:?}"),
     }
@@ -553,8 +589,15 @@ fn a_system_without_a_curated_core_blocks_the_launch() {
     assert!(!plan.is_ready());
 
     match plan.blockers() {
-        [LaunchBlocker::UnsupportedSystemOrCore { system, .. }] => {
+        [LaunchBlocker::UnsupportedSystemOrCore { system, reason }] => {
             assert_eq!(system.as_deref(), Some(GBA));
+            assert!(
+                matches!(
+                    reason,
+                    UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform { .. }
+                ),
+                "the platform is the uncurated part: {reason:?}"
+            );
         }
         blockers => panic!("the combination must be reported as unsupported: {blockers:?}"),
     }
@@ -828,6 +871,11 @@ fn an_invalid_stored_configuration_key_blocks_the_launch_and_is_preserved() {
         }],
         "the stored key is named instead of being deleted"
     );
+    assert_eq!(
+        plan.readiness().blocking_issues(),
+        [bitarchive_application::ReadinessIssue::InvalidConfiguration],
+        "an unusable stored override is a configuration problem, not a content problem"
+    );
 }
 
 /// Without any configuration the effective configuration is empty rather than filled
@@ -1054,15 +1102,16 @@ fn every_blocker_maps_to_a_readiness_category() {
 
     let cases = [
         (
-            LaunchBlocker::RuntimeMissing {
+            LaunchBlocker::RuntimeUnavailable {
                 id: String::from("retroarch"),
+                reason: RuntimeUnavailableReason::NotInstalled,
             },
             ReadinessIssue::RuntimeUnavailable,
         ),
         (
             LaunchBlocker::UnsupportedSystemOrCore {
                 system: None,
-                reason: String::from("no curated system"),
+                reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
             },
             ReadinessIssue::UnsupportedFormat,
         ),
@@ -1088,7 +1137,7 @@ fn every_blocker_maps_to_a_readiness_category() {
             LaunchBlocker::InvalidConfiguration {
                 key: String::from("Video_Vsync"),
             },
-            ReadinessIssue::InvalidContent,
+            ReadinessIssue::InvalidConfiguration,
         ),
     ];
 
@@ -1133,14 +1182,253 @@ fn a_blocked_plan_reports_what_it_observed() {
     assert_eq!(plan.request().content(), Path::new(GBA_CONTENT));
     assert_eq!(plan.system().map(|system| system.key()), Some(&key(GBA)));
     assert!(
-        matches!(plan.preparation(), LaunchPreparation::Blocked { .. }),
+        !plan.preparation().is_ready(),
         "the outcome is a blocked preparation"
     );
     assert!(plan.core_state().is_some(), "the core state is observable");
     assert!(
         plan.blockers()
             .iter()
-            .any(|blocker| matches!(blocker, LaunchBlocker::RuntimeMissing { .. })),
+            .any(|blocker| matches!(blocker, LaunchBlocker::RuntimeUnavailable { .. })),
         "the blocker names the missing runtime"
     );
+}
+
+/// A runtime that is not installed and a runtime that is installed but broken are
+/// different conditions: both block the launch, and the blocker keeps them apart with a
+/// typed reason.
+///
+/// This is the regression test for the review finding that all three store failures were
+/// collapsed into one "missing" answer — which made the command line offer
+/// `acquire-retroarch-runtime` for a state that command cannot repair.
+#[test]
+fn a_not_installed_runtime_and_a_broken_runtime_are_different_blockers() {
+    let ready = FakeState::ready(curated_definition());
+
+    let missing = negotiate(
+        GBA_CONTENT,
+        &ready.clone().without_runtime(),
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+    let broken = negotiate(
+        GBA_CONTENT,
+        &ready.clone().with_broken_runtime(),
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+    let unreadable = negotiate(
+        GBA_CONTENT,
+        &ready.with_unreadable_runtime_store(),
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+
+    match missing.blockers() {
+        [LaunchBlocker::RuntimeUnavailable { reason, .. }] => {
+            assert_eq!(reason, &RuntimeUnavailableReason::NotInstalled);
+            assert!(reason.is_installable());
+        }
+        blockers => panic!("the runtime must be reported: {blockers:?}"),
+    }
+
+    match broken.blockers() {
+        [LaunchBlocker::RuntimeUnavailable { reason, .. }] => {
+            assert_eq!(
+                reason,
+                &RuntimeUnavailableReason::ExecutableMissing {
+                    expected: PathBuf::from(MANAGED_EXECUTABLE),
+                    version: String::from("1.22.2"),
+                },
+                "a broken installation names the expected executable and the version"
+            );
+            assert!(
+                !reason.is_installable(),
+                "acquiring the runtime again cannot repair an installation the store has"
+            );
+        }
+        blockers => panic!("the broken installation must be reported: {blockers:?}"),
+    }
+
+    match unreadable.blockers() {
+        [LaunchBlocker::RuntimeUnavailable { reason, .. }] => {
+            assert_eq!(reason, &RuntimeUnavailableReason::StoreUnreadable);
+            assert!(!reason.is_installable());
+        }
+        blockers => panic!("the unreadable store must be reported: {blockers:?}"),
+    }
+
+    assert_ne!(missing.blockers(), broken.blockers());
+    assert_ne!(broken.blockers(), unreadable.blockers());
+    assert_eq!(
+        missing.readiness().blocking_issues(),
+        broken.readiness().blocking_issues(),
+        "all three are a runtime readiness problem, and the blocker keeps the detail"
+    );
+}
+
+/// An unusable stored configuration key reaches readiness as a configuration problem,
+/// never as a content problem, through the whole negotiation.
+#[test]
+fn an_invalid_stored_key_is_a_configuration_problem_not_a_content_problem() {
+    use bitarchive_application::ReadinessIssue;
+
+    let state = FakeState::ready(curated_definition());
+    let stored = bitarchive_domain::ScopedConfig::stored(
+        ConfigScope::Game,
+        [("Video_Vsync", "true"), ("audio_volume", "0.5")],
+    );
+
+    let plan = negotiate(
+        GBA_CONTENT,
+        &state,
+        &FakeFirmware::empty(),
+        vec![stored],
+        true,
+    );
+
+    assert_eq!(
+        plan.blockers(),
+        [LaunchBlocker::InvalidConfiguration {
+            key: String::from("Video_Vsync")
+        }]
+    );
+    assert_eq!(
+        plan.readiness().blocking_issues(),
+        [ReadinessIssue::InvalidConfiguration]
+    );
+    assert_ne!(
+        plan.readiness().blocking_issues(),
+        [ReadinessIssue::InvalidContent],
+        "the content bytes were never checked, so they are never reported as invalid"
+    );
+}
+
+/// The configuration hierarchy is a property of the scope, not of the order a caller
+/// supplies its scopes in: the game value wins for every input order.
+#[test]
+fn the_configuration_precedence_does_not_depend_on_the_caller_order() {
+    let state = FakeState::ready(curated_definition());
+
+    let orders = [
+        [ConfigScope::Global, ConfigScope::System, ConfigScope::Game],
+        [ConfigScope::Game, ConfigScope::System, ConfigScope::Global],
+        [ConfigScope::System, ConfigScope::Global, ConfigScope::Game],
+    ];
+
+    for order in orders {
+        let config = order
+            .into_iter()
+            .map(|scope| {
+                let value = match scope {
+                    ConfigScope::Global => "global",
+                    ConfigScope::System => "system",
+                    ConfigScope::Game => "game",
+                };
+
+                scoped(scope, &[("video_vsync", value)])
+            })
+            .collect::<Vec<_>>();
+
+        let plan = negotiate(GBA_CONTENT, &state, &FakeFirmware::empty(), config, true);
+        let launch = prepared(&plan);
+
+        assert_eq!(
+            config_value(launch.config(), "video_vsync"),
+            Some(&ConfigValue::Text(String::from("game"))),
+            "the game scope must win for input order {order:?}"
+        );
+        assert_eq!(
+            launch
+                .config()
+                .trace(&ConfigKey::from_str("video_vsync").expect("a well formed key"))
+                .expect("a trace")
+                .overridden,
+            [ConfigScope::Global, ConfigScope::System],
+            "the replaced scopes are reported least specific first, for {order:?}"
+        );
+    }
+}
+
+/// The three unsupported cases reach the plan as distinct typed reasons, so a caller
+/// can tell a format problem from an uncurated system from an uncurated platform.
+#[test]
+fn the_unsupported_reasons_are_typed_and_distinct() {
+    let state = FakeState::ready(curated_definition());
+
+    let format = negotiate(
+        "/library/game.nes",
+        &state,
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+
+    match format.blockers() {
+        [LaunchBlocker::UnsupportedSystemOrCore { system, reason }] => {
+            assert_eq!(system, &None);
+            assert_eq!(
+                reason,
+                &UnsupportedSystemOrCoreReason::UnsupportedContentFormat
+            );
+        }
+        blockers => panic!("the format must be reported as unsupported: {blockers:?}"),
+    }
+
+    let uncurated_system = FakeState {
+        runtime: LaunchRuntimeResolution::Resolved(runtime()),
+        core: Some(SystemCoreState::NotCurated(SystemCore::Unavailable {
+            reason: bitarchive_domain::CoreUnavailableReason::SystemNotCurated,
+        })),
+    };
+    let plan = negotiate(
+        GBA_CONTENT,
+        &uncurated_system,
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+
+    match plan.blockers() {
+        [LaunchBlocker::UnsupportedSystemOrCore { system, reason }] => {
+            assert_eq!(system.as_deref(), Some(GBA));
+            assert_eq!(reason, &UnsupportedSystemOrCoreReason::SystemNotCurated);
+        }
+        blockers => panic!("the system must be reported as uncurated: {blockers:?}"),
+    }
+
+    let uncurated_platform = FakeState {
+        runtime: LaunchRuntimeResolution::Resolved(runtime()),
+        core: Some(SystemCoreState::NotCurated(SystemCore::Unavailable {
+            reason: bitarchive_domain::CoreUnavailableReason::CoreNotCuratedForPlatform {
+                component_id: CoreComponentId::from_str(CoreComponentId::MGBA)
+                    .expect("a valid component identity"),
+                platform: CorePlatform::MacOsArm64,
+            },
+        })),
+    };
+    let plan = negotiate(
+        GBA_CONTENT,
+        &uncurated_platform,
+        &FakeFirmware::empty(),
+        Vec::new(),
+        true,
+    );
+
+    match plan.blockers() {
+        [LaunchBlocker::UnsupportedSystemOrCore { reason, .. }] => {
+            assert_eq!(
+                reason,
+                &UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+                    component_id: String::from(CoreComponentId::MGBA),
+                    platform: CorePlatform::MacOsArm64,
+                },
+                "the platform case names the component and the platform, not a sentence"
+            );
+        }
+        blockers => panic!("the platform must be reported as uncurated: {blockers:?}"),
+    }
 }

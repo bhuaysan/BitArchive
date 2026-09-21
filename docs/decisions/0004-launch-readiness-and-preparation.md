@@ -6,6 +6,13 @@
 - **Supersedes:** —
 - **Superseded by:** —
 
+*Revised during the PR #30 review: the blocked state is now structurally non-empty
+(§1), runtime reasons separate "not installed" from "unusable" (§3), an unusable stored
+configuration key has its own readiness category instead of being reported as invalid
+content (§2, §6), the configuration precedence is defined by the scope rather than by
+the caller's order (§6), and the configuration seam is documented as not yet rendered
+into a RetroArch configuration file (§4).*
+
 ## Context
 
 B7 (Issue #23, ADR 0003) proved the real managed launch path end to end: a
@@ -56,10 +63,33 @@ GameLaunchPlan
 
 The negotiation never fails. Every condition it reports is a *state* — something is
 not installed, not available, or not curated — and a caller needs all of them at
-once, not the first one an error type would report. `LaunchPreparation` has exactly
-two variants and `Blocked` can only be built from a non-empty blocker list, so
-"blocked for no reason" has no constructor. `LaunchReadiness` is *derived* from the
-preparation rather than stored beside it, so the two cannot disagree.
+once, not the first one an error type would report.
+
+**`Blocked` is structurally non-empty.** The preparation's state is private and a
+blocked one can only be built from a non-empty blocker collection, so
+
+```text
+LaunchPreparation::Blocked(vec![])        ← not expressible
+Blocked(no reasons) + readiness() == Ready ← not expressible
+```
+
+have no representation, not even for external code:
+
+```rust
+pub struct LaunchPreparation(Preparation);       // private state
+
+enum Preparation {
+    Blocked(BlockingReasons),                    // private wrapper, non-empty
+    Prepared(Box<PreparedGameLaunch>),
+}
+```
+
+`from_blockers` answers `Option<Self>` and returns `None` for an empty list, so a
+caller that collected no reason cannot obtain a blocked preparation by accident
+either. `LaunchReadiness` is *derived* from the preparation rather than stored beside
+it, so a blocked preparation is never ready and a ready one never names a blocker.
+No runtime assertion and no `unsafe` is involved: the invariant is carried by the
+type, as it already is for `LaunchReadiness` itself.
 
 A `LaunchBlocker` carries structure and no presentation: an identity, a platform, a
 list of file names. It has no severity, no ordering, no user-facing text, and no
@@ -80,12 +110,25 @@ FirmwareMissing             → FirmwareMissing
 InvalidConfiguration        → InvalidContent
 ```
 
+```text
+InvalidConfiguration        → InvalidConfiguration  (added by this decision)
+```
+
+`InvalidConfiguration` is the one category §21 does not name and a launch decision
+genuinely needs: the configuration hierarchy is part of the launch path, and a stored
+override can be unusable. It is deliberately **not** mapped to `InvalidContent`: an
+unusable stored key says nothing about the bytes to launch, and a UI that reported
+invalid content would offer the wrong action.
+
 `SourceOffline`, `SourcePermissionDenied`, `CoreIntegrityFailure`,
 `FirmwareWrongContent`, `FirmwareWrongFilename`, `InvalidContent`, and
 `SessionActive` are **not** produced. Each needs a library index, a filesystem
 source model, a hash-verified firmware index, content validation, or a session
 registry, and none of those exists. A readiness check that reported them would be
 claiming to have checked something it did not check.
+
+Categories are not interchangeable: a condition is reported as the category whose
+*repair* matches, never as a neighbouring one.
 
 A capability that is not implemented must not appear as a satisfied check either.
 The reason a source cannot be offline is that there is no source yet, not that the
@@ -114,15 +157,51 @@ Two ports carry everything the decision reads, and nothing else does:
   present.
 
 The ports answer in the **application layer's own vocabulary**, not in store error
-types: a missing runtime is `LaunchRuntimeResolution::Missing`, not a
-`RetroArchRuntimeError`; a core is an identity plus a directory and a library, not a
-`ManagedCore`. The adapter that knows how to read a store translates its failures,
-and that translation is the only place the two vocabularies meet.
+types: an unusable runtime is `LaunchRuntimeResolution::Unavailable` with a
+`RuntimeUnavailableReason`, not a `RetroArchRuntimeError`; a core is an identity plus
+a directory and a library, not a `ManagedCore`. The adapter that knows how to read a
+store translates its failures, and that translation is the only place the two
+vocabularies meet.
 
-`not installed` and `installed but unusable` stay distinguishable through the whole
-path, because they are different repairs: the first is what the existing acquisition
-command installs, the second is a broken installation that needs diagnosis — and the
-store refuses to install a build it already has, so re-installing is not the answer.
+### "Not installed" is not "unusable"
+
+Both component classes keep that distinction, in their own vocabularies:
+
+```text
+runtime   RuntimeUnavailableReason::{NotInstalled, ExecutableMissing, StoreUnreadable}
+core      CoreUnusableReason::{NotInstalled, Unusable}
+```
+
+They are different repairs: `NotInstalled` is what the existing acquisition command
+installs, while a broken installation or an unreadable store needs diagnosis — and
+the stores refuse to install a component they already have, so re-installing is not
+the answer. `RuntimeUnavailableReason::is_installable()` is the single place that
+decision is made, and the presentation layer reads it instead of guessing from a
+string.
+
+### Reasons are typed, never rendered
+
+No application or domain type carries a user-facing sentence. A `LaunchBlocker` holds
+identities, platforms, paths, versions, file names, and typed reasons:
+
+```rust
+enum UnsupportedSystemOrCoreReason {
+    UnsupportedContentFormat,
+    SystemNotCurated,
+    CoreNotCuratedForPlatform { component_id: String, platform: CorePlatform },
+}
+
+enum RuntimeUnavailableReason {
+    NotInstalled,
+    ExecutableMissing { expected: PathBuf, version: String },
+    StoreUnreadable,
+}
+```
+
+Granularity stays deliberately small: a reason names the condition a caller must act
+on, not a copy of every infrastructure error. Phrasing, localization, and the choice
+of a recovery command belong to the presentation layer
+(`apps/bitarchive-desktop/src/prepare.rs` today, the UI later).
 
 ### 4. The step ends at `ready + prepared`, and never start a process
 
@@ -156,6 +235,28 @@ that the decision was made.
 `RetroArchBackend` remains the sole owner of the RetroArch command line. B8
 composes its input and spells no argument; the composition root calls
 `prepare_launch` only to show what the later play flow would start.
+
+**What the seam carries today, and what it does not:**
+
+```text
+PreparedGameLaunch
+  ├── runtime executable ─┐
+  ├── core library ───────┼→ RetroArchLaunchInput → RetroArchBackend::prepare_launch
+  ├── content ────────────┘                               ↓
+  │                                                  PreparedLaunch
+  │                                                       ↓
+  │                                 ProcessController::spawn  ← B7, not B8
+  └── effective configuration
+           ↓ carried as product preparation state — NOT part of RetroArchLaunchInput
+```
+
+The effective configuration is resolved and carried, and it is **not yet handed to
+RetroArch**. Reaching RetroArch with a configuration means rendering a `.cfg` file
+whose path the launch input names, and no `.cfg` is generated by B8: `ARCHITECTURE.md`
+§28 makes a generated launch configuration a session artifact, and no session exists.
+The prepared RetroArch input therefore names no configuration file, and RetroArch keeps
+its own lookup rules until the launch-artifact step exists. Documentation and output
+state this rather than implying that the configuration already reaches RetroArch.
 
 ### 5. Firmware readiness is file-name presence, and required firmware is the exception
 
@@ -198,11 +299,19 @@ for a digest exists.
 Global → System → Game        game > system > global
 ```
 
-The rule is domain code (`resolve_launch_config`). It applies scoped values from the
-least to the most specific scope, so a later scope replaces an earlier value for the
-same key, and it reports for every effective key which scope supplied it and which
-less specific scopes it replaced. A conflict is not an error: an intentional game
-override *is* a conflict with a system value, and the hierarchy exists to resolve it.
+The rule is domain code (`resolve_launch_config`). **The scope defines the
+precedence, never the caller's iteration order:** the resolution groups the sources by
+their `ConfigScope` and applies them in `ConfigScope::precedence()` order — `Global`,
+then `System`, then `Game` — whatever order they were supplied in. A caller cannot
+invert the hierarchy by iterating differently, because its order is not what the rule
+reads. The order *within* one scope stays the caller's, so several sources of the same
+scope (a global settings record and a global default, for instance) still resolve
+deterministically: the last one wins.
+
+The result reports for every effective key which scope supplied it and which less
+specific scopes it replaced, least specific first. A conflict is not an error: an
+intentional game override *is* a conflict with a system value, and the hierarchy exists
+to resolve it.
 
 RetroArch settings deliberately have **no release scope**, unlike core selection
 (`ARCHITECTURE.md` §20.4, `PRODUCT.md` §17.2).
@@ -243,6 +352,10 @@ structured `UnsupportedSystemOrCore` blocker.
   later UI needs to offer the right action.
 - Readiness cannot overstate itself: the blocker set is exactly what the code can
   observe, and the mapping to the readiness categories stays total.
+- A blocked preparation without a reason and a readiness that contradicts its own
+  preparation are both unrepresentable, so no caller needs a fallback for either.
+- The decision a caller makes — install the component, or diagnose it — reads a typed
+  reason, so it cannot be wrong because of how a state was phrased.
 - "Which RetroArch and which core would run, with which content and which
   configuration?" has one derived answer, taken from the same managed components
   B7 starts and from no other source.
@@ -277,6 +390,10 @@ structured `UnsupportedSystemOrCore` blocker.
 | Generate the RetroArch `.cfg` in this step | `ARCHITECTURE.md` §28 makes launch artifacts session artifacts; generating one before a session exists would create an unbounded artifact with no owner. The effective configuration is the value; rendering it is a later step. |
 | Reuse the process adapter for a "dry run" spawn | Starting anything contradicts the point of the step, and a dry run would need the very session machinery the product does not have yet. The prepared launch is printed instead. |
 | Let the readiness check acquire a missing component | Creates a second acquisition flow beside the reviewed one and makes a decision depend on the network (ADR 0001, ADR 0002, ADR 0003). |
+| Keep `Blocked { blockers: Vec<LaunchBlocker> }` public and document the non-empty rule | A documented invariant that the public API contradicts is not an invariant: external code could build a blocked preparation with no reason, and `readiness()` would then report ready for a blocked plan. |
+| Report a configuration problem as `InvalidContent` | Claims the content bytes are invalid although they were never checked, and would make a UI offer a content action for a stored settings problem. |
+| Let the caller define the configuration precedence by supplying scopes in order | Makes a product invariant (`game > system > global`) depend on every caller's discipline instead of on the scope, so one differently-ordered call would silently invert the hierarchy. |
+| Render a `.cfg` path into the prepared RetroArch input now | No step generates that file, and `ARCHITECTURE.md` §28 makes a generated launch configuration a session artifact. A path that no step produced would be a false statement about what RetroArch loads. |
 | Fall back to a system RetroArch or a developer-supplied core when the store has none | Undoes the managed-component invariant B5/B6/B7 established and makes "which binary ran?" unanswerable (invariant 10). |
 
 ## References

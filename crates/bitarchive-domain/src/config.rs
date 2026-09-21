@@ -70,6 +70,24 @@ impl ConfigScope {
             Self::Game => "Game",
         }
     }
+
+    /// Returns the scope's precedence, from the least to the most specific scope.
+    ///
+    /// The number is what makes `game > system > global` a property of the scope
+    /// itself instead of a property of the order a caller happened to supply its
+    /// values in: [`resolve_launch_config`] sorts by this value, so no caller can
+    /// invert the hierarchy by iterating differently.
+    ///
+    /// The order is total and every scope has its own number, so a sort over it is
+    /// deterministic rather than merely stable.
+    #[must_use]
+    pub const fn precedence(self) -> u8 {
+        match self {
+            Self::Global => 0,
+            Self::System => 1,
+            Self::Game => 2,
+        }
+    }
 }
 
 impl fmt::Display for ConfigScope {
@@ -478,18 +496,25 @@ pub struct LaunchConfigResolution {
 
 /// Resolves the effective launch configuration from scoped overrides.
 ///
-/// The sources are applied from the least specific scope to the most specific one, so
-/// a later source replaces an earlier value for the same key and a key only one scope
-/// sets keeps that scope's value:
+/// The effective value of a key is the one of the **most specific scope that
+/// configures it**:
 ///
 /// ```text
-/// Global → System → Game      game > system > global
+/// game > system > global
 /// ```
 ///
-/// The function is order-sensitive by contract: it applies the sources in the order
-/// given, so the caller passes `Global`, then `System`, then `Game`. Passing a less
-/// specific scope after a more specific one would let the less specific one win, which
-/// is why the expected order is part of this contract and not inferred.
+/// # The scope decides the precedence, never the caller's order
+///
+/// The sources are grouped by their [`ConfigScope`] and applied in
+/// [`ConfigScope::precedence`] order — `Global`, then `System`, then `Game` —
+/// whatever order they were supplied in. A caller cannot invert the hierarchy by
+/// iterating differently, because the order it supplies values in is not what the
+/// rule reads.
+///
+/// The order *within* one scope is the caller's and is kept, so two values for the
+/// same key of the same scope still resolve deterministically: the last one wins.
+/// Several sources may name the same scope — a global settings record and a global
+/// default, for instance — and that is how their relative order stays meaningful.
 ///
 /// Which system and which game a `System` and a `Game` scope belong to is decided
 /// *before* this function runs: the caller selects the scoped values for the concrete
@@ -499,36 +524,50 @@ pub struct LaunchConfigResolution {
 ///
 /// Returns [`LaunchConfigResolution`] with a non-empty `errors` list when a stored key
 /// is not well formed. The effective configuration is still resolved from the usable
-/// overrides, so a caller that reports the error loses nothing.
+/// overrides, so a caller that reports the error loses nothing. The rejected key does
+/// not take part and does not disturb the precedence of the keys that do.
 pub fn resolve_launch_config(
     sources: impl IntoIterator<Item = ScopedConfig>,
 ) -> Result<EffectiveLaunchConfig, LaunchConfigResolution> {
+    let mut by_scope: BTreeMap<u8, Vec<ScopedConfig>> = BTreeMap::new();
+
+    for source in sources {
+        by_scope
+            .entry(source.scope().precedence())
+            .or_default()
+            .push(source);
+    }
+
     let mut values: BTreeMap<ConfigKey, ConfigValue> = BTreeMap::new();
     let mut trace: BTreeMap<ConfigKey, ConfigTrace> = BTreeMap::new();
     let mut errors: Vec<ConfigKeyError> = Vec::new();
 
-    for source in sources {
-        let scope = source.scope();
+    // Ascending precedence: the least specific scope is applied first, so every later
+    // scope replaces what an earlier one set.
+    for (_, sources) in by_scope {
+        for source in sources {
+            let scope = source.scope();
 
-        // The typed values come first, then the raw stored ones, so a scope's usable
-        // overrides all take part even when one stored key is rejected.
-        for (key, value) in
-            source
-                .values()
-                .iter()
-                .cloned()
-                .chain(source.stored_values().iter().filter_map(|(key, value)| {
-                    ConfigKey::from_str(key)
-                        .ok()
-                        .map(|key| (key, ConfigValue::Text(value.clone())))
-                }))
-        {
-            apply(&mut values, &mut trace, scope, key, value);
-        }
+            // The typed values come first, then the raw stored ones, so a scope's
+            // usable overrides all take part even when one stored key is rejected.
+            for (key, value) in
+                source
+                    .values()
+                    .iter()
+                    .cloned()
+                    .chain(source.stored_values().iter().filter_map(|(key, value)| {
+                        ConfigKey::from_str(key)
+                            .ok()
+                            .map(|key| (key, ConfigValue::Text(value.clone())))
+                    }))
+            {
+                apply(&mut values, &mut trace, scope, key, value);
+            }
 
-        for (key, _) in source.stored_values() {
-            if let Err(error) = ConfigKey::from_str(key) {
-                errors.push(error);
+            for (key, _) in source.stored_values() {
+                if let Err(error) = ConfigKey::from_str(key) {
+                    errors.push(error);
+                }
             }
         }
     }
@@ -823,6 +862,141 @@ mod tests {
             ["a_key", "b_key", "c_key"],
             "the effective values are ordered by key"
         );
+    }
+
+    /// The scope decides the precedence, not the caller's iteration order: however the
+    /// three scopes are supplied, the game value wins.
+    #[test]
+    fn the_scope_decides_the_precedence_in_any_input_order() {
+        let key = ConfigKey::from_str("video_vsync").expect("a well formed key");
+        let expected = ConfigValue::Text(String::from("game"));
+
+        // Every permutation of the three scopes, including the ones that would invert
+        // the hierarchy if the caller's order were the rule.
+        let orders = [
+            [ConfigScope::Global, ConfigScope::System, ConfigScope::Game],
+            [ConfigScope::Global, ConfigScope::Game, ConfigScope::System],
+            [ConfigScope::System, ConfigScope::Global, ConfigScope::Game],
+            [ConfigScope::System, ConfigScope::Game, ConfigScope::Global],
+            [ConfigScope::Game, ConfigScope::Global, ConfigScope::System],
+            [ConfigScope::Game, ConfigScope::System, ConfigScope::Global],
+        ];
+
+        for order in orders {
+            let sources = order.map(|scope| {
+                let value = match scope {
+                    ConfigScope::Global => "global",
+                    ConfigScope::System => "system",
+                    ConfigScope::Game => "game",
+                };
+
+                scoped(scope, &[("video_vsync", value)])
+            });
+
+            let effective = resolve(sources);
+
+            assert_eq!(
+                effective.get(&key),
+                Some(&expected),
+                "the game scope must win for input order {order:?}"
+            );
+
+            let trace = effective.trace(&key).expect("a trace");
+
+            assert_eq!(
+                trace.source,
+                ConfigScope::Game,
+                "the source names the scope the value came from, for {order:?}"
+            );
+            assert_eq!(
+                trace.overridden,
+                [ConfigScope::Global, ConfigScope::System],
+                "the replaced scopes are recorded least specific first, for {order:?}"
+            );
+        }
+    }
+
+    /// Two scopes in either order produce the same result, so only the hierarchy is
+    /// read and never the sequence.
+    #[test]
+    fn a_less_specific_scope_supplied_last_still_loses() {
+        let key = ConfigKey::from_str("audio_volume").expect("a well formed key");
+
+        let specific_last = resolve([
+            scoped(ConfigScope::System, &[("audio_volume", "global")]),
+            scoped(ConfigScope::Game, &[("audio_volume", "game")]),
+        ]);
+        let specific_first = resolve([
+            scoped(ConfigScope::Game, &[("audio_volume", "game")]),
+            scoped(ConfigScope::System, &[("audio_volume", "global")]),
+        ]);
+
+        assert_eq!(specific_last, specific_first);
+        assert_eq!(
+            specific_last.get(&key),
+            Some(&ConfigValue::Text(String::from("game")))
+        );
+        assert_eq!(
+            specific_first.trace(&key).expect("a trace").overridden,
+            [ConfigScope::System],
+            "the replaced scope is the less specific one, whatever the input order was"
+        );
+    }
+
+    /// The order *within* one scope stays the caller's, so two values of the same scope
+    /// still resolve deterministically and the last one wins.
+    #[test]
+    fn the_order_within_one_scope_stays_the_callers() {
+        let key = ConfigKey::from_str("video_vsync").expect("a well formed key");
+
+        let effective = resolve([
+            scoped(ConfigScope::Global, &[("video_vsync", "first")]),
+            scoped(ConfigScope::Game, &[("video_vsync", "game")]),
+            scoped(ConfigScope::Global, &[("video_vsync", "second")]),
+        ]);
+
+        assert_eq!(
+            effective.get(&key),
+            Some(&ConfigValue::Text(String::from("game"))),
+            "the game scope still wins over both global sources"
+        );
+        assert_eq!(
+            effective.trace(&key).expect("a trace").overridden,
+            [ConfigScope::Global, ConfigScope::Global],
+            "both replaced global scopes are recorded in application order"
+        );
+    }
+
+    /// A rejected stored key does not disturb the precedence of the keys that resolve.
+    #[test]
+    fn a_rejected_key_does_not_change_the_precedence() {
+        let key = ConfigKey::from_str("video_vsync").expect("a well formed key");
+
+        let resolution = resolve_launch_config([
+            stored(ConfigScope::Game, &[("Video_Vsync", "oops")]),
+            stored(ConfigScope::Global, &[("video_vsync", "global")]),
+            scoped(ConfigScope::System, &[("video_vsync", "system")]),
+        ])
+        .expect_err("the malformed key must be reported");
+
+        assert_eq!(resolution.errors.len(), 1);
+        assert_eq!(
+            resolution.effective.get(&key),
+            Some(&ConfigValue::Text(String::from("system"))),
+            "the system scope still overrides the global one, supplied after it"
+        );
+    }
+
+    /// Every scope has its own precedence, and the numbers ascend from the least to the
+    /// most specific scope, so a sort over them is total.
+    #[test]
+    fn scope_precedence_ascends_from_global_to_game() {
+        assert_eq!(ConfigScope::Global.precedence(), 0);
+        assert_eq!(ConfigScope::System.precedence(), 1);
+        assert_eq!(ConfigScope::Game.precedence(), 2);
+
+        assert!(ConfigScope::Global.precedence() < ConfigScope::System.precedence());
+        assert!(ConfigScope::System.precedence() < ConfigScope::Game.precedence());
     }
 
     /// Raw stored values and typed values describe the same scope, so a stored

@@ -19,7 +19,9 @@ use std::str::FromStr;
 
 use bitarchive_application::managed_core::{CoreInstaller, CoreStoreError, ManagedCore};
 use bitarchive_application::managed_runtime::{InstalledRuntime, RuntimeInstaller};
-use bitarchive_application::{CoreUnusableReason, ManagedEmulationState, SystemCoreState};
+use bitarchive_application::{
+    CoreUnusableReason, ManagedEmulationState, RuntimeUnavailableReason, SystemCoreState,
+};
 use bitarchive_domain::ComponentId;
 use bitarchive_domain::component::RelativePath;
 use bitarchive_domain::managed_core::{
@@ -256,10 +258,10 @@ fn an_active_runtime_resolves_its_executable() {
     assert_eq!(resolution.id(), runtime.id());
 }
 
-/// Nothing installed is reported as a missing runtime, and the identity of the runtime
-/// that is missing is named.
+/// Nothing installed is reported as a runtime that is not installed — the one reason
+/// that has an installing answer.
 #[test]
-fn nothing_activated_is_a_missing_runtime() {
+fn nothing_activated_is_a_runtime_that_is_not_installed() {
     let definition = pinned_retroarch_runtime();
     let installer = FakeRuntimeInstaller::with_active(None);
     let cores = FakeCoreInstaller::unreadable();
@@ -269,30 +271,62 @@ fn nothing_activated_is_a_missing_runtime() {
 
     assert!(resolution.runtime().is_none());
     assert_eq!(resolution.id(), RuntimeId::RETROARCH);
+    assert_eq!(
+        resolution.unavailable_reason(),
+        Some(&RuntimeUnavailableReason::NotInstalled)
+    );
+    assert!(
+        resolution
+            .unavailable_reason()
+            .expect("a reason")
+            .is_installable(),
+        "only this state is repaired by acquiring the runtime"
+    );
 }
 
-/// An activated version whose executable disappeared is reported as a missing runtime
-/// rather than handed to a process adapter that would fail on it.
+/// An activated version whose executable disappeared is reported as a broken
+/// installation rather than handed to a process adapter that would fail on it — and the
+/// reason keeps the expected executable and the version, so a caller can name what is
+/// incomplete.
 #[test]
-fn an_installation_without_its_executable_is_not_resolved() {
+fn an_installation_without_its_executable_is_a_broken_installation() {
     let root = TempRoot::create("no-executable");
     let definition = pinned_retroarch_runtime();
     // The installation is reported as active, but nothing was written to disk.
     let installer = FakeRuntimeInstaller::with_active(Some(installed_runtime(root.path())));
     let cores = FakeCoreInstaller::unreadable();
 
-    std::fs::remove_file(root.path().join("1.22.2").join(PINNED_RETROARCH_EXECUTABLE))
-        .expect("the executable can be removed for the test");
+    let executable = root.path().join("1.22.2").join(PINNED_RETROARCH_EXECUTABLE);
+
+    std::fs::remove_file(&executable).expect("the executable can be removed for the test");
 
     let state = ManagedEmulation::new(&definition, CorePlatform::MacOsArm64, &installer, &cores);
+    let resolution = state.runtime();
 
-    assert!(state.runtime().runtime().is_none());
+    assert!(resolution.runtime().is_none());
+
+    match resolution.unavailable_reason() {
+        Some(RuntimeUnavailableReason::ExecutableMissing { expected, version }) => {
+            assert_eq!(expected, &executable);
+            assert_eq!(version, "1.22.2");
+        }
+        other => panic!("a broken installation must say so: {other:?}"),
+    }
+
+    assert!(
+        !resolution
+            .unavailable_reason()
+            .expect("a reason")
+            .is_installable(),
+        "acquiring the runtime again cannot repair an installation the store already has"
+    );
 }
 
-/// An unreadable store is reported as a missing runtime instead of being hidden: the
-/// caller learns that no runtime could be resolved, and the identity says why.
+/// An unreadable store is reported as unreadable instead of being hidden: the caller
+/// learns that no runtime could be resolved and that the reason is the store, not a
+/// missing installation.
 #[test]
-fn an_unreadable_runtime_store_is_reported() {
+fn an_unreadable_runtime_store_is_reported_as_such() {
     let definition = pinned_retroarch_runtime();
     let installer = FakeRuntimeInstaller::unreadable();
     let cores = FakeCoreInstaller::unreadable();
@@ -301,10 +335,54 @@ fn an_unreadable_runtime_store_is_reported() {
     let resolution = state.runtime();
 
     assert!(resolution.runtime().is_none());
+    assert_eq!(
+        resolution.unavailable_reason(),
+        Some(&RuntimeUnavailableReason::StoreUnreadable)
+    );
+    assert_eq!(
+        resolution.id(),
+        RuntimeId::RETROARCH,
+        "the identity stays an identity and carries no message"
+    );
     assert!(
-        resolution.id().contains("could not be read"),
-        "the answer explains the store failure: {}",
-        resolution.id()
+        !resolution
+            .unavailable_reason()
+            .expect("a reason")
+            .is_installable(),
+        "an unreadable store is diagnosed, not repaired by a download"
+    );
+}
+
+/// The runtime failures stay distinguishable, so a caller can tell a first run from an
+/// unreadable store.
+#[test]
+fn the_runtime_failures_stay_distinguishable() {
+    let definition = pinned_retroarch_runtime();
+    let cores = FakeCoreInstaller::unreadable();
+
+    let not_installed = FakeRuntimeInstaller::with_active(None);
+    let unreadable = FakeRuntimeInstaller::unreadable();
+
+    let first_run = ManagedEmulation::new(
+        &definition,
+        CorePlatform::MacOsArm64,
+        &not_installed,
+        &cores,
+    );
+    let broken_store =
+        ManagedEmulation::new(&definition, CorePlatform::MacOsArm64, &unreadable, &cores);
+
+    assert_eq!(
+        first_run.runtime().unavailable_reason(),
+        Some(&RuntimeUnavailableReason::NotInstalled)
+    );
+    assert_eq!(
+        broken_store.runtime().unavailable_reason(),
+        Some(&RuntimeUnavailableReason::StoreUnreadable)
+    );
+    assert_ne!(
+        first_run.runtime().unavailable_reason(),
+        broken_store.runtime().unavailable_reason()
     );
 }
 

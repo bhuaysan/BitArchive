@@ -2,13 +2,22 @@
 
 /// A structured reason why a launch cannot proceed.
 ///
-/// The categories mirror the readiness model in ARCHITECTURE.md §21. They are
-/// data, not presentation: no user-facing text, no localization, and no
-/// recovery action. A UI layer decides how to phrase an issue and which action
-/// to offer.
+/// The categories mirror the readiness model in ARCHITECTURE.md §21, extended by the
+/// one category that model does not name and a launch decision genuinely needs:
+/// [`InvalidConfiguration`](ReadinessIssue::InvalidConfiguration). They are data, not
+/// presentation: no user-facing text, no localization, and no recovery action. A UI
+/// layer decides how to phrase an issue and which action to offer.
 ///
-/// Checking readiness belongs to the steps that produce these issues. This
-/// contract only names them.
+/// Checking readiness belongs to the steps that produce these issues. This contract
+/// only names them.
+///
+/// # Categories are not interchangeable
+///
+/// Every variant names one condition, and a condition is never reported as a
+/// neighbouring one: an unusable stored configuration key is not invalid content, and
+/// a system BitArchive curates no core for is not a broken installation. A category is
+/// only interchangeable with another when the *repair* is the same, which is what makes
+/// a readiness result usable by a UI.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ReadinessIssue {
     /// The launch needs a core, but none is configured for any scope.
@@ -39,6 +48,19 @@ pub enum ReadinessIssue {
     UnsupportedFormat,
     /// The content is present but not valid.
     InvalidContent,
+
+    /// A stored configuration override cannot be used.
+    ///
+    /// The stored value is preserved rather than deleted (ARCHITECTURE.md invariant
+    /// 19); this category only reports that it could not take part in the effective
+    /// launch configuration. It is deliberately **not**
+    /// [`InvalidContent`](Self::InvalidContent): the content of the launch is not what
+    /// is wrong, and a UI would offer the wrong action for it.
+    ///
+    /// ARCHITECTURE.md §21 does not name this category. It is added here because the
+    /// configuration hierarchy is part of the launch path and a stored override can
+    /// genuinely be unusable, which the model has to be able to say.
+    InvalidConfiguration,
 
     /// Another emulation session is already active.
     ///
@@ -227,7 +249,7 @@ mod tests {
     /// the observable half for every reachable issue count.
     #[test]
     fn a_blocked_result_always_names_at_least_one_issue() {
-        let issue_counts = [1, 2, 12];
+        let issue_counts = [1, 2, 13];
         let all_issues = [
             ReadinessIssue::CoreMissing,
             ReadinessIssue::CoreIntegrityFailure,
@@ -240,6 +262,7 @@ mod tests {
             ReadinessIssue::SourcePermissionDenied,
             ReadinessIssue::UnsupportedFormat,
             ReadinessIssue::InvalidContent,
+            ReadinessIssue::InvalidConfiguration,
             ReadinessIssue::SessionActive,
         ];
 

@@ -61,15 +61,17 @@
 use std::path::{Path, PathBuf};
 
 use bitarchive_domain::config::{EffectiveLaunchConfig, ScopedConfig, resolve_launch_config};
-use bitarchive_domain::system::{EmulatedSystem, EmulatedSystemCatalog, SystemCore};
+use bitarchive_domain::system::{
+    CoreUnavailableReason, EmulatedSystem, EmulatedSystemCatalog, SystemCore,
+};
 use bitarchive_domain::{
-    CoreDefinition, FirmwareRequirement, FirmwareRequirementLevel, GameId, ReleaseId,
+    CoreDefinition, CorePlatform, FirmwareRequirement, FirmwareRequirementLevel, GameId, ReleaseId,
 };
 
 use crate::launch_readiness::LaunchReadiness;
 use crate::launch_state::{
     CoreUnusableReason, FirmwareChecker, FirmwareOutcome, InstalledCore, LaunchRuntime,
-    LaunchRuntimeResolution, SystemCoreState,
+    LaunchRuntimeResolution, RuntimeUnavailableReason, SystemCoreState,
 };
 
 /// A request to prepare a launch of one concrete game.
@@ -132,7 +134,7 @@ impl GameLaunchRequest {
 /// Every field is a fact an outer layer observed. Nothing here is derived by this
 /// module, and nothing here can be filled in by guessing: a caller that cannot
 /// answer a question passes the state that says so — `content_available: false`, a
-/// [`LaunchRuntimeResolution::Missing`], a [`SystemCoreState`] without an
+/// [`LaunchRuntimeResolution::Unavailable`], a [`SystemCoreState`] without an
 /// installation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct GameLaunchContext<'a> {
@@ -164,38 +166,74 @@ pub struct GameLaunchContext<'a> {
     pub config: Vec<ScopedConfig>,
 }
 
+/// Why the content's system has no launchable core.
+///
+/// The variants are distinct answers with distinct repairs, which is why they are not
+/// one "unsupported" message:
+///
+/// - [`UnsupportedContentFormat`](Self::UnsupportedContentFormat) — the file is in a
+///   format no curated system accepts, so there is no system at all. Nothing can be
+///   installed to change that; the content, not BitArchive's state, decides.
+/// - [`SystemNotCurated`](Self::SystemNotCurated) — the system is known but is not in
+///   BitArchive's curated system list, and custom systems are not part of the MVP
+///   (PRODUCT.md §13). No component identity exists to install.
+/// - [`CoreNotCuratedForPlatform`](Self::CoreNotCuratedForPlatform) — the system is
+///   supported and names a core component, but this build has no reviewed definition
+///   for that component on this platform. Another architecture's artifact is never
+///   substituted.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum UnsupportedSystemOrCoreReason {
+    /// The content format selects no curated system.
+    UnsupportedContentFormat,
+    /// The content's system is not in the curated system list.
+    SystemNotCurated,
+    /// The system's core component has no curated definition for this platform.
+    CoreNotCuratedForPlatform {
+        /// The component identity the system asks for.
+        component_id: String,
+        /// The platform no curated definition exists for.
+        platform: CorePlatform,
+    },
+}
+
 /// Why a launch cannot proceed.
 ///
-/// Each variant names a condition a negotiation observed, and each is repairable in
-/// a different way: install the runtime, install the core, provide content, use a
-/// system BitArchive has a core for, provide the firmware, or fix the stored
-/// configuration.
+/// Each variant names a condition a negotiation observed, and each is repairable in a
+/// different way: install the runtime, install the core, provide content, use a system
+/// BitArchive has a core for, provide the firmware, or fix the stored configuration.
 ///
 /// The variants carry what was observed — an identity, a platform, a list of file
-/// names — so a caller can name the component or the file instead of reporting a
-/// generic failure. They carry no severity, no ordering, and no advice: reporting
-/// *what* is wrong is this layer's job, and deciding what to do about it is not.
+/// names, and a typed *reason* for every condition that has more than one cause — so a
+/// caller can name the component or the file instead of reporting a generic failure.
+/// They carry **no message**: no user-facing text, no localization, and no recovery
+/// action. Deciding how to phrase a blocker and which command resolves it belongs to
+/// the presentation layer, which is the only place a sentence like "run this first"
+/// belongs.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum LaunchBlocker {
-    /// No managed runtime is installed and activated.
+    /// No usable managed runtime could be resolved.
     ///
-    /// Repairing this means acquiring the pinned runtime; no `PATH` lookup, no
-    /// `/Applications` scan, and no system RetroArch is consulted instead
+    /// The reason separates "not installed", which acquiring the pinned runtime
+    /// repairs, from a broken installation, which it does not — the component store
+    /// refuses to install a version it already has. No `PATH` lookup, no `/Applications`
+    /// scan, and no system RetroArch is ever consulted instead
     /// (PRODUCT.md §16.1, invariant 10).
-    RuntimeMissing {
-        /// The runtime identity that is not installed.
+    RuntimeUnavailable {
+        /// The runtime identity that could not be resolved.
         id: String,
+        /// Why no runtime could be resolved.
+        reason: RuntimeUnavailableReason,
     },
-    /// The content's system has no curated core definition on this platform.
-    ///
-    /// BitArchive runs only cores it curates, so this is not repairable by
-    /// installing something: either the content targets a system BitArchive does not
-    /// curate, or this platform has no reviewed artifact for it.
+    /// The content's system has no curated, launchable core.
     UnsupportedSystemOrCore {
         /// The system of the content, when a system could be resolved at all.
+        ///
+        /// [`None`] only for
+        /// [`UnsupportedContentFormat`](UnsupportedSystemOrCoreReason::UnsupportedContentFormat),
+        /// because a format that selects no system has no system key to report.
         system: Option<String>,
-        /// Why no curated definition was available.
-        reason: String,
+        /// Why no launchable core exists for the content.
+        reason: UnsupportedSystemOrCoreReason,
     },
     /// A curated core definition exists, but no usable build is installed.
     ///
@@ -234,55 +272,139 @@ pub enum LaunchBlocker {
     },
 }
 
+/// At least one [`LaunchBlocker`].
+///
+/// The field is private and there is no public constructor, so a value of this type
+/// always holds at least one blocker. Only this module can create one, and only from a
+/// non-empty collection, which is what makes "blocked for no reason" unrepresentable
+/// instead of merely documented — the same construction
+/// [`LaunchReadiness`](crate::LaunchReadiness) uses for its own blocked state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct BlockingReasons(Vec<LaunchBlocker>);
+
+impl BlockingReasons {
+    /// Wraps `blockers`, or returns [`None`] when nothing would be blocked.
+    ///
+    /// The returned value is the only evidence that a launch is blocked, so an empty
+    /// list can never turn into a blocked preparation.
+    #[must_use]
+    fn from_blockers(blockers: Vec<LaunchBlocker>) -> Option<Self> {
+        if blockers.is_empty() {
+            None
+        } else {
+            Some(Self(blockers))
+        }
+    }
+
+    /// Returns every blocker, in the order the negotiation observed them.
+    fn as_slice(&self) -> &[LaunchBlocker] {
+        &self.0
+    }
+}
+
 /// The outcome of preparing a game launch.
 ///
-/// Exactly one of the two variants holds, so "the launch is blocked" and "the launch
-/// is prepared" cannot contradict each other. A [`Blocked`](Self::Blocked) always
-/// names at least one reason, because the negotiation only produces one when it
-/// found a reason.
+/// The state is private, and a blocked one can only be built from a non-empty blocker
+/// list, so the two states are unambiguous and cannot contradict each other:
+///
+/// ```text
+/// Prepared(launch)      → the launch is ready
+/// Blocked([reason, …])  → at least one blocker, and no prepared launch
+/// ```
+///
+/// "Blocked for no reason" is therefore not expressible through this API — not even as
+/// `LaunchPreparation::Blocked(Vec::new())`, because the variant's payload is private
+/// and has no public constructor. That also removes the contradictory pair
+///
+/// ```text
+/// blocked without reasons  +  readiness() == Ready
+/// ```
+///
+/// from the type: a blocked preparation always names a reason, and
+/// [`readiness`](Self::readiness) derives its result from exactly those reasons.
+///
+/// Create a preparation with [`from_blockers`](Self::from_blockers) or
+/// [`prepared`](Self::prepared), and inspect it with [`is_ready`](Self::is_ready),
+/// [`blockers`](Self::blockers), and [`prepared_launch`](Self::prepared_launch). The
+/// preparation is a value, so a caller never has to match on it to read it.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum LaunchPreparation {
+pub struct LaunchPreparation(Preparation);
+
+/// The private preparation state.
+///
+/// Kept separate from [`LaunchPreparation`] so that the blocked variant can hold
+/// evidence only this module can produce, and no caller can build an empty one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Preparation {
     /// The launch is blocked by at least one reason.
-    Blocked {
-        /// Everything that blocks the launch, in a deterministic order.
-        blockers: Vec<LaunchBlocker>,
-    },
+    Blocked(BlockingReasons),
     /// The launch is ready and every input is resolved.
     Prepared(Box<PreparedGameLaunch>),
 }
 
 impl LaunchPreparation {
+    /// Returns a preparation for `blockers`.
+    ///
+    /// An empty list means nothing blocks the launch, so the result is [`None`] rather
+    /// than a blocked preparation without a reason. A caller that has collected blockers
+    /// and found none has not prepared a launch either — it has to prepare one — and
+    /// this signature makes that visible instead of silently producing a contradiction.
+    #[must_use]
+    pub fn from_blockers(blockers: impl IntoIterator<Item = LaunchBlocker>) -> Option<Self> {
+        BlockingReasons::from_blockers(blockers.into_iter().collect())
+            .map(|blockers| Self(Preparation::Blocked(blockers)))
+    }
+
+    /// Returns a preparation for a launch that is ready.
+    ///
+    /// The launch has to be prepared, so this cannot produce a "ready without a launch"
+    /// state.
+    #[must_use]
+    pub fn prepared(launch: PreparedGameLaunch) -> Self {
+        Self(Preparation::Prepared(Box::new(launch)))
+    }
+
     /// Returns the prepared launch, if the launch is ready.
     #[must_use]
-    pub fn prepared(&self) -> Option<&PreparedGameLaunch> {
-        match self {
-            Self::Prepared(prepared) => Some(prepared),
-            Self::Blocked { .. } => None,
+    pub fn prepared_launch(&self) -> Option<&PreparedGameLaunch> {
+        match &self.0 {
+            Preparation::Prepared(prepared) => Some(prepared),
+            Preparation::Blocked(_) => None,
         }
     }
 
     /// Returns what blocks the launch, or an empty slice when it is ready.
+    ///
+    /// The empty slice is the *ready* case only: a blocked preparation always returns at
+    /// least one blocker.
     #[must_use]
     pub fn blockers(&self) -> &[LaunchBlocker] {
-        match self {
-            Self::Prepared(_) => &[],
-            Self::Blocked { blockers } => blockers,
+        match &self.0 {
+            Preparation::Prepared(_) => &[],
+            Preparation::Blocked(blockers) => blockers.as_slice(),
         }
     }
 
     /// Returns whether the launch may proceed.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        matches!(self, Self::Prepared(_))
+        matches!(self.0, Preparation::Prepared(_))
     }
 
     /// Returns the readiness result of this preparation.
     ///
-    /// The result is derived from the preparation itself rather than stored next to
-    /// it, so a readiness that disagrees with the preparation is not representable.
+    /// The result is derived from the preparation itself rather than stored next to it,
+    /// so a readiness that disagrees with the preparation is not representable. A blocked
+    /// preparation always carries at least one reason, so the derived readiness is always
+    /// blocked and always names a category.
     #[must_use]
     pub fn readiness(&self) -> LaunchReadiness {
-        LaunchReadiness::from_issues(self.blockers().iter().map(LaunchBlocker::issue))
+        match &self.0 {
+            Preparation::Prepared(_) => LaunchReadiness::ready(),
+            Preparation::Blocked(blockers) => {
+                LaunchReadiness::from_issues(blockers.as_slice().iter().map(LaunchBlocker::issue))
+            }
+        }
     }
 }
 
@@ -297,15 +419,18 @@ impl LaunchBlocker {
         use crate::launch_readiness::ReadinessIssue;
 
         match self {
-            Self::RuntimeMissing { .. } => ReadinessIssue::RuntimeUnavailable,
-            // A system or a core combination BitArchive cannot run is a format
-            // question from the product's point of view: this content cannot be
-            // launched here, however intact it is.
+            Self::RuntimeUnavailable { .. } => ReadinessIssue::RuntimeUnavailable,
+            // A system BitArchive cannot run is a format question from the product's
+            // point of view: this content cannot be launched here, however intact it
+            // is, and whatever state the component stores are in.
             Self::UnsupportedSystemOrCore { .. } => ReadinessIssue::UnsupportedFormat,
             Self::CoreUnusable { .. } => ReadinessIssue::CoreMissing,
             Self::ContentMissing => ReadinessIssue::ContentUnavailable,
             Self::FirmwareMissing { .. } => ReadinessIssue::FirmwareMissing,
-            Self::InvalidConfiguration { .. } => ReadinessIssue::InvalidContent,
+            // An unusable stored override is a configuration problem, never a content
+            // problem: the bytes to launch are not what is wrong, and a UI that
+            // reported invalid content would offer the wrong action.
+            Self::InvalidConfiguration { .. } => ReadinessIssue::InvalidConfiguration,
         }
     }
 }
@@ -313,22 +438,36 @@ impl LaunchBlocker {
 /// Everything a later play flow needs to start this launch through the existing
 /// launch path.
 ///
+/// A value exists only for a launch that is ready: it is produced after content,
+/// runtime, core, firmware, and configuration all resolved, so holding one is evidence
+/// that every readiness question was answered. It contains no RetroArch-specific type
+/// and no process, and it starts nothing.
+///
+/// # What reaches RetroArch today, and what does not
+///
+/// The technical seam into the existing launch path currently consumes three of the
+/// four prepared inputs:
+///
 /// ```text
 /// PreparedGameLaunch
-///         ↓
-/// RetroArchLaunchInput      (runtime executable, core library, content, config)
-///         ↓
-/// RetroArchBackend::prepare_launch
-///         ↓
-/// PreparedLaunch
-///         ↓
-/// ProcessController::spawn  ← the step after this one, not part of it
+///   ├── runtime executable ─┐
+///   ├── core library ───────┼→ RetroArchLaunchInput → RetroArchBackend::prepare_launch
+///   ├── content ────────────┘                               ↓
+///   │                                                  PreparedLaunch
+///   │                                                       ↓
+///   │                                 ProcessController::spawn  ← the step after this one
+///   └── effective configuration
+///            ↓
+///        carried as product preparation state. It is **not** part of
+///        `RetroArchLaunchInput` yet, because reaching RetroArch requires a rendered
+///        `.cfg` file and generating one is a later step (ARCHITECTURE.md §28 makes
+///        generated launch artifacts session artifacts).
 /// ```
 ///
-/// A value exists only for a launch that is ready: it is produced after content,
-/// runtime, core, firmware, and configuration all resolved, so holding one is
-/// evidence that every readiness question was answered. It contains no
-/// RetroArch-specific type and no process, and it starts nothing.
+/// So the configuration is resolved, effective, and carried — and deliberately not yet
+/// turned into a file path. The prepared RetroArch input names no configuration file, so
+/// RetroArch keeps its own lookup rules until a launch-artifact step renders the
+/// effective configuration (ARCHITECTURE.md §28).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PreparedGameLaunch {
     game_id: GameId,
@@ -453,7 +592,7 @@ impl GameLaunchPlan {
     /// Returns the prepared launch, if the launch is ready.
     #[must_use]
     pub fn prepared(&self) -> Option<&PreparedGameLaunch> {
-        self.preparation.prepared()
+        self.preparation.prepared_launch()
     }
 
     /// Returns what blocks the launch, or an empty slice when it is ready.
@@ -515,13 +654,14 @@ pub fn prepare_game_launch(
     let Some(system) = system else {
         blockers.push(LaunchBlocker::UnsupportedSystemOrCore {
             system: None,
-            reason: String::from(
-                "no curated system accepts the content format of this file, so BitArchive has no \
-                 core it could run it with",
-            ),
+            reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
         });
 
-        return blocked(request, None, None, blockers);
+        // The blocker above is why this cannot be `None`: an unsupported content
+        // format always blocks. The `expect` documents that step rather than hiding a
+        // second failure mode behind a default.
+        return blocked(request, None, None, blockers)
+            .expect("an unsupported content format always blocks the launch");
     };
 
     let core_state = context.core.clone();
@@ -543,9 +683,10 @@ pub fn prepare_game_launch(
 
     let installed = core_state.as_ref().and_then(SystemCoreState::installed);
 
-    if context.runtime.runtime().is_none() {
-        blockers.push(LaunchBlocker::RuntimeMissing {
+    if let Some(reason) = context.runtime.unavailable_reason() {
+        blockers.push(LaunchBlocker::RuntimeUnavailable {
             id: context.runtime.id().to_owned(),
+            reason: reason.clone(),
         });
     }
 
@@ -556,7 +697,8 @@ pub fn prepare_game_launch(
         installed.cloned(),
         context.runtime.runtime(),
     ) else {
-        return blocked(request, Some(system), core_state, blockers);
+        return blocked(request, Some(system), core_state, blockers)
+            .expect("a launch is only built when nothing blocks it, and something did");
     };
 
     let launch = PreparedGameLaunch {
@@ -575,13 +717,20 @@ pub fn prepare_game_launch(
 }
 
 /// Wraps `request` and everything that was observed into a blocked plan.
+///
+/// Every caller reaches this function only after it has pushed at least one blocker, so
+/// the preparation is never asked to be blocked for no reason. The function still
+/// answers with an [`Option`] rather than unwrapping, because the non-empty invariant
+/// belongs to [`LaunchPreparation`] and not to a convention here.
 fn blocked(
     request: GameLaunchRequest,
     system: Option<EmulatedSystem>,
     core: Option<SystemCoreState>,
     blockers: Vec<LaunchBlocker>,
-) -> GameLaunchPlan {
-    LaunchGameLaunchPlan::new(request, system, core).finish(LaunchPreparation::Blocked { blockers })
+) -> Option<GameLaunchPlan> {
+    let preparation = LaunchPreparation::from_blockers(blockers)?;
+
+    Some(LaunchGameLaunchPlan::new(request, system, core).finish(preparation))
 }
 
 /// Wraps a fully prepared launch, or reports the blockers that appeared anyway.
@@ -597,10 +746,13 @@ fn prepared(
     blockers: Vec<LaunchBlocker>,
     launch: PreparedGameLaunch,
 ) -> GameLaunchPlan {
-    let preparation = if blockers.is_empty() {
-        LaunchPreparation::Prepared(Box::new(launch))
-    } else {
-        LaunchPreparation::Blocked { blockers }
+    // A prepared launch is only built when nothing blocks the launch, so this is the
+    // ready case. A blocker that appeared anyway is a contradiction, and one this
+    // function refuses to hide: the block below states which state is wrong instead of
+    // silently dropping either the launch or the reason.
+    let preparation = match LaunchPreparation::from_blockers(blockers) {
+        None => LaunchPreparation::prepared(launch),
+        Some(blocked) => blocked,
     };
 
     LaunchGameLaunchPlan::new(request, Some(system), core).finish(preparation)
@@ -640,7 +792,7 @@ impl LaunchGameLaunchPlan {
 
 /// Adds the blocker a system's core state produces, if it produces one.
 ///
-/// The two cases are different repairs and stay distinguishable: a system BitArchive
+/// The cases are different repairs and stay distinguishable: a system BitArchive
 /// curates no core for cannot be fixed by installing anything, while a curated
 /// definition that is not installed can.
 fn report_core_state(
@@ -648,24 +800,10 @@ fn report_core_state(
     state: &SystemCoreState,
     blockers: &mut Vec<LaunchBlocker>,
 ) {
-    let Some(core) = state.definition() else {
-        // The caller asked the port for a system that the curated catalogue does not
-        // contain, so there is no definition and no component to install. The
-        // negotiation only asks about systems it resolved itself, which makes this
-        // unreachable from the launch path.
-        blockers.push(LaunchBlocker::UnsupportedSystemOrCore {
-            system: Some(system.key().as_str().to_owned()),
-            reason: String::from(
-                "no curated core definition was resolved for this system, and no uncurated core is \
-                 ever used",
-            ),
-        });
+    let key = system.key().as_str().to_owned();
 
-        return;
-    };
-
-    match core {
-        SystemCore::Curated(definition) => {
+    match state.definition() {
+        Some(SystemCore::Curated(definition)) => {
             let Some(reason) = state.unusable_reason() else {
                 // The curated build is installed, so nothing blocks the launch here.
                 return;
@@ -677,12 +815,35 @@ fn report_core_state(
                 reason: reason.clone(),
             });
         }
-        SystemCore::Unavailable { reason } => {
-            // The system or the platform has no curated core, so the reason names what
-            // is missing instead of reporting a generic failure.
+        Some(SystemCore::Unavailable { reason }) => {
+            // The curated catalogue or the platform has no core for this system. The
+            // domain's reason is translated, not copied as text, so the blocker stays
+            // structured and the presentation layer decides how to phrase it.
             blockers.push(LaunchBlocker::UnsupportedSystemOrCore {
-                system: Some(system.key().as_str().to_owned()),
-                reason: reason.to_string(),
+                system: Some(key),
+                reason: match reason {
+                    CoreUnavailableReason::SystemNotCurated => {
+                        UnsupportedSystemOrCoreReason::SystemNotCurated
+                    }
+                    CoreUnavailableReason::CoreNotCuratedForPlatform {
+                        component_id,
+                        platform,
+                    } => UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+                        component_id: component_id.as_str().to_owned(),
+                        platform: *platform,
+                    },
+                },
+            });
+        }
+        None => {
+            // The caller asked the port for a system that the curated catalogue does not
+            // contain, so there is no definition at all. The negotiation only asks about
+            // systems it resolved itself, which makes this unreachable from the launch
+            // path; it is reported as uncurated rather than as a missing installation,
+            // because installing something could not repair it.
+            blockers.push(LaunchBlocker::UnsupportedSystemOrCore {
+                system: Some(key),
+                reason: UnsupportedSystemOrCoreReason::SystemNotCurated,
             });
         }
     }
@@ -793,24 +954,134 @@ fn resolve_config(sources: &[ScopedConfig]) -> (EffectiveLaunchConfig, Vec<Launc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch_readiness::ReadinessIssue;
+    use crate::launch_state::CoreUnusableReason;
 
-    /// A blocked preparation always names a reason, and readiness is derived from
-    /// the preparation instead of being stored next to it.
+    /// A runtime blocker for a runtime that is not installed.
+    fn runtime_missing() -> LaunchBlocker {
+        LaunchBlocker::RuntimeUnavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::NotInstalled,
+        }
+    }
+
+    /// A runtime blocker for a broken installation.
+    fn runtime_broken() -> LaunchBlocker {
+        LaunchBlocker::RuntimeUnavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::ExecutableMissing {
+                expected: PathBuf::from("/components/runtime/retroarch/1.22.2/RetroArch"),
+                version: String::from("1.22.2"),
+            },
+        }
+    }
+
+    /// Nothing blocks the launch, so a blocked preparation cannot be built from it.
+    ///
+    /// This is the regression test for the review finding: "blocked for no reason" is
+    /// not constructible through the public API, so a caller that collected no blocker
+    /// gets [`None`] instead of a preparation that contradicts itself.
     #[test]
-    fn a_blocked_preparation_always_names_a_reason() {
-        use crate::launch_readiness::ReadinessIssue;
+    fn no_blockers_do_not_produce_a_blocked_preparation() {
+        let nothing_blocks: [LaunchBlocker; 0] = [];
 
-        let blocked = LaunchPreparation::Blocked {
-            blockers: vec![
-                LaunchBlocker::ContentMissing,
-                LaunchBlocker::RuntimeMissing {
-                    id: String::from("retroarch"),
-                },
-            ],
-        };
+        assert_eq!(
+            LaunchPreparation::from_blockers(nothing_blocks),
+            None,
+            "an empty blocker list is not a blocked launch"
+        );
+    }
+
+    /// One blocker produces a blocked preparation that names exactly that blocker.
+    #[test]
+    fn one_blocker_produces_a_blocked_preparation() {
+        let blocked = LaunchPreparation::from_blockers([LaunchBlocker::ContentMissing])
+            .expect("one blocker blocks the launch");
 
         assert!(!blocked.is_ready());
-        assert!(blocked.prepared().is_none());
+        assert!(blocked.prepared_launch().is_none());
+        assert_eq!(blocked.blockers(), [LaunchBlocker::ContentMissing]);
+        assert!(!blocked.readiness().is_ready());
+    }
+
+    /// Several blockers are all kept, in the order the negotiation observed them.
+    #[test]
+    fn several_blockers_produce_a_blocked_preparation_that_keeps_them_all() {
+        let blockers = [
+            LaunchBlocker::ContentMissing,
+            runtime_missing(),
+            LaunchBlocker::FirmwareMissing {
+                filenames: vec![String::from("bios.bin")],
+            },
+        ];
+
+        let blocked =
+            LaunchPreparation::from_blockers(blockers.clone()).expect("three blockers block");
+
+        assert_eq!(blocked.blockers(), blockers.as_slice());
+        assert_eq!(
+            blocked.readiness().blocking_issues().len(),
+            3,
+            "every blocker contributes a readiness category"
+        );
+    }
+
+    /// A blocked preparation always names at least one reason, for every reachable
+    /// blocker count: the blocked state is private and only ever built from a non-empty
+    /// collection, so "blocked for no reason" has no constructor at all.
+    #[test]
+    fn a_blocked_preparation_always_names_a_reason() {
+        for count in [1, 2, 6] {
+            let blockers = [
+                LaunchBlocker::ContentMissing,
+                runtime_missing(),
+                runtime_broken(),
+                LaunchBlocker::UnsupportedSystemOrCore {
+                    system: None,
+                    reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
+                },
+                LaunchBlocker::CoreUnusable {
+                    component_id: String::from("mgba"),
+                    build_id: String::from("mgba-0.11-212-7a12d6d"),
+                    reason: CoreUnusableReason::NotInstalled,
+                },
+                LaunchBlocker::InvalidConfiguration {
+                    key: String::from("Video_Vsync"),
+                },
+            ];
+
+            let blocked = LaunchPreparation::from_blockers(blockers.into_iter().take(count))
+                .expect("a non-empty blocker list blocks the launch");
+
+            assert!(
+                !blocked.is_ready(),
+                "{count} blockers must block the launch"
+            );
+            assert_eq!(
+                blocked.blockers().len(),
+                count,
+                "every blocker must be reported"
+            );
+            assert!(
+                !blocked.blockers().is_empty(),
+                "a blocked preparation must name at least one reason"
+            );
+            assert!(
+                !blocked.readiness().is_ready(),
+                "a blocked preparation cannot report readiness"
+            );
+        }
+    }
+
+    /// Readiness cannot contradict the preparation, because it is derived from it: a
+    /// blocked preparation is never ready and a ready one never names a blocker.
+    #[test]
+    fn readiness_cannot_contradict_the_preparation() {
+        let blocked =
+            LaunchPreparation::from_blockers([LaunchBlocker::ContentMissing, runtime_missing()])
+                .expect("the blockers block the launch");
+
+        assert!(!blocked.is_ready());
         assert_eq!(
             blocked.readiness().blocking_issues(),
             [
@@ -818,5 +1089,122 @@ mod tests {
                 ReadinessIssue::RuntimeUnavailable
             ]
         );
+        assert!(
+            blocked.readiness().blocking_issues().len() == blocked.blockers().len(),
+            "every blocker is represented in the derived readiness"
+        );
+    }
+
+    /// An unusable stored configuration key is a configuration problem and never a
+    /// content problem.
+    ///
+    /// This is the regression test for the review finding: mapping it to
+    /// [`ReadinessIssue::InvalidContent`] claimed the content bytes were invalid, which
+    /// the negotiation never checked.
+    #[test]
+    fn an_invalid_configuration_is_not_invalid_content() {
+        let blocker = LaunchBlocker::InvalidConfiguration {
+            key: String::from("Video_Vsync"),
+        };
+
+        assert_eq!(blocker.issue(), ReadinessIssue::InvalidConfiguration);
+        assert_ne!(
+            blocker.issue(),
+            ReadinessIssue::InvalidContent,
+            "an unusable stored override says nothing about the content"
+        );
+
+        let blocked = LaunchPreparation::from_blockers([blocker]).expect("the blocker blocks");
+
+        assert_eq!(
+            blocked.readiness().blocking_issues(),
+            [ReadinessIssue::InvalidConfiguration]
+        );
+    }
+
+    /// A missing runtime and a broken runtime are different conditions with different
+    /// repairs, and the blocker keeps them apart.
+    #[test]
+    fn a_missing_runtime_and_a_broken_runtime_stay_distinguishable() {
+        let missing = LaunchPreparation::from_blockers([runtime_missing()])
+            .expect("the blocker blocks the launch");
+        let broken = LaunchPreparation::from_blockers([runtime_broken()])
+            .expect("the blocker blocks the launch");
+
+        assert_ne!(missing.blockers(), broken.blockers());
+        assert_eq!(
+            missing.readiness().blocking_issues(),
+            broken.readiness().blocking_issues(),
+            "both are a runtime readiness problem, and the blocker keeps the detail"
+        );
+    }
+
+    /// The three unsupported cases are separate structured reasons, not one message.
+    #[test]
+    fn unsupported_system_or_core_reasons_stay_distinguishable() {
+        let format = UnsupportedSystemOrCoreReason::UnsupportedContentFormat;
+        let system = UnsupportedSystemOrCoreReason::SystemNotCurated;
+        let platform = UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+            component_id: String::from("mgba"),
+            platform: CorePlatform::MacOsArm64,
+        };
+
+        assert_ne!(format, system);
+        assert_ne!(system, platform);
+        assert_ne!(format, platform);
+
+        let blocked = LaunchPreparation::from_blockers([LaunchBlocker::UnsupportedSystemOrCore {
+            system: Some(String::from("gba")),
+            reason: platform,
+        }])
+        .expect("the blocker blocks the launch");
+
+        assert_eq!(
+            blocked.readiness().blocking_issues(),
+            [ReadinessIssue::UnsupportedFormat]
+        );
+    }
+
+    /// No blocker carries presentation text: every field is an identity, a platform, a
+    /// path, a version, or a file name.
+    #[test]
+    fn no_blocker_carries_presentation_text() {
+        let blockers = [
+            runtime_missing(),
+            runtime_broken(),
+            LaunchBlocker::UnsupportedSystemOrCore {
+                system: None,
+                reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
+            },
+            LaunchBlocker::UnsupportedSystemOrCore {
+                system: Some(String::from("gba")),
+                reason: UnsupportedSystemOrCoreReason::SystemNotCurated,
+            },
+            LaunchBlocker::CoreUnusable {
+                component_id: String::from("mgba"),
+                build_id: String::from("mgba-0.11-212-7a12d6d"),
+                reason: CoreUnusableReason::Unusable,
+            },
+            LaunchBlocker::ContentMissing,
+            LaunchBlocker::FirmwareMissing {
+                filenames: vec![String::from("bios.bin")],
+            },
+            LaunchBlocker::InvalidConfiguration {
+                key: String::from("Video_Vsync"),
+            },
+        ];
+
+        for blocker in &blockers {
+            let rendered = format!("{blocker:?}");
+
+            assert!(
+                !rendered.contains("run this"),
+                "a blocker must not carry recovery advice: {rendered}"
+            );
+            assert!(
+                !rendered.contains("please") && !rendered.contains("cannot be launched here"),
+                "a blocker must not carry a sentence for a person: {rendered}"
+            );
+        }
     }
 }

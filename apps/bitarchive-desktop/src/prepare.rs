@@ -44,17 +44,29 @@
 //! Readiness is only useful if the result can actually be handed to the launch path, so
 //! the command composes the resolved values into a
 //! [`PreparedLaunch`](bitarchive_application::PreparedLaunch) and prints it —
-//! and starts nothing. That is the seam the later product play flow goes through:
+//! and starts nothing. That is the seam the later product play flow goes through, and
+//! today it carries three of the four prepared inputs:
 //!
 //! ```text
-//! PreparedGameLaunch.runtime().executable()      ┐
+//! PreparedGameLaunch.runtime().executable()       ┐
 //! PreparedGameLaunch.core_installation().library()├→ RetroArchLaunchInput
-//! PreparedGameLaunch.content()                   │
-//! PreparedGameLaunch.config()                    ┘
+//! PreparedGameLaunch.content()                    ┘        ↓
+//!                                          RetroArchBackend::prepare_launch
+//!                                                           ↓
+//!                                                     PreparedLaunch
+//!
+//! PreparedGameLaunch.config()  →  effective configuration, carried and printed.
+//!                                 It is **not** part of RetroArchLaunchInput: reaching
+//!                                 RetroArch needs a rendered `.cfg` file, and generating
+//!                                 one is a later launch-artifact step (no `.cfg` is
+//!                                 written by B8).
 //! ```
 //!
-//! The arguments themselves stay the sole responsibility of [`RetroArchBackend`], so
-//! this module cannot drift from the documented RetroArch CLI form.
+//! The command prints the effective configuration with the scope each value came from, so
+//! a developer can see what a later step would render without this one pretending to have
+//! rendered it. The arguments themselves stay the sole responsibility of
+//! [`RetroArchBackend`], so this module cannot drift from the documented RetroArch CLI
+//! form.
 //!
 //! # Why a missing component is not acquired here
 //!
@@ -76,7 +88,8 @@ use std::str::FromStr;
 
 use bitarchive_application::{
     CoreUnusableReason, GameLaunchContext, GameLaunchPlan, GameLaunchRequest, LaunchBlocker,
-    LaunchPreparation, ManagedEmulationState, PreparedGameLaunch, prepare_game_launch,
+    ManagedEmulationState, PreparedGameLaunch, RuntimeUnavailableReason,
+    UnsupportedSystemOrCoreReason, prepare_game_launch,
 };
 use bitarchive_domain::config::ConfigScope;
 use bitarchive_domain::managed_core::{UnsupportedCoreHost, host_core_platform};
@@ -437,23 +450,20 @@ fn report_plan(plan: &GameLaunchPlan) {
         None => println!("  library      none — no usable build is installed"),
     }
 
-    match plan.preparation() {
-        LaunchPreparation::Prepared(launch) => {
-            println!(
-                "  runtime      {} {}",
-                launch.runtime().id(),
-                launch.runtime().version()
-            );
-            println!("  executable   {}", launch.runtime().executable().display());
+    if let Some(launch) = plan.prepared() {
+        println!(
+            "  runtime      {} {}",
+            launch.runtime().id(),
+            launch.runtime().version()
+        );
+        println!("  executable   {}", launch.runtime().executable().display());
 
-            for outcome in launch.firmware() {
-                println!(
-                    "  firmware     {:?} {:?} present={:?} missing={:?}",
-                    outcome.level, outcome.expected, outcome.present, outcome.missing
-                );
-            }
+        for outcome in launch.firmware() {
+            println!(
+                "  firmware     {:?} {:?} present={:?} missing={:?}",
+                outcome.level, outcome.expected, outcome.present, outcome.missing
+            );
         }
-        LaunchPreparation::Blocked { .. } => {}
     }
 
     println!();
@@ -508,14 +518,41 @@ fn report_blockers(plan: &GameLaunchPlan, store_root: Option<&Path>) {
 ///
 /// The blocker itself carries no user-facing text (ARCHITECTURE.md §21); this is the
 /// composition root's presentation of it, which is exactly where such text belongs.
+/// Every sentence below reads a *typed* reason and decides how to phrase it — the
+/// application layer never hands one over pre-rendered.
 fn describe(blocker: &LaunchBlocker) -> String {
     match blocker {
-        LaunchBlocker::RuntimeMissing { id } => {
-            format!("the managed runtime is missing: {id}")
-        }
-        LaunchBlocker::UnsupportedSystemOrCore { system, reason } => match system {
-            Some(system) => format!("no curated core can run {system} here: {reason}"),
-            None => format!("the content format is not supported: {reason}"),
+        LaunchBlocker::RuntimeUnavailable { id, reason } => match reason {
+            RuntimeUnavailableReason::NotInstalled => {
+                format!("the managed runtime {id} is not installed")
+            }
+            RuntimeUnavailableReason::ExecutableMissing { expected, version } => format!(
+                "the installed {id} {version} has no executable at {} — the installation is \
+                 incomplete",
+                expected.display()
+            ),
+            RuntimeUnavailableReason::StoreUnreadable => format!(
+                "the managed runtime {id} could not be resolved: the component store could not be \
+                 read"
+            ),
+        },
+        LaunchBlocker::UnsupportedSystemOrCore { system, reason } => match reason {
+            UnsupportedSystemOrCoreReason::UnsupportedContentFormat => String::from(
+                "the content format is not supported: no curated system accepts the format of this \
+                 file, so there is no core to run it with",
+            ),
+            UnsupportedSystemOrCoreReason::SystemNotCurated => format!(
+                "the system {} is not in BitArchive's curated system list, and custom systems are \
+                 not supported",
+                system.as_deref().unwrap_or("of this content")
+            ),
+            UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+                component_id,
+                platform,
+            } => format!(
+                "no curated {component_id} core exists for {platform}, and no other architecture's \
+                 build is substituted for it"
+            ),
         },
         LaunchBlocker::CoreUnusable {
             component_id,
@@ -545,18 +582,29 @@ fn describe(blocker: &LaunchBlocker) -> String {
 /// The developer command that installs the component a blocker is about, when
 /// installing it would resolve the blocker.
 ///
-/// Only "not installed" has an answer: the acquisition command installs the component
-/// and a preparation then resolves it. A build directory that exists without its
-/// library is a broken installation, and the store refuses to install a build it
-/// already has, so that blocker is reported for diagnosis instead.
+/// Only a component that is genuinely **not installed** has an answer: the acquisition
+/// command installs it, and a preparation then resolves it. Every other state is
+/// answered with nothing, because the acquisition command cannot repair it:
+///
+/// - a broken installation: the stores refuse to install a component they already have;
+/// - an unreadable store: the store needs diagnosis, not a download;
+/// - an unsupported system or core, missing content, missing firmware, an unusable
+///   stored override: no install changes any of them.
+///
+/// The decision reads the *typed* reason, so it cannot be fooled by how a state is
+/// phrased.
 fn acquisition_command(blocker: &LaunchBlocker) -> Option<AcquisitionCommand> {
     match blocker {
-        LaunchBlocker::RuntimeMissing { .. } => Some(AcquisitionCommand::Runtime),
+        LaunchBlocker::RuntimeUnavailable {
+            reason: RuntimeUnavailableReason::NotInstalled,
+            ..
+        } => Some(AcquisitionCommand::Runtime),
         LaunchBlocker::CoreUnusable {
             reason: CoreUnusableReason::NotInstalled,
             ..
         } => Some(AcquisitionCommand::Core),
-        LaunchBlocker::UnsupportedSystemOrCore { .. }
+        LaunchBlocker::RuntimeUnavailable { .. }
+        | LaunchBlocker::UnsupportedSystemOrCore { .. }
         | LaunchBlocker::CoreUnusable { .. }
         | LaunchBlocker::ContentMissing
         | LaunchBlocker::FirmwareMissing { .. }
@@ -646,10 +694,18 @@ fn report_effective_config(launch: &PreparedGameLaunch) {
 /// Composes the prepared product launch into the launch path's own contract.
 ///
 /// This is the seam the later play flow uses: the resolved runtime executable, the
-/// installed core library, the content, and the effective configuration become a
-/// [`RetroArchLaunchInput`], and [`RetroArchBackend`] alone turns that into a
-/// [`bitarchive_application::PreparedLaunch`]. The environment and the working
-/// directory stay unset, because nothing in B8 decides them.
+/// installed core library, and the content become a [`RetroArchLaunchInput`], and
+/// [`RetroArchBackend`] alone turns that into a
+/// [`bitarchive_application::PreparedLaunch`]. The environment and the working directory
+/// stay unset, because nothing in B8 decides them.
+///
+/// The effective configuration is deliberately **not** passed here. A
+/// [`RetroArchLaunchInput`] can name a configuration *file*, and there is none: the
+/// effective configuration is resolved product state and no step renders it into a
+/// `.cfg` yet (ARCHITECTURE.md §28 makes a generated launch configuration a session
+/// artifact). Passing a path that no step produced would be a false statement about what
+/// RetroArch would load, so the input names no configuration and RetroArch keeps its own
+/// lookup rules until the launch-artifact step exists.
 fn prepared_launch(launch: &PreparedGameLaunch) -> bitarchive_application::PreparedLaunch {
     let input = RetroArchLaunchInput::new(
         launch.runtime().executable(),
@@ -825,13 +881,31 @@ mod tests {
         );
     }
 
+    /// A runtime blocker for a runtime that is not installed.
+    fn runtime_not_installed() -> LaunchBlocker {
+        LaunchBlocker::RuntimeUnavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::NotInstalled,
+        }
+    }
+
+    /// A runtime blocker for an installation that lost its executable.
+    fn runtime_executable_missing() -> LaunchBlocker {
+        LaunchBlocker::RuntimeUnavailable {
+            id: String::from("retroarch"),
+            reason: RuntimeUnavailableReason::ExecutableMissing {
+                expected: PathBuf::from(
+                    "/components/runtime/retroarch/macos-universal/1.22.2/RetroArch.app/Contents/MacOS/RetroArch",
+                ),
+                version: String::from("1.22.2"),
+            },
+        }
+    }
+
     /// The command's presentation of a blocker names the component, and the
     /// acquisition advice is only offered for a component that is not installed.
     #[test]
     fn only_a_missing_component_has_an_install_command() {
-        let missing_runtime = LaunchBlocker::RuntimeMissing {
-            id: String::from("retroarch"),
-        };
         let missing_core = LaunchBlocker::CoreUnusable {
             component_id: String::from("mgba"),
             build_id: String::from("mgba-0.11-212-7a12d6d"),
@@ -847,8 +921,9 @@ mod tests {
         };
 
         assert_eq!(
-            acquisition_command(&missing_runtime),
-            Some(AcquisitionCommand::Runtime)
+            acquisition_command(&runtime_not_installed()),
+            Some(AcquisitionCommand::Runtime),
+            "a runtime that is not installed is what acquire-retroarch-runtime installs"
         );
         assert_eq!(
             acquisition_command(&missing_core),
@@ -866,78 +941,120 @@ mod tests {
         );
     }
 
-    /// The advice names the store the run actually used, so it repairs that store.
+    /// A runtime that is installed but broken gets **no** acquisition advice: the store
+    /// refuses to install a version it already has, so `acquire-retroarch-runtime`
+    /// could not repair it.
     #[test]
-    fn the_acquisition_advice_names_the_store_that_was_used() {
-        let default = AcquisitionCommand::Runtime.render(None);
-        let rooted = AcquisitionCommand::Runtime.render(Some(Path::new("/tmp/store")));
-
-        assert!(default.ends_with("acquire-retroarch-runtime"));
-        assert!(rooted.ends_with("acquire-retroarch-runtime --root /tmp/store"));
-    }
-
-    /// The deduplication of the advice keeps one line per component class, so a run
-    /// that misses both components is not told to install the core twice.
-    #[test]
-    fn the_acquisition_advice_lists_each_component_class_once() {
-        let blockers = [
-            LaunchBlocker::CoreUnusable {
-                component_id: String::from("mgba"),
-                build_id: String::from("mgba-0.11-212-7a12d6d"),
-                reason: CoreUnusableReason::NotInstalled,
-            },
-            LaunchBlocker::RuntimeMissing {
+    fn a_broken_runtime_gets_no_acquisition_advice() {
+        assert_eq!(
+            acquisition_command(&runtime_executable_missing()),
+            None,
+            "an incomplete installation is diagnosed, not downloaded again"
+        );
+        assert_eq!(
+            acquisition_command(&LaunchBlocker::RuntimeUnavailable {
                 id: String::from("retroarch"),
-            },
-            LaunchBlocker::CoreUnusable {
-                component_id: String::from("mgba"),
-                build_id: String::from("mgba-0.11-212-7a12d6d"),
-                reason: CoreUnusableReason::NotInstalled,
-            },
-        ];
-
-        let mut commands: Vec<AcquisitionCommand> = Vec::new();
-
-        for blocker in &blockers {
-            if let Some(command) = acquisition_command(blocker)
-                && !commands.contains(&command)
-            {
-                commands.push(command);
-            }
-        }
-
-        assert_eq!(
-            commands,
-            [AcquisitionCommand::Core, AcquisitionCommand::Runtime],
-            "each component class is advised once, in blocker order"
-        );
-        assert_eq!(
-            AcquisitionCommand::Core.name(),
-            ACQUIRE_CORE_COMMAND,
-            "the advice names the existing command"
+                reason: RuntimeUnavailableReason::StoreUnreadable,
+            }),
+            None,
+            "an unreadable store is diagnosed, not downloaded again"
         );
     }
 
-    /// Every blocker renders a description, so a developer always learns what is
-    /// wrong.
+    /// The presentation of a broken runtime names the executable and the version, and
+    /// never suggests acquiring it.
+    #[test]
+    fn a_broken_runtime_is_described_without_a_download_hint() {
+        let text = describe(&runtime_executable_missing());
+
+        assert!(text.contains("1.22.2"), "the version is named: {text}");
+        assert!(
+            text.contains("RetroArch.app"),
+            "the expected executable is named: {text}"
+        );
+        assert!(
+            !text.contains("acquire"),
+            "the description carries no recovery action: {text}"
+        );
+    }
+
+    /// A runtime that is not installed is described as missing rather than as broken.
+    #[test]
+    fn a_missing_runtime_is_described_as_missing() {
+        let text = describe(&runtime_not_installed());
+
+        assert!(text.contains("not installed"), "{text}");
+        assert!(
+            !text.contains("incomplete"),
+            "a first run is not a broken installation: {text}"
+        );
+    }
+
+    /// Each typed unsupported reason renders its own sentence, so a format problem, an
+    /// uncurated system, and an uncurated platform do not collapse into one message.
+    #[test]
+    fn the_unsupported_reasons_render_different_descriptions() {
+        let format = describe(&LaunchBlocker::UnsupportedSystemOrCore {
+            system: None,
+            reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
+        });
+        let system = describe(&LaunchBlocker::UnsupportedSystemOrCore {
+            system: Some(String::from("gba")),
+            reason: UnsupportedSystemOrCoreReason::SystemNotCurated,
+        });
+        let platform = describe(&LaunchBlocker::UnsupportedSystemOrCore {
+            system: Some(String::from("gba")),
+            reason: UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+                component_id: String::from("mgba"),
+                platform: bitarchive_domain::CorePlatform::MacOsArm64,
+            },
+        });
+
+        assert!(format.contains("content format"), "{format}");
+        assert!(system.contains("curated system list"), "{system}");
+        assert!(
+            platform.contains("mgba") && platform.contains("macos-arm64"),
+            "the uncurated platform names the component and the platform: {platform}"
+        );
+        assert_ne!(format, system);
+        assert_ne!(system, platform);
+    }
+
+    /// Every blocker variant renders a description, so a developer always learns what
+    /// is wrong — and no description is empty or carries recovery advice.
     #[test]
     fn every_blocker_renders_a_description() {
         let blockers = [
-            LaunchBlocker::RuntimeMissing {
+            runtime_not_installed(),
+            runtime_executable_missing(),
+            LaunchBlocker::RuntimeUnavailable {
                 id: String::from("retroarch"),
-            },
-            LaunchBlocker::UnsupportedSystemOrCore {
-                system: Some(String::from("gba")),
-                reason: String::from("no curated definition"),
+                reason: RuntimeUnavailableReason::StoreUnreadable,
             },
             LaunchBlocker::UnsupportedSystemOrCore {
                 system: None,
-                reason: String::from("no curated system"),
+                reason: UnsupportedSystemOrCoreReason::UnsupportedContentFormat,
+            },
+            LaunchBlocker::UnsupportedSystemOrCore {
+                system: Some(String::from("gba")),
+                reason: UnsupportedSystemOrCoreReason::SystemNotCurated,
+            },
+            LaunchBlocker::UnsupportedSystemOrCore {
+                system: Some(String::from("gba")),
+                reason: UnsupportedSystemOrCoreReason::CoreNotCuratedForPlatform {
+                    component_id: String::from("mgba"),
+                    platform: bitarchive_domain::CorePlatform::MacOsArm64,
+                },
             },
             LaunchBlocker::CoreUnusable {
                 component_id: String::from("mgba"),
                 build_id: String::from("mgba-0.11-212-7a12d6d"),
                 reason: CoreUnusableReason::NotInstalled,
+            },
+            LaunchBlocker::CoreUnusable {
+                component_id: String::from("mgba"),
+                build_id: String::from("mgba-0.11-212-7a12d6d"),
+                reason: CoreUnusableReason::Unusable,
             },
             LaunchBlocker::ContentMissing,
             LaunchBlocker::FirmwareMissing {
@@ -949,10 +1066,35 @@ mod tests {
         ];
 
         for blocker in blockers {
+            let text = describe(&blocker);
+
             assert!(
-                !describe(&blocker).is_empty(),
+                !text.is_empty(),
                 "{blocker:?} must be explainable to a developer"
             );
+            assert!(
+                !text.contains("acquire-"),
+                "the description carries no recovery action: {text}"
+            );
         }
+    }
+
+    /// An unusable stored configuration key is described as a configuration problem and
+    /// never as a content problem.
+    #[test]
+    fn an_invalid_configuration_key_is_not_described_as_content() {
+        let text = describe(&LaunchBlocker::InvalidConfiguration {
+            key: String::from("Video_Vsync"),
+        });
+
+        assert!(text.contains("Video_Vsync"), "the key is named: {text}");
+        assert!(
+            text.contains("configuration"),
+            "the description names the configuration: {text}"
+        );
+        assert!(
+            !text.contains("content"),
+            "an unusable stored override says nothing about the content: {text}"
+        );
     }
 }

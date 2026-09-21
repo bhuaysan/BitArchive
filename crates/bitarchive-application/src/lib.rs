@@ -130,13 +130,14 @@ mod prepared_launch;
 
 pub use game_launch::{
     GameLaunchContext, GameLaunchPlan, GameLaunchRequest, LaunchBlocker, LaunchPreparation,
-    PreparedGameLaunch, prepare_game_launch,
+    PreparedGameLaunch, UnsupportedSystemOrCoreReason, prepare_game_launch,
 };
 pub use launch::{LaunchAction, LaunchRequest};
 pub use launch_readiness::{LaunchReadiness, ReadinessIssue};
 pub use launch_state::{
     CoreAvailability, CoreUnusableReason, FirmwareChecker, FirmwareOutcome, InstalledCore,
-    LaunchRuntime, LaunchRuntimeResolution, ManagedEmulationState, SystemCoreState,
+    LaunchRuntime, LaunchRuntimeResolution, ManagedEmulationState, RuntimeUnavailableReason,
+    SystemCoreState,
 };
 pub use managed_core::{
     CoreArchiveExtractor, CoreInstaller, CoreStoreError, ManagedCore, artifact_request,
