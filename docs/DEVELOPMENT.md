@@ -59,22 +59,38 @@ Handover Protocol
     ↓
 Review by ChatGPT
     ↓
-Changes if required
+APPROVED / CHANGES REQUESTED
     ↓
-Tests
+if CHANGES REQUESTED:
+    Changes
+        ↓
+    Tests
+        ↓
+    Commit + Push
+        ↓
+    New Handover
+        ↓
+    Re-review
     ↓
-Commit + Push
+APPROVED
     ↓
-Updated Handover
-    ↓
-Re-review
-    ↓
-Approval
+Formal GitHub approval when applicable
     ↓
 Squash Merge into main
 ```
 
 No step should normally be skipped.
+
+The mandatory gate in this flow is the **ChatGPT review verdict**. The formal GitHub approval step is separate and only applies when a distinct reviewer account exists (§24).
+
+In the current solo repository topology, the verdict `APPROVED` is what permits the Squash Merge:
+
+```text
+Current solo topology:
+ChatGPT APPROVED
+    → no GitHub self-approval required
+    → Squash Merge into main
+```
 
 ---
 
@@ -757,7 +773,44 @@ CHANGES REQUESTED
 
 An approval means that the reviewer considers the Pull Request ready for merge.
 
+`APPROVED` is the **content-review verdict**. It is the approval the merge gate refers to, and it is mandatory before a Pull Request may be merged.
+
+`CHANGES REQUESTED` prohibits the merge until the changes have been implemented, tested, committed, pushed, handed over again, and re-reviewed.
+
 Requested changes must clearly describe what needs to be corrected.
+
+### GitHub review approval is a separate mechanism
+
+The content-review verdict and a formal GitHub review approval are **not the same thing**.
+
+A formal GitHub approval is additionally required only when:
+
+- a distinct reviewer account exists and repository policy requires it, or
+- branch protection requires approving reviews.
+
+This repository currently runs with a single GitHub account, so the Pull Request author and the authenticated account are identical:
+
+```text
+PR author == only authenticated GitHub account
+```
+
+GitHub does not permit an account to approve its own Pull Request. Therefore:
+
+```text
+GitHub self-approval is technically impossible and is not required.
+```
+
+In that topology the absence of a formal GitHub review does **not** invalidate a documented ChatGPT `APPROVED`, and it does not weaken the review gate. The content-review verdict remains mandatory; only the redundant GitHub self-approval step does not apply.
+
+This is not an exemption from review:
+
+```text
+not:  a solo developer may merge without approval
+but:  the solo repository still requires the content-review verdict APPROVED;
+      only the redundant GitHub self-approval step is omitted
+```
+
+If an independent collaborator joins the repository, the formal GitHub approval can be used in addition. Creating a second GitHub account controlled by the same person does not add independent review quality and is not a recommended substitute.
 
 ---
 
@@ -852,12 +905,21 @@ A Pull Request may only be merged when:
 - relevant tests pass
 - required CI checks pass
 - review is complete
-- reviewer approval has been given
+- the content-review verdict is `APPROVED`
+- a formal GitHub review approval, where one is applicable (§24)
 - no unresolved blocking review comments remain
 
 The rule is:
 
 > **No approval, no merge.**
+
+Here `approval` refers to the **content-review verdict** defined in §24, not to a GitHub UI state:
+
+```text
+No APPROVED review verdict → no merge.
+```
+
+In the current solo topology the GitHub self-approval mechanism is not applicable. The content-review verdict is.
 
 ---
 
@@ -876,6 +938,8 @@ Recommended settings:
 - automatically delete merged source branches
 
 Where GitHub plan and repository settings allow it, protections should also apply to repository administrators.
+
+Requiring approving reviews is only meaningful when a distinct reviewer account exists. In the current solo topology the Pull Request author is the only account, so such a requirement could never be satisfied and is not enabled. The merge gate is then carried by the content-review verdict described in §24, and not by a branch protection approval count.
 
 ---
 
@@ -1198,3 +1262,5 @@ The BitArchive workflow can be summarized by the following rules:
 > **Main stays stable.**
 
 > **GitHub is the development source of truth.**
+
+In the rules above, `approval` means the content-review verdict `APPROVED` (§24). It is not a GitHub UI state, and it is never waived.
