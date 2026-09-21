@@ -12,8 +12,14 @@
 //!
 //! It is deliberately small. It carries no titles, descriptions, regions,
 //! languages, release types, hashes, paths, scanner or scraping state, save
-//! states, or configuration. Those are added by the Issues that actually need
-//! them, not in advance.
+//! states, or configuration persistence. Those are added by the Issues that
+//! actually need them, not in advance.
+//!
+//! What it does own beyond the identities is the set of deterministic rules the
+//! launch path is built from: core selection ([`core`]), the curated system list
+//! and the core each system runs ([`system`]), the launch configuration hierarchy
+//! ([`config`]), and the pinned component descriptions ([`runtime`],
+//! [`managed_core`]).
 //!
 //! # Boundary
 //!
@@ -68,6 +74,7 @@
 //! conversion between them exists yet.
 
 pub mod component;
+pub mod config;
 mod content;
 pub mod core;
 mod game;
@@ -75,10 +82,15 @@ mod id;
 pub mod managed_core;
 mod release;
 pub mod runtime;
+pub mod system;
 
 pub use component::{
     ArtifactReference, ArtifactSource, ComponentArtifactSource, ComponentAttribution, ComponentId,
     LicenseIdentifier, LoopbackSource, RelativePath, Sha256Digest,
+};
+pub use config::{
+    ConfigKey, ConfigKeyError, ConfigScope, ConfigTrace, ConfigValue, EffectiveLaunchConfig,
+    LaunchConfig, LaunchConfigResolution, ScopedConfig, resolve_launch_config,
 };
 pub use content::Content;
 pub use core::{CoreSelectionSource, ResolvedCore, resolve_core};
@@ -86,10 +98,14 @@ pub use game::Game;
 pub use id::{ContentId, CoreId, GameId, ReleaseId, SystemId};
 pub use managed_core::{
     CoreBuildId, CoreComponentId, CoreDefinition, CoreParts, CorePlatform, CoreProvenance,
-    MAX_CORE_BUILD_ID_LENGTH,
+    FirmwareRequirement, FirmwareRequirementLevel, MAX_CORE_BUILD_ID_LENGTH,
 };
 pub use release::Release;
 pub use runtime::{
     ArtifactKind, RuntimeAttribution, RuntimeDefinition, RuntimeId, RuntimeParts, RuntimePlatform,
     RuntimeSource, RuntimeVersion,
+};
+pub use system::{
+    CoreUnavailableReason, EmulatedSystem, EmulatedSystemCatalog, EmulatedSystemKey,
+    EmulatedSystemKeyError, SystemCore, curated_systems, resolve_system_core,
 };

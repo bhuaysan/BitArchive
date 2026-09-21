@@ -9,7 +9,8 @@
 //!  ├── (nothing)                        → the Slint desktop UI
 //!  ├── acquire-retroarch-runtime [opts] → the opt-in developer runtime acquisition
 //!  ├── acquire-core [opts]              → the opt-in developer core acquisition
-//!  └── launch <content> [--root <dir>]  → the opt-in developer managed launch
+//!  ├── launch <content> [--root <dir>]  → the opt-in developer managed launch
+//!  └── prepare <content> [opts]         → the opt-in developer launch preparation
 //! ```
 //!
 //! # LIVE COMPONENT ACQUISITION
@@ -31,6 +32,15 @@
 //! existing launch path, and waits for the process to exit. It accepts no runtime
 //! and no core argument, downloads nothing, and is likewise never called by the
 //! UI, by a test, or by CI.
+//!
+//! # GAME LAUNCH PREPARATION
+//!
+//! `prepare` is the developer command that answers whether a concrete game can be
+//! started with the currently installed state, and which launch inputs follow from
+//! that (Issue #29). It resolves the content's system from the curated list, the
+//! managed runtime, the curated core build, the firmware the core looks for, and the
+//! effective launch configuration — and it starts nothing. The real process start
+//! stays `launch` (Issue #23), which is the proof that the prepared path is startable.
 //!
 //! What the runtime command does:
 //!
@@ -68,12 +78,14 @@
 mod acquire_core;
 mod acquire_runtime;
 mod launch;
+mod prepare;
 
 use std::process::ExitCode;
 
 use acquire_core::AcquireCoreRequest;
 use acquire_runtime::AcquireRequest;
 use launch::LaunchRequest;
+use prepare::PrepareRequest;
 
 /// The command that acquires the pinned RetroArch runtime.
 const ACQUIRE_COMMAND: &str = "acquire-retroarch-runtime";
@@ -84,6 +96,9 @@ const ACQUIRE_CORE_COMMAND: &str = "acquire-core";
 /// The command that launches local content with the managed components.
 const LAUNCH_COMMAND: &str = "launch";
 
+/// The command that decides and prepares a game launch without starting anything.
+const PREPARE_COMMAND: &str = "prepare";
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
@@ -91,6 +106,7 @@ fn main() -> ExitCode {
         Some((command, rest)) if command == ACQUIRE_COMMAND => acquire_runtime::run(rest),
         Some((command, rest)) if command == ACQUIRE_CORE_COMMAND => acquire_core::run(rest),
         Some((command, rest)) if command == LAUNCH_COMMAND => launch::run(rest),
+        Some((command, rest)) if command == PREPARE_COMMAND => prepare::run(rest),
         Some((command, _)) if command == "--help" || command == "-h" => {
             print_usage();
 
@@ -130,6 +146,10 @@ fn print_usage() {
          \x20                                              launch local content with the managed\n\
          \x20                                              runtime and core (REAL PROCESS START,\n\
          \x20                                              developer opt-in)\n\
+         \x20 bitarchive-desktop {PREPARE_COMMAND} <content> [--root <dir>] [config overrides]\n\
+         \x20                                              decide launch readiness and prepare the\n\
+         \x20                                              launch inputs (NO PROCESS START,\n\
+         \x20                                              developer opt-in)\n\
          \x20 bitarchive-desktop --help\n\
          \n\
          Options for {ACQUIRE_COMMAND}:"
@@ -144,4 +164,8 @@ fn print_usage() {
     println!("\nOptions for {LAUNCH_COMMAND}:");
 
     let _ = LaunchRequest::usage();
+
+    println!("\nOptions for {PREPARE_COMMAND}:");
+
+    let _ = PrepareRequest::usage();
 }

@@ -12,27 +12,35 @@
 //! Domain
 //! ```
 //!
-//! What exists here is deliberately only the beginning of the launch path plus
-//! the runtime acquisition contract:
+//! What exists here is the launch path up to the point where a launch is decided and
+//! prepared, plus the runtime acquisition contract:
 //!
 //! - [`LaunchRequest`] — the user's launch wish, expressed as a [`GameId`] and a
 //!   [`LaunchAction`]
-//! - [`LaunchReadiness`] and [`ReadinessIssue`] — the structured result of a
-//!   readiness check
+//! - [`LaunchReadiness`] and [`ReadinessIssue`] — the structured vocabulary of a
+//!   readiness result
 //! - [`PreparedLaunch`] — the backend-neutral description of a fully resolved
 //!   process launch
 //! - [`resolve_core`] — re-exported domain policy for deterministic core
 //!   selection
+//! - the launch-readiness and launch-preparation use case in `game_launch`:
+//!   [`GameLaunchRequest`], [`prepare_game_launch`], [`LaunchBlocker`],
+//!   [`LaunchPreparation`], and [`PreparedGameLaunch`]
+//! - [`launch_state`] — the state that use case reads, through the ports
+//!   [`ManagedEmulationState`] and [`FirmwareChecker`], and the neutral values they
+//!   answer with
 //! - [`managed_runtime`] — the ports and result types of managed runtime
 //!   acquisition: [`ArtifactDownloader`], [`ArtifactExtractor`],
 //!   [`DiskImageExtractor`], [`RuntimeInstaller`], and [`InstalledRuntime`]
 //! - [`managed_core`] — the ports and result types of curated core acquisition:
 //!   [`CoreArchiveExtractor`], [`CoreInstaller`], and [`ManagedCore`]
 //!
-//! Release resolution, content resolution, firmware readiness, configuration
-//! resolution, core options, process spawning, and session management are not
-//! implemented yet (ARCHITECTURE.md §20, §21, §22, §23). This crate introduces no
-//! ports for them in advance.
+//! The launch preparation ends at *ready and prepared*: it starts no process. Release
+//! resolution, content resolution, core options, generated configuration files,
+//! process spawning, and session management are not implemented yet
+//! (ARCHITECTURE.md §20, §21, §22, §23). This crate introduces no ports for them in
+//! advance, and a readiness result never claims to have checked what those steps
+//! would check.
 //!
 //! # One download contract, two component classes
 //!
@@ -112,14 +120,25 @@
 //!
 //! [`GameId`]: bitarchive_domain::GameId
 
+mod game_launch;
 mod launch;
 mod launch_readiness;
+pub mod launch_state;
 pub mod managed_core;
 pub mod managed_runtime;
 mod prepared_launch;
 
+pub use game_launch::{
+    GameLaunchContext, GameLaunchPlan, GameLaunchRequest, LaunchBlocker, LaunchPreparation,
+    PreparedGameLaunch, UnsupportedSystemOrCoreReason, prepare_game_launch,
+};
 pub use launch::{LaunchAction, LaunchRequest};
 pub use launch_readiness::{LaunchReadiness, ReadinessIssue};
+pub use launch_state::{
+    CoreAvailability, CoreUnusableReason, FirmwareChecker, FirmwareOutcome, InstalledCore,
+    LaunchRuntime, LaunchRuntimeResolution, ManagedEmulationState, RuntimeUnavailableReason,
+    SystemCoreState,
+};
 pub use managed_core::{
     CoreArchiveExtractor, CoreInstaller, CoreStoreError, ManagedCore, artifact_request,
 };

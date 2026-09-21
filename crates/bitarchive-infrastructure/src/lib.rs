@@ -83,6 +83,7 @@ mod artifact_extract;
 mod component_store;
 mod core_archive;
 mod core_store;
+mod firmware_inventory;
 mod http_download;
 mod store_layout;
 
@@ -90,6 +91,7 @@ pub use artifact_extract::AppleDiskImageExtractor;
 pub use component_store::ComponentStore;
 pub use core_archive::ZipCoreArchiveExtractor;
 pub use core_store::CoreStore;
+pub use firmware_inventory::FilesystemFirmwareChecker;
 pub use http_download::{HttpArtifactDownloader, user_agent};
 
 #[cfg(test)]

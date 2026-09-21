@@ -68,10 +68,12 @@
 //!
 //! [`std::process::Command`]: std::process::Command
 
+mod launch_state;
 mod managed_runtime;
 mod retroarch;
 mod runtime;
 
+pub use launch_state::ManagedEmulation;
 pub use managed_runtime::{ManagedRuntime, RetroArchRuntimeError};
 pub use retroarch::{RetroArchBackend, RetroArchLaunchInput};
 pub use runtime::{

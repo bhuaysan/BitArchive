@@ -378,6 +378,10 @@ fn definition_with(
             },
             RelativePath::from_str(library).expect("a valid relative library path"),
         ),
+        // The fixture core needs no external firmware, so its requirement list is
+        // empty. A launch-readiness test that needs a requirement builds its own
+        // definition through `FirmwareRequirement`.
+        firmware: Vec::new(),
         // Synthetic provenance: this definition describes a fixture, not a
         // reviewed upstream build, and the values say so instead of repeating a
         // pin that would go stale with the next one.
