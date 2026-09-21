@@ -47,11 +47,11 @@ Core name:        mgba_libretro           (as RetroArch addresses it)
 Build id:         mgba-0.11-212-7a12d6d
 Platform:         macos-arm64 | macos-x86_64
 Artifact:         https://buildbot.libretro.com/nightly/apple/osx/<arch>/latest/mgba_libretro.dylib.zip
-SHA-256:          1aa000e5… (arm64) · 15308808… (x86_64)
+SHA-256:          df80dfc6… (arm64) · 751adc0b… (x86_64)
 Archive kind:     libretro-core-archive { member: "mgba_libretro.dylib" }
 Library:          mgba_libretro.dylib
 Upstream:         mGBA · mgba-emu/mgba · MPL-2.0
-Provenance:       revision 7a12d6d4b9acb14c0ae62c9166b6a2f3d08007f6 (2026-09-17)
+Provenance:       revision 7a12d6d4b9acb14c0ae62c9166b6a2f3d08007f6 (channel 2026-09-21)
 ```
 
 There is no core catalog, no enumeration of the build host, no `--core` argument
@@ -91,13 +91,50 @@ matched the artifacts published on 2026-09-17 (`0.11-212-7a12d6d`, CRC-32
 The observed version string is not monotonic (`219` → `212` after a rebuild), which
 is exactly why the commit *count* inside it is not identity: the revision is.
 
+#### A container repack moves the archive digest without changing the build
+
+Issue #24 recorded the second case, and it is a different one. On 2026-09-21 the
+build host republished the mGBA archive with **new archive bytes but the same library
+inside it**: the version string stayed `0.11-212-7a12d6d`, the extracted library kept
+its size, and its CRC-32 still matched both the host's index and the value recorded
+here for the reviewed build. Because BitArchive pins the *archive* digest, that
+repack was refused as a `DigestMismatch` even though the installed result would have
+been byte-identical.
+
+The re-pin therefore changed only the transport side of the pin:
+
+| Constant | Before (2026-09-17) | After (2026-09-21) |
+|---|---|---|
+| `MGBA_ARTIFACT_SHA256_ARM64` | `1aa000e5…` | `df80dfc6…` |
+| `MGBA_ARTIFACT_SHA256_X86_64` | `15308808…` | `751adc0b…` |
+| `MGBA_CHANNEL_DATE_ARM64` / `_X86_64` | `2026-09-17` | `2026-09-21` |
+| `MGBA_VERSION`, `MGBA_BUILD_ID`, `MGBA_REVISION`, `MGBA_CHANNEL_CRC32_*` | unchanged | unchanged |
+
+Telling the two cases apart is what keeps the provenance update honest: a **rebuild**
+changes version, revision, and library bytes and needs all of them re-verified; a
+**repack** changes only the archive, and the identity stays. The check that separates
+them is step 4 of the procedure below — the host's published CRC-32 of the library,
+compared against the value recorded here. It remains a *change hint* rather than an
+integrity check, as §3 explains; the pinned archive SHA-256 stays the trust anchor.
+
+Two consequences are accepted rather than solved here:
+
+- Because the build identity did not change, a machine that already installed
+  `mgba-0.11-212-7a12d6d` keeps it: the store is immutable and refuses to reinstall
+  an installed build, and the library it holds is the same reviewed build.
+- A host that repacks without rebuilding can force a re-pin at any time. Whether
+  BitArchive should instead pin a digest of the *library* (checked after extraction)
+  is a trust-anchor design change; it is recorded here as an open question and is
+  deliberately **not** part of this re-pin.
+
 **How a pin is raised** (the procedure this step verified):
 
 1. download both architecture artifacts from the official host;
 2. compute their SHA-256 locally and record it;
 3. read the version string out of each library and resolve the short revision to a
    full commit in `mgba-emu/mgba`;
-4. record the build host's channel date and CRC-32 for each architecture;
+4. record the build host's channel date and CRC-32 for each architecture, and compare
+   the CRC-32 with the recorded one to tell a repack from a rebuild;
 5. update `MGBA_*` together — version, build id, revision, digests, dates, CRC-32 —
    and re-run the opt-in live command.
 

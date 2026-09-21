@@ -59,6 +59,30 @@ artifacts/
 *.dmg
 *_libretro.dylib
 
+# --- Local test content: ROMs, disc images, firmware -----------------------
+# Content and firmware are user-owned external files (AGENTS.md §4) and this
+# repository is public: a game image, a disc image, or a firmware dump must never
+# be committed here. The directories are where the developer vertical slice keeps
+# local verification content at the repository root; the extensions are a backstop
+# for a file dropped next to the sources.
+#
+# Ambiguous extensions are deliberately absent: `*.md` is Markdown in this
+# repository (even though it is also a Mega Drive ROM extension) and `*.bin` is
+# too ambiguous to claim. A test fixture that genuinely needs tracking belongs
+# under `tests/` and is force-added, as the local-state section notes.
+/ROMS/
+/BIOS/
+*.gba
+*.gb
+*.gbc
+*.nes
+*.fds
+*.sfc
+*.smc
+*.iso
+*.cue
+*.chd
+
 # --- Test / coverage output ------------------------------------------------
 coverage/
 

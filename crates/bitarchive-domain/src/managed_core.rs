@@ -882,10 +882,15 @@ impl CoreComponentId {
     pub const MGBA_REVISION_SHORT: &'static str = "7a12d6d";
 
     /// The build date the official build host publishes for the arm64 artifact.
-    pub const MGBA_CHANNEL_DATE_ARM64: &'static str = "2026-09-17";
+    ///
+    /// Raised on 2026-09-21: the host repacked the archive without rebuilding the
+    /// library inside it (ADR 0002 §2).
+    pub const MGBA_CHANNEL_DATE_ARM64: &'static str = "2026-09-21";
 
     /// The build date the official build host publishes for the x86_64 artifact.
-    pub const MGBA_CHANNEL_DATE_X86_64: &'static str = "2026-09-17";
+    ///
+    /// Raised on 2026-09-21 together with the arm64 date (ADR 0002 §2).
+    pub const MGBA_CHANNEL_DATE_X86_64: &'static str = "2026-09-21";
 
     /// The CRC-32 the official build host publishes for the arm64 library.
     ///
@@ -909,12 +914,18 @@ impl CoreComponentId {
     pub const MGBA_LIBRARY: &'static str = "mgba_libretro.dylib";
 
     /// The SHA-256 of the pinned `macos-arm64` artifact.
+    ///
+    /// Re-pinned on 2026-09-21 after the build host repacked the archive; the
+    /// library inside is the reviewed build, which the host's unchanged CRC-32
+    /// and the unchanged version string confirm (ADR 0002 §2).
     pub const MGBA_ARTIFACT_SHA256_ARM64: &'static str =
-        "1aa000e5a88c2ea2afb788cdee89853f86d1c8639fc0df5d2ed6f261c2d81462";
+        "df80dfc617be1eafac6a6e464e0e39522f956bae62e9ab01f9cf8b55795c72dc";
 
     /// The SHA-256 of the pinned `macos-x86_64` artifact.
+    ///
+    /// Re-pinned on 2026-09-21 together with the arm64 digest (ADR 0002 §2).
     pub const MGBA_ARTIFACT_SHA256_X86_64: &'static str =
-        "1530880845ec16538187c9c1299073bc010064979df8087cc100041edb396d22";
+        "751adc0bc6b7a991f86d5dcd4fb752cebf293d1c70cc122c94b2fd7d628fbf32";
 
     /// The upstream project mGBA belongs to.
     pub const MGBA_UPSTREAM_PROJECT: &'static str = "mgba-emu/mgba";
@@ -968,7 +979,9 @@ mod tests {
                 provenance.revision_short,
                 CoreComponentId::MGBA_REVISION_SHORT
             );
-            assert_eq!(provenance.channel_date, "2026-09-17");
+            // A reviewed golden value on purpose: raising a pin has to touch this
+            // test, so the date cannot change without review.
+            assert_eq!(provenance.channel_date, "2026-09-21");
 
             // The build identity is derivable from the recorded evidence, so the
             // two cannot drift apart silently.
