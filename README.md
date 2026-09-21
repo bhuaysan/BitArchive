@@ -157,6 +157,7 @@ Dabei gilt:
 - Der Developer gibt nur den Content-Pfad an. Content ist eine externe, user-eigene Datei: BitArchive lädt keinen Content herunter, kopiert, verschiebt, benennt oder verändert ihn nicht und implementiert hier keine Library, keinen Scan und keinen Import.
 - Der Launch-Befehl lädt **nichts** herunter. Fehlt die Runtime oder der Core, nennt er den vorhandenen Acquisition-Befehl, der die Komponente installiert — es entsteht kein zweiter Acquisition-Flow.
 - Der gestartete Prozess wird nur beobachtet und über den bestehenden `SpawnedProcess`-Handle abgewartet; Exit-Status und technische Fehler gehen an den Developer zurück. Es gibt keinen SessionManager, keine Persistenz, keine Playtime und kein Beenden des Prozesses durch BitArchive.
+- Der Developer-Slice ist real verifiziert: Mit der BitArchive-verwalteten RetroArch-Runtime, dem kuratierten mGBA-Core und einer lokalen GBA-Datei startet der Befehl einen echten RetroArch-Prozess, der den Managed Core lädt; ein normaler RetroArch-Quit kommt als Exit-Code `0` beim Aufrufer an. Das bleibt eine Developer-Verifikation und ist **kein** Produkt-Play-Flow.
 - Ein Produkt-Play-Flow ist weiterhin **nicht** implementiert: kein Play-Button, keine Library, keine Readiness-Prüfung, keine Konfigurationserzeugung, keine Save States, und aus dem normalen BitArchive-Fenster wird noch kein Spiel gestartet.
 
 Die Entscheidung im Detail steht in [`docs/decisions/0003-managed-launch-composition.md`](./docs/decisions/0003-managed-launch-composition.md).
