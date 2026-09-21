@@ -75,8 +75,10 @@
 //! - **No active/global core.** There is no activation record for cores and no
 //!   "currently active core" (ARCHITECTURE.md §23.1 records activation for
 //!   runtimes only). Several builds of mGBA may be installed at once.
-//! - **No firmware.** mGBA's firmware entries are all optional; this module
-//!   records the requirement level and downloads no BIOS (ARCHITECTURE.md §25).
+//! - **No firmware downloads.** A definition records the firmware a core looks for
+//!   and how binding it is ([`FirmwareRequirement`]); nothing here downloads a
+//!   BIOS, copies one, renames one, or compares one against a hash list
+//!   (ARCHITECTURE.md §25).
 //! - **No I/O.** No HTTP client, no archive library, no filesystem access, no
 //!   dynamic loading. Installing and extracting live in outer layers.
 
@@ -87,6 +89,7 @@ use crate::component::{
     ArtifactReference, ArtifactSource, ComponentArtifactSource, ComponentAttribution, ComponentId,
     LicenseIdentifier, RelativePath, Sha256Digest,
 };
+use crate::system::EmulatedSystemKey;
 
 /// Upper bound for an accepted core build identity.
 ///
@@ -446,19 +449,147 @@ impl CoreArtifactKind {
     }
 }
 
+/// How binding a firmware requirement is.
+///
+/// The level belongs to the core, not to the user's firmware folder: a core either
+/// can work without an external firmware file or it cannot, and that is a property
+/// of the core (ARCHITECTURE.md §25.2, invariant 9).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FirmwareRequirementLevel {
+    /// The core needs the firmware to run its system at all.
+    ///
+    /// A launch is not ready while a required firmware file is missing.
+    Required,
+    /// The core uses the firmware when it is there and runs without it otherwise.
+    ///
+    /// mGBA's external Game Boy Advance BIOS is the canonical example: without it
+    /// the core falls back to its built-in boot behaviour, so a missing optional
+    /// firmware file must never block a launch.
+    Optional,
+}
+
+/// A firmware file a core can use, and how binding that is.
+///
+/// # What a requirement is, and what it deliberately is not
+///
+/// A requirement names the core's *expectation*: a level, the file names the core
+/// looks for, and optionally the systems it applies to. It is a reviewed constant
+/// of a curated [`CoreDefinition`], never derived from what happens to lie in a
+/// user's firmware folder.
+///
+/// It carries **no accepted hash list**. `ARCHITECTURE.md` §25.2 shows
+/// `accepted_hashes`, but BitArchive has no reviewed source for the SHA-256 of a
+/// commercial BIOS dump, and inventing one would be a false statement about bytes
+/// BitArchive has not verified. So this model answers exactly one question — is a
+/// file with an expected name present? — and a launch is blocked by a missing
+/// required firmware file, never by a hash comparison BitArchive cannot make
+/// honestly. Hash-based firmware identification is a later decision with its own
+/// reviewable source of truth.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FirmwareRequirement {
+    level: FirmwareRequirementLevel,
+    expected_filenames: Vec<String>,
+    systems: Vec<EmulatedSystemKey>,
+}
+
+impl FirmwareRequirement {
+    /// Creates a requirement for `expected_filenames`.
+    ///
+    /// An empty `expected_filenames` list is refused for a
+    /// [`Required`](FirmwareRequirementLevel::Required) requirement, because such a
+    /// requirement could never be satisfied: it would block every launch of its
+    /// systems no matter what the user provides. The caller is a curated constant
+    /// table, so the refusal is a panic — this is a defect in BitArchive's own
+    /// data, not a condition a user can cause or fix.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a required requirement names no expected file name.
+    #[must_use]
+    pub fn new(
+        level: FirmwareRequirementLevel,
+        expected_filenames: Vec<String>,
+        systems: Vec<EmulatedSystemKey>,
+    ) -> Self {
+        assert!(
+            level != FirmwareRequirementLevel::Required || !expected_filenames.is_empty(),
+            "a required firmware requirement must name at least one expected file name, \
+             because a requirement without one can never be satisfied"
+        );
+
+        Self {
+            level,
+            expected_filenames,
+            systems,
+        }
+    }
+
+    /// Creates an optional requirement.
+    #[must_use]
+    pub fn optional(expected_filenames: Vec<String>, systems: Vec<EmulatedSystemKey>) -> Self {
+        Self::new(
+            FirmwareRequirementLevel::Optional,
+            expected_filenames,
+            systems,
+        )
+    }
+
+    /// Creates a required requirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `expected_filenames` is empty, matching [`FirmwareRequirement::new`].
+    #[must_use]
+    pub fn required(expected_filenames: Vec<String>, systems: Vec<EmulatedSystemKey>) -> Self {
+        Self::new(
+            FirmwareRequirementLevel::Required,
+            expected_filenames,
+            systems,
+        )
+    }
+
+    /// Returns how binding this requirement is.
+    #[must_use]
+    pub const fn level(&self) -> FirmwareRequirementLevel {
+        self.level
+    }
+
+    /// Returns the file names the core looks for.
+    #[must_use]
+    pub fn expected_filenames(&self) -> &[String] {
+        &self.expected_filenames
+    }
+
+    /// Returns the systems this requirement applies to.
+    ///
+    /// An empty list means every system the core serves, which keeps a requirement
+    /// that is not system-specific from having to repeat the core's whole system
+    /// list.
+    #[must_use]
+    pub fn systems(&self) -> &[EmulatedSystemKey] {
+        &self.systems
+    }
+
+    /// Returns whether this requirement applies to `system`.
+    #[must_use]
+    pub fn applies_to(&self, system: &EmulatedSystemKey) -> bool {
+        self.systems.is_empty() || self.systems.iter().any(|candidate| candidate == system)
+    }
+}
+
 /// Which component, in which build, for which platform.
 ///
-/// A definition is built from five groups rather than from loose values, so that
+/// A definition is built from groups rather than from loose values, so that
 /// each part of the pin is named where it is written and a review can read the
-/// identity, the artifact, the layout, the provenance, and the attribution
-/// separately.
+/// identity, the artifact, the layout, the firmware, the provenance, and the
+/// attribution separately.
 ///
 /// ```
 /// use std::str::FromStr;
 ///
 /// use bitarchive_domain::managed_core::{
 ///     CoreArtifactKind, CoreBuildId, CoreComponentId, CoreDefinition, CoreParts, CorePlatform,
-///     CoreProvenance,
+///     CoreProvenance, FirmwareRequirement,
 /// };
 /// use bitarchive_domain::component::{
 ///     ArtifactReference, ArtifactSource, ComponentArtifactSource, ComponentAttribution,
@@ -494,6 +625,10 @@ impl CoreArtifactKind {
 ///         },
 ///         RelativePath::from_str("mgba_libretro.dylib").unwrap(),
 ///     ),
+///     firmware: vec![FirmwareRequirement::optional(
+///         vec![String::from("gba_bios.bin")],
+///         vec![],
+///     )],
 ///     provenance: CoreProvenance {
 ///         version: String::from("0.11-212-7a12d6d"),
 ///         revision: String::from("7a12d6d4b9acb14c0ae62c9166b6a2f3d08007f6"),
@@ -521,6 +656,12 @@ pub struct CoreParts {
     /// How the artifact is packaged and where the library sits below the
     /// installation directory.
     pub layout: (CoreArtifactKind, RelativePath),
+    /// The firmware files the core can use, and how binding each one is.
+    ///
+    /// Empty for a core that needs no external firmware at all. A firmware
+    /// requirement belongs to the core (invariant 9), so it is recorded next to
+    /// the pin and never derived from a user's firmware folder.
+    pub firmware: Vec<FirmwareRequirement>,
     /// How the pinned binary was identified upstream.
     pub provenance: CoreProvenance,
     /// The upstream and license metadata of the component.
@@ -543,6 +684,7 @@ pub struct CoreDefinition {
     artifact: ArtifactReference,
     kind: CoreArtifactKind,
     library: RelativePath,
+    firmware: Vec<FirmwareRequirement>,
     provenance: CoreProvenance,
     attribution: ComponentAttribution,
 }
@@ -555,6 +697,7 @@ impl CoreDefinition {
             identity: (component_id, display_name, core_name, build_id, platform),
             artifact,
             layout: (kind, library),
+            firmware,
             provenance,
             attribution,
         } = parts;
@@ -568,6 +711,7 @@ impl CoreDefinition {
             artifact,
             kind,
             library,
+            firmware,
             provenance,
             attribution,
         }
@@ -646,6 +790,25 @@ impl CoreDefinition {
     #[must_use]
     pub const fn library(&self) -> &RelativePath {
         &self.library
+    }
+
+    /// Returns every firmware requirement of this core, in review order.
+    #[must_use]
+    pub fn firmware_requirements(&self) -> &[FirmwareRequirement] {
+        &self.firmware
+    }
+
+    /// Returns the firmware requirements that apply to `system`.
+    ///
+    /// A requirement that names no system applies to every system the core
+    /// serves; see [`FirmwareRequirement::systems`].
+    pub fn firmware_requirements_for(
+        &self,
+        system: &EmulatedSystemKey,
+    ) -> impl Iterator<Item = &FirmwareRequirement> {
+        self.firmware
+            .iter()
+            .filter(move |requirement| requirement.applies_to(system))
     }
 
     /// Returns how the pinned binary was identified upstream.
@@ -741,6 +904,18 @@ pub fn mgba_bootstrap(platform: CorePlatform) -> CoreDefinition {
             RelativePath::from_str(CoreComponentId::MGBA_LIBRARY)
                 .expect("the curated library name is relative and canonical"),
         ),
+        // mGBA needs no external firmware to run. Its only firmware entry is the
+        // Game Boy Advance external BIOS, which upstream treats as optional: a
+        // core without `gba_bios.bin` falls back to its built-in boot behaviour,
+        // which is why the curated core records the file and nothing is ever
+        // downloaded for it (ARCHITECTURE.md §25).
+        firmware: vec![FirmwareRequirement::optional(
+            vec![String::from(CoreComponentId::MGBA_GBA_BIOS_FILE_NAME)],
+            vec![
+                EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY_ADVANCE)
+                    .expect("the curated system key is valid"),
+            ],
+        )],
         provenance: CoreProvenance {
             version: String::from(CoreComponentId::MGBA_VERSION),
             revision: String::from(CoreComponentId::MGBA_REVISION),
@@ -912,6 +1087,15 @@ impl CoreComponentId {
 
     /// The library the archive contains and the installation installs.
     pub const MGBA_LIBRARY: &'static str = "mgba_libretro.dylib";
+
+    /// The name of the Game Boy Advance external BIOS the mGBA core looks for.
+    ///
+    /// This is the file name the core expects in its system directory, not a file
+    /// BitArchive ships, downloads, or renames. The requirement it belongs to is
+    /// [optional](FirmwareRequirementLevel::Optional): without the file mGBA falls
+    /// back to its built-in boot behaviour, so a missing `gba_bios.bin` must never
+    /// block a Game Boy Advance launch (ARCHITECTURE.md §25, PRODUCT.md §16).
+    pub const MGBA_GBA_BIOS_FILE_NAME: &'static str = "gba_bios.bin";
 
     /// The SHA-256 of the pinned `macos-arm64` artifact.
     ///
@@ -1280,5 +1464,80 @@ mod tests {
             definition.source().file_name(),
             Some("mgba_libretro.dylib.zip")
         );
+    }
+
+    /// The curated mGBA core records the one firmware file it can use and records
+    /// it as optional, so a Game Boy Advance launch is never blocked by a missing
+    /// `gba_bios.bin`.
+    #[test]
+    fn the_curated_core_records_the_gba_bios_as_optional() {
+        let definition = mgba_bootstrap(CorePlatform::MacOsArm64);
+        let gba = EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY_ADVANCE)
+            .expect("the curated system key");
+
+        let requirement = definition
+            .firmware_requirements_for(&gba)
+            .collect::<Vec<_>>();
+
+        assert_eq!(requirement.len(), 1, "mGBA has exactly one firmware entry");
+
+        let requirement = requirement[0];
+
+        assert_eq!(
+            requirement.level(),
+            FirmwareRequirementLevel::Optional,
+            "the GBA external BIOS is optional upstream, so it must never block a launch"
+        );
+        assert_eq!(
+            requirement.expected_filenames(),
+            [CoreComponentId::MGBA_GBA_BIOS_FILE_NAME],
+            "the core looks for the file under this exact name"
+        );
+        assert!(
+            requirement.applies_to(&gba),
+            "the file belongs to Game Boy Advance"
+        );
+    }
+
+    /// A firmware requirement that names systems applies only to them: a
+    /// Game Boy Advance BIOS is not a requirement of Game Boy Color.
+    #[test]
+    fn a_system_specific_requirement_does_not_apply_to_other_systems() {
+        let definition = mgba_bootstrap(CorePlatform::MacOsArm64);
+        let gba = EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY_ADVANCE)
+            .expect("the curated system key");
+        let gb = EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY)
+            .expect("the curated system key");
+
+        assert_eq!(definition.firmware_requirements_for(&gba).count(), 1);
+        assert_eq!(
+            definition.firmware_requirements_for(&gb).count(),
+            0,
+            "Game Boy has no external firmware requirement in this pin"
+        );
+    }
+
+    /// A requirement that names no system applies to every system the core
+    /// serves, so it does not have to repeat the core's whole system list.
+    #[test]
+    fn a_requirement_without_systems_applies_to_every_system() {
+        let requirement = FirmwareRequirement::required(vec![String::from("bios.bin")], Vec::new());
+        let gba = EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY_ADVANCE)
+            .expect("the curated system key");
+        let gb = EmulatedSystemKey::from_str(EmulatedSystemKey::GAME_BOY)
+            .expect("the curated system key");
+
+        assert_eq!(requirement.level(), FirmwareRequirementLevel::Required);
+        assert!(requirement.applies_to(&gba));
+        assert!(requirement.applies_to(&gb));
+    }
+
+    /// A required firmware requirement without an expected file name is refused,
+    /// because it could never be satisfied and would block every launch of its
+    /// systems no matter what the user provides.
+    #[test]
+    #[should_panic(expected = "must name at least one expected file name")]
+    fn a_required_requirement_without_a_file_name_is_refused() {
+        let _ = FirmwareRequirement::required(Vec::new(), Vec::new());
     }
 }

@@ -56,6 +56,9 @@ const COMPONENTS_DIRECTORY: &str = "components";
 /// The directory below the application support root that holds managed media.
 const MEDIA_DIRECTORY: &str = "media";
 
+/// The directory below the application support root that holds user firmware.
+const FIRMWARE_DIRECTORY: &str = "firmware";
+
 /// The directory below the application support root that holds generated files.
 const GENERATED_DIRECTORY: &str = "generated";
 
@@ -152,6 +155,17 @@ impl AppPaths {
         self.application_support.join(MEDIA_DIRECTORY)
     }
 
+    /// Returns the firmware root.
+    ///
+    /// This is the one folder the user's firmware files are read from
+    /// (ARCHITECTURE.md §25). BitArchive only ever *reads* it: firmware is a
+    /// user-owned external resource, so nothing here copies, renames, repairs, or
+    /// deletes a file in it, and asking for the path creates nothing.
+    #[must_use]
+    pub fn firmware(&self) -> PathBuf {
+        self.application_support.join(FIRMWARE_DIRECTORY)
+    }
+
     /// Returns the generated-files root.
     #[must_use]
     pub fn generated(&self) -> PathBuf {
@@ -246,6 +260,10 @@ mod tests {
             Path::new("/tmp/bitarchive-app-paths/database")
         );
         assert_eq!(paths.media(), Path::new("/tmp/bitarchive-app-paths/media"));
+        assert_eq!(
+            paths.firmware(),
+            Path::new("/tmp/bitarchive-app-paths/firmware")
+        );
         assert_eq!(
             paths.generated(),
             Path::new("/tmp/bitarchive-app-paths/generated")

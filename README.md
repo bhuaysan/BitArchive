@@ -162,6 +162,42 @@ Dabei gilt:
 
 Die Entscheidung im Detail steht in [`docs/decisions/0003-managed-launch-composition.md`](./docs/decisions/0003-managed-launch-composition.md).
 
+### Stand der Launch-Readiness und Launch-Vorbereitung
+
+Die Produktentscheidung **vor** dem Prozessstart ist als eigener Schritt implementiert: BitArchive kann für einen konkreten Content beantworten, ob er mit dem aktuell konfigurierten und installierten Zustand gestartet werden kann, und welche konkreten Launch-Inputs daraus folgen.
+
+```text
+GameLaunchRequest
+      ↓
+System des Contents (kuratierte Systemliste, Format entscheidet)
+      ↓
+kuratierter Core + Installation (Managed Core Store)
+      ↓
+Managed Runtime (Managed RetroArch Runtime)
+      ↓
+Firmware-Readiness (Core-Anforderungen gegen vorhandene Dateien)
+      ↓
+effektive Launch-Konfiguration (Global → System → Game)
+      ↓
+PreparedGameLaunch  oder  LaunchBlocker[]
+      ↓
+RetroArchLaunchInput → RetroArchBackend::prepare_launch → PreparedLaunch
+      ↓
+        ── STOPP. Kein Prozessstart. ──
+```
+
+Dabei gilt:
+
+- **Readiness ist ein Ergebnis, kein Fehler.** Ein blockierter Launch ist eine Liste strukturierter Gründe (`RuntimeMissing`, `CoreUnusable`, `UnsupportedSystemOrCore`, `ContentMissing`, `FirmwareMissing`, `InvalidConfiguration`) — nie eine Exception und nie ein verstecktes Boolean. Ein blockiertes Ergebnis ohne Grund ist nicht konstruierbar; die `LaunchReadiness` wird aus der Vorbereitung abgeleitet und kann ihr nicht widersprechen.
+- **Readiness behauptet nur, was tatsächlich geprüft wurde.** Die Blocker-Menge ist eine echte Teilmenge der Kategorien aus `ARCHITECTURE.md` §21: Quellen-Verfügbarkeit, Berechtigungen, Content-Validierung, Core-Integrität und Session-Status brauchen Library, Source-Modell, Hash-Index und Session-Registry, die es noch nicht gibt.
+- **Firmware blockiert nur, wenn sie wirklich nötig ist.** Der kuratierte mGBA-Core führt `gba_bios.bin` als **optional** — ein fehlendes GBA-BIOS blockiert einen GBA-Launch also nicht. Required-Firmware blockiert strukturell, ist aber nur gegen eine synthetische Definition getestet, weil heute kein kuratierter Core Firmware zwingend braucht. Es gibt keine Firmware-Downloads, keine BIOS-Datenbank, keine Auto-Beschaffung und keine erfundene Hash-Liste; Firmware wird ausschließlich gelesen, nie kopiert, umbenannt oder repariert.
+- **Runtime und Core bleiben managed.** Dieselbe Invariante wie B7: kein `PATH`, kein `/Applications`, keine System-RetroArch, kein Developer-Executable, kein anderer Core und keine andere Architektur. „Nicht installiert“ und „installiert, aber unbrauchbar“ bleiben unterscheidbar, weil das zwei verschiedene Reparaturen sind.
+- **Konfiguration folgt `Global → System → Game`** (`game > system > global`). RetroArch-Settings haben bewusst **keine** Release-Ebene. Ein unbrauchbarer gespeicherter Key wird gemeldet und bleibt erhalten (Invariante 19), statt still gelöscht zu werden.
+- **Der Schritt endet bei „ready + prepared“.** Es wird kein Prozess gestartet; der reale Prozessstart bleibt B7. `RetroArchBackend` bleibt der einzige Ort, der die RetroArch-CLI kennt.
+- Der normale Start `cargo run -p bitarchive-desktop` bleibt unverändert; aus dem Produkt-Flow wird weiterhin kein Spiel gestartet.
+
+Die Entscheidung im Detail steht in [`docs/decisions/0004-launch-readiness-and-preparation.md`](./docs/decisions/0004-launch-readiness-and-preparation.md).
+
 Signierte Distribution-Manifeste sind noch nicht implementiert. Bis dahin ist der gepinnte SHA-256 der BitArchive-seitige Trust Anchor; Details stehen in [`docs/decisions/0001-managed-runtime-acquisition.md`](./docs/decisions/0001-managed-runtime-acquisition.md) und [`docs/decisions/0002-managed-core-acquisition.md`](./docs/decisions/0002-managed-core-acquisition.md).
 
 Für RetroArch-Konfigurationen ist folgende Priorität vorgesehen:
@@ -186,7 +222,7 @@ Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind do
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
-- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell, Core-Resolution-Policy, gepinnte Runtime-Definition und kuratierte Core-Definition), `bitarchive-application` (Launch-Verträge, Runtime- und Core-Acquisition-Ports und Orchestrierungsschicht), `bitarchive-infrastructure` (HTTP-Download, Verifikation, ZIP-Extraktion, Staging und Component Stores), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung, gepinnte RetroArch-Runtime und Auflösung des verwalteten Executables), `bitarchive-platform` (plattformspezifische Dienste: Prozessstart, App-Pfade und das Lesen des macOS-Disk-Images), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
+- ein Cargo-Workspace mit den Crates `bitarchive-domain` (fachliche Identitäten, Launch-Pfad-Modell, Core-Resolution-Policy, kuratierte Systemliste, Firmware-Anforderungen, Konfigurations-Hierarchie sowie gepinnte Runtime- und Core-Definition), `bitarchive-application` (Launch-Verträge, Launch-Readiness und Launch-Vorbereitung, Runtime- und Core-Acquisition-Ports und Orchestrierungsschicht), `bitarchive-infrastructure` (HTTP-Download, Verifikation, ZIP-Extraktion, Staging, Component Stores und die Firmware-Inventarisierung des einen Firmware-Ordners), `bitarchive-emulation` (RetroArch-Launch-Aufbereitung, gepinnte RetroArch-Runtime, Auflösung des verwalteten Executables und die Zustandsauflösung für die Launch-Readiness), `bitarchive-platform` (plattformspezifische Dienste: Prozessstart, App-Pfade und das Lesen des macOS-Disk-Images), `bitarchive-ui` (Slint-Presentation-Layer) und `bitarchive-desktop` (Composition Root und Einstiegspunkt),
 - ein startbares Desktop-Binary, das ein minimales Slint-Fenster öffnet,
 - ein Platzhalter-Fenster, das ausschließlich anzeigt, dass das Fundament läuft.
 
@@ -196,7 +232,9 @@ Für die **RetroArch-Runtime** existiert die erste kontrollierte Management-Stuf
 
 Für **Cores** existiert die erste kontrollierte Management-Stufe ebenfalls, bewusst auf genau einen kuratierten Core begrenzt: eine Allowlist mit einer reviewten mGBA-Definition (Komponenten-ID, libretro-Core-Name, Build-ID, Revision, Architektur, offizielle URL, gepinnter SHA-256, erwartetes Archiv-Member, Library-Pfad sowie Upstream- und Lizenzmetadaten), ein Download über dieselbe HTTP-Implementierung wie die Runtime, eine member-genaue ZIP-Extraktion (nur das gepinnte Member wird geschrieben; absolute Pfade, `..`, Verzeichnis- und Symlink-Einträge werden abgelehnt), ein plattform- und build-spezifischer Core Store (`components/cores/<component>/<platform>/<build>/`) mit einem einzelnen Rename als Installationsschritt und **ohne** jegliche Aktivierung. Ein Core, für den keine kuratierte Definition existiert, wird nicht installiert — es gibt keinen User-URL-, Core-Namen- oder Library-Pfad-Parameter. Vom offiziellen Build-Host stammt nur der rollierende `latest`-Pfad; Identität und Vertrauensanker sind Build-ID, Revision und der gepinnte SHA-256.
 
-Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, Core-Auswahl und Core-Katalog über den einen kuratierten Core hinaus, Core-Options, RetroArch-Konfigurationserzeugung, Firmware-Readiness, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization, Rollback sowie Runtime-Update-UI und Packaging.
+Für die **Launch-Readiness und Launch-Vorbereitung** existiert der erste produktnahe Orchestrierungsschritt: ein `GameLaunchRequest` (Game-Identität + Content) wird gegen die kuratierte Systemliste, die Managed-Components-Stores, den einen Firmware-Ordner und die Konfigurations-Hierarchie `Global → System → Game` aufgelöst und ergibt entweder ein `PreparedGameLaunch` (Managed-Executable, Managed-Core-Library, exakter Content, effektive Konfiguration) oder eine Liste strukturierter Blocker. Der Schritt startet keinen Prozess: Er entscheidet und bereitet vor, der reale Start bleibt B7.
+
+Noch **nicht** implementiert sind unter anderem: Home, Game Browser, Game Info, Suche, Global Menu, Game Options, Save States, Manage Library, Settings, Onboarding, Activity, Datenbank, Library-Scan, Scraping, Start eines echten Spiels aus dem Produkt-Flow, Play-Button, Content-Resolution über den vom Aufrufer gelieferten Pfad hinaus, Release-Resolution, Core-Auswahl und Core-Katalog über den einen kuratierten Core hinaus, Core-Options, RetroArch-Konfigurationserzeugung, Hash-basierte Firmware-Identifikation, Session-Management, Prozess-Lifecycle (geordnetes Beenden, Force Kill), Launch-Log-Artefakte, Controller-Input, Localization, Rollback sowie Runtime-Update-UI und Packaging.
 
 Weiteres wird als GitHub Issue geplant und umgesetzt.
 
@@ -368,6 +406,25 @@ Wo die Daten liegen (macOS, siehe `ARCHITECTURE.md` §35):
 ~/Library/Application Support/BitArchive/components/runtime/retroarch/macos-universal/<version>/
 ~/Library/Application Support/BitArchive/components/cores/mgba/<platform>/<build-id>/mgba_libretro.dylib
 ```
+
+### GAME LAUNCH PREPARATION (Developer, opt-in)
+
+Der vierte Developer-Befehl beantwortet die Produktentscheidung vor dem Start und bereitet die Launch-Inputs vor, **ohne** einen Prozess zu starten:
+
+```bash
+cargo run -p bitarchive-desktop -- prepare /pfad/zu/lokalem/content
+cargo run -p bitarchive-desktop -- prepare /pfad/zu/lokalem/content --root /tmp/bitarchive-prepare-check
+cargo run -p bitarchive-desktop -- prepare /pfad/zu/lokalem/content --global video_vsync=true --system gba video_vsync=false --game video_fullscreen=true
+```
+
+- `<content>` ist der einzige Pflicht-Input und muss bereits lokal existieren. BitArchive lädt keinen Content herunter und kopiert oder verändert ihn nicht.
+- `--root <dir>` löst Runtime, Core und den Firmware-Ordner aus einem anderen Store-Root auf (dieselbe Option wie bei den anderen Developer-Befehlen). Es benennt keine Komponente, sondern einen Store.
+- `--global`, `--system <key>` und `--game` setzen Konfigurations-Overrides. Die Priorität ist `game > system > global`; ein `--system`-Override gilt nur für genau dieses System. Es gibt noch keine Persistenz: Die Overrides existieren nur für diesen Lauf.
+- Es gibt **kein** Argument für Runtime, Core, Version, URL oder Library-Pfad. Der Befehl lädt **nichts** herunter: Fehlt eine Komponente, nennt er den vorhandenen Acquisition-Befehl mit demselben `--root`; eine *beschädigte* Installation bekommt bewusst keinen Acquisition-Hinweis.
+- Der Befehl startet **keinen** Prozess. Er zeigt die aufgelösten Werte, die effektive Konfiguration mit ihrer Quelle je Key und die Argumente, die der spätere Play-Flow verwenden würde. Exit-Code `0` bedeutet „ready und prepared“, `1` bedeutet „blockiert“.
+- CI führt ihn nicht aus; die normalen Tests hängen nicht davon ab, und für die Readiness-Tests werden ausschließlich Fakes verwendet (kein Netzwerk, kein RetroArch, keine ROMs, keine BIOS-Dumps, keine GUI).
+
+Die Entscheidung im Detail steht in [`docs/decisions/0004-launch-readiness-and-preparation.md`](./docs/decisions/0004-launch-readiness-and-preparation.md).
 
 ## Beiträge
 
