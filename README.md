@@ -221,7 +221,7 @@ BitArchive indexiert und verwaltet darüber Metadaten, Kompatibilität, Timeline
 
 ## Projektstatus
 
-Produktanforderungen, Architektur, UI/UX-Konzept und Entwicklungsprozess sind dokumentiert. Die Implementierung hat begonnen.
+Produktanforderungen, Architektur, Datenmodell, UI/UX-Konzept und Entwicklungsprozess sind dokumentiert. Die Implementierung hat begonnen.
 
 Aktuell existiert bewusst nur ein minimales, lauffähiges Fundament:
 
@@ -251,6 +251,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 ├── AGENTS.md
 ├── PRODUCT.md
 ├── ARCHITECTURE.md
+├── DATA_MODEL.md
 ├── apps/
 │   └── bitarchive-desktop/
 ├── crates/
@@ -260,6 +261,8 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 │   ├── bitarchive-infrastructure/
 │   ├── bitarchive-platform/
 │   └── bitarchive-ui/
+├── tools/
+│   └── check_data_model.py
 └── docs/
     ├── DEVELOPMENT.md
     ├── UI_UX_CONCEPT.md
@@ -274,6 +277,7 @@ Weiteres wird als GitHub Issue geplant und umgesetzt.
 | [`PRODUCT.md`](./PRODUCT.md) | Produktfähigkeiten, MVP, Verhalten und Scope |
 | [`docs/UI_UX_CONCEPT.md`](./docs/UI_UX_CONCEPT.md) | Informationsarchitektur, Interaktion, Navigation und UI/UX-Entscheidungsstatus |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Technische Architektur, Subsystemgrenzen und Invarianten |
+| [`DATA_MODEL.md`](./DATA_MODEL.md) | Konkretes Datenmodell: Identitäten, Tabellen, Constraints, Ownership, Lifecycle und Retention-Regeln |
 | [`AGENTS.md`](./AGENTS.md) | Regeln und Kontext für AI-gestützte Entwicklung |
 | [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) | Entwicklungsworkflow, Git, Issues, Tests, PRs und Reviews |
 | [`docs/decisions/`](./docs/decisions/) | Architecture Decision Records für langlebige Querschnittsentscheidungen |
@@ -309,6 +313,37 @@ Merge nach main
 Am Ende einer Implementierung wird ein **Handover-Protokoll** erstellt. Dieses dient insbesondere dem Review im ChatGPT-Chat und dokumentiert die vorgenommenen Änderungen, Tests, bekannte Einschränkungen und offene Punkte.
 
 Die vollständigen Entwicklungsregeln stehen in [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md).
+
+### Dokument- und Modellprüfung
+
+`DATA_MODEL.md` wird zusätzlich statisch geprüft. Das Skript liest seine
+Schlüsseldefinitionen **ausschließlich aus dem Dokument** (keine eigene Schlüsselliste)
+und validiert unter anderem:
+
+- jeder Foreign Key nennt eine existierende Child- und Parent-Spalte, und sein
+  Parent-Key ist ein echter Primary Key oder ein vollständiger UNIQUE-Key —
+  **niemals** ein partieller Unique-Index (den SQLite als FK-Ziel ablehnt);
+- jede Tabelle deklariert **genau einen** implementierbaren Storage-Primary-Key,
+  und kein partieller Index wird als Primary Key bezeichnet;
+- Domain Identity, Storage Primary Key und Business Uniqueness werden getrennt
+  geführt und stimmen mit der Checkliste in §20.1 überein;
+- kein Key-Bestandteil ist nullable ohne pinning-Prädikat, und **kein Locale-Wert
+  wird durch einen Sentinel ersetzt** (ein echtes BCP-47-Tag ist niemals `NULL`);
+- die `ArchiveEntry`-/`File`-Form der Content-Location stimmt mit
+  `ARCHITECTURE.md` §14.2 überein, und `ARCHITECTURE.md` enthält kein
+  `ArchiveEntryId`;
+- keine Stelle im Dokument behauptet, ein Library Rebuild lösche `games`,
+  `releases` oder `contents`;
+- die dokumentierte Full-Reset-Reihenfolge ist gegen den FK-Graph ausführbar, es
+  gibt keinen `RESTRICT`-Zyklus, und der Re-Identifikationspfad bleibt erhalten.
+
+```bash
+python3 tools/check_data_model.py
+```
+
+Der Check läuft zusätzlich in GitHub Actions als eigener Schritt des Workflows
+`Rust quality` (`.github/workflows/ci.yml`), damit das Dokument nicht auf einem
+Branch mit grüner CI abdriften kann.
 
 ## Repository
 

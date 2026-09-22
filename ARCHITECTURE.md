@@ -689,7 +689,7 @@ pub enum LaunchContent {
     File(ContentId),
     ArchiveEntry {
         archive: ContentId,
-        entry: ArchiveEntryId,
+        content: ContentId,
     },
     ExistingPlaylist {
         playlist: ContentId,
@@ -700,6 +700,46 @@ pub enum LaunchContent {
     },
 }
 ```
+
+Ein `ArchiveEntry` wird durch **zwei Identitäten** adressiert: den
+`ArchiveContainer`-Content und den spielbaren Entry-Content. Der technische
+Entry-Pfad ist **keine eigene Identität** und wird auch nicht im Launch-Vertrag
+dupliziert — er wird über die `ArchiveEntry`-Content-Location aufgelöst
+(`archive_content_id` + `content_id`, §14.1).
+
+Das unterstützte ZIP-Modell erlaubt **höchstens einen importierten spielbaren Entry
+pro `ArchiveContainer`** (§14.4 und die Produktregel, dass eine ZIP-Datei nur
+unterstützt wird, wenn sie genau einen eindeutig spielbaren Content enthält). Daher
+löst `archive` + `content` auf **höchstens eine** `ArchiveEntry`-Content-Location
+auf: der Container ist bereits eindeutig, und ihr `archive_entry_path` wird
+gelesen, nicht ausgewählt.
+
+Damit gibt es kein `ArchiveEntryId`: ein Entry ist bereits vollständig durch
+(Container-Content, spielbarer Content, Entry-Pfad) bestimmt, und ein vierter
+Identitätstyp ohne fachlichen Inhalt wäre eine zweite Wahrheit.
+
+Die Auflösung erfolgt ausschließlich über Identitäten, nie über Pfadvergleiche:
+
+```text
+spielbarer ContentId + Container-ContentId
+        ↓ ArchiveEntry-Content-Location     (0 oder 1 Zeile, nie 2)
+archive_entry_path
+        ↓ ArchiveContainer
+eine Present File-Location des Containers (deterministisch gewählt)
+        ↓
+Start: Archivpfad + Entry-Pfad
+```
+
+Mehrere `archive_entry_path`-Werte für dasselbe `(archive, content)`-Paar gibt es
+nicht: ein Archiv mit mehreren spielbaren Entries ist mehrdeutig und wird nicht
+regulär importiert (§14.4). Einen Entry-Pfad-Tie-Break gibt es deshalb **nicht**;
+`DATA_MODEL.md` §5.2 drückt die Regel als Datenbank-Constraint aus und §5.4 ist die
+bindende Auflösungsregel.
+
+Hat der Container mehrere `Present` File-Locations, wird genau eine
+deterministisch gewählt; `DATA_MODEL.md` §5.4 ist die bindende Regel dafür.
+Gibt es keine, ist das ein Readiness-Ergebnis (`ContentUnavailable`,
+`SourceOffline`, §21) und kein Fallback auf einen anderen Pfad.
 
 ### 14.3 Multi-Disc
 
@@ -714,6 +754,14 @@ Generierte Playlists liegen ausschließlich im BitArchive-Datenbereich und sind 
 ### 14.4 ZIP
 
 Nur ZIPs mit genau einem eindeutig spielbaren Inhalt werden regulär unterstützt.
+Archive mit mehreren ROMs gelten als mehrdeutig und werden nicht regulär importiert;
+ein Archiv ohne eindeutig spielbaren Inhalt bleibt unbekannt bzw. nicht unterstützt.
+
+Daraus folgt für die Persistenz: **höchstens eine importierte spielbare
+`ArchiveEntry`-Location pro `ArchiveContainer`.** Das ist eine Aussage über den
+Import, nicht über den physischen Inhalt des ZIP — ein ZIP kann technisch beliebig
+viele Einträge enthalten, und die `EntryList`-Fingerprints beschreiben sie weiterhin
+vollständig (`DATA_MODEL.md` §5.2, §6.3, §7.1).
 
 Kein dauerhaftes Entpacken.
 
