@@ -25,12 +25,17 @@ fn a_sibling_test_module_opens_its_own_isolated_database() {
     let temporary = TempDatabase::new();
     let database = temporary.open().expect("a new database must open");
 
+    // `open` applies the shipped catalogue, so a module that declares nothing of
+    // its own still starts from the schema the application ships — which is what
+    // makes the helper usable from a test whose subject is a repository rather
+    // than the migration foundation.
     assert_eq!(
         database
             .schema_version()
             .expect("the version must be readable"),
-        SchemaVersion::NONE,
-        "a sibling module starts from the foundation and nothing else"
+        SchemaVersion::new(1),
+        "a sibling module starts from the shipped schema, and nothing is applied \
+         twice to get there"
     );
 
     assert!(

@@ -12,8 +12,16 @@
 //! The migration runner is driven with **fixture migrations** that live in this
 //! file. They create small dummy tables so that ordering, idempotence, failure,
 //! and the newer-database refusal can be observed; none of them is a BitArchive
-//! table, and the shipped catalogue is asserted to be empty so the two cannot be
-//! confused with schema v1 (Issue #109).
+//! table, and the shipped catalogue is asserted to be exactly the initial schema
+//! so the two cannot be confused.
+//!
+//! These tests are about the *runner*. What the shipped schema contains — every
+//! table, key, and constraint of schema v1 — is asserted in
+//! [`crate::tests::schema_v1`], which is also where a test that opens a database
+//! with the shipped catalogue belongs. A foundation test can always state its
+//! subject with the catalogue it needs, and the empty catalogue below is how the
+//! foundation's own boundary stays assertable now that the shipped one carries
+//! schema v1.
 //!
 //! The tests assert *behaviour*: that a re-run leaves the data as it was, that a
 //! failed migration left no table behind, that a refused database still holds the
@@ -68,6 +76,13 @@ const FIXTURES_WITHOUT_THE_BROKEN_ONE: &[Migration] = &[FIXTURE_ONE, FIXTURE_TWO
 
 /// A catalogue with a single migration, standing in for an older build.
 const FIXTURES_ONE_ONLY: &[Migration] = &[FIXTURE_ONE];
+
+/// A catalogue that carries no migration at all.
+///
+/// This is the foundation's own boundary — the state an empty database file is
+/// brought to before any schema migration exists — and the only way to assert it
+/// once the shipped catalogue carries schema v1.
+const NO_MIGRATIONS: &[Migration] = &[];
 
 fn runner(migrations: &'static [Migration]) -> MigrationRunner {
     MigrationRunner::new(migrations)
@@ -140,14 +155,20 @@ fn referenced_parents(connection: &Connection, table: &str) -> Vec<String> {
         .expect("every row must be readable")
 }
 
-/// A fresh database carries the ledger and nothing else.
+/// The foundation on its own creates the ledger and nothing else.
 ///
-/// This is the boundary of Issue #34 stated as a test: the foundation creates the
-/// bookkeeping table, and schema v1's tables arrive with Issue #109.
+/// This is the boundary of Issue #34 stated as a test, and it is stated with an
+/// empty catalogue so that it keeps asserting the same thing now that the shipped
+/// catalogue carries schema v1: what the *foundation* adds to an empty file is
+/// `schema_migrations` and no domain table. A database opened with the shipped
+/// catalogue carries the whole of schema v1, which is
+/// [`crate::tests::schema_v1`]'s subject rather than this test's.
 #[test]
-fn a_new_database_carries_only_the_migration_ledger() {
+fn the_foundation_alone_creates_only_the_migration_ledger() {
     let temporary = TempDatabase::new();
-    let database = temporary.open().expect("a new database must open");
+    let database = temporary
+        .open_with(runner(NO_MIGRATIONS))
+        .expect("a database with no migration at all must open");
 
     assert_eq!(
         database
@@ -202,18 +223,53 @@ fn the_ledger_has_the_columns_the_data_model_fixes() {
     drop(database);
 }
 
-/// The shipped catalogue knows no migration, because schema v1 is Issue #109.
+/// The shipped catalogue is the initial schema, and nothing else.
+///
+/// This test replaces the one that asserted the catalogue was empty while the
+/// schema still belonged to a later Issue. What it asserts is the truth that
+/// replaced it: exactly one migration, numbered 1, whose statements are schema v1
+/// — so there is no migration 0, no migration 2, and no fixture from this file
+/// has leaked into what a built application applies.
 #[test]
-fn the_shipped_catalogue_carries_no_migration_yet() {
-    assert!(
-        BITARCHIVE_MIGRATIONS.is_empty(),
-        "schema v1 belongs to Issue #109; the foundation must not pre-empt it"
+fn the_shipped_catalogue_begins_with_the_initial_schema() {
+    assert_eq!(
+        BITARCHIVE_MIGRATIONS.len(),
+        1,
+        "schema v1 is one migration; a second one would be an upgrade, and nothing \
+         has been released that could need one"
     );
 
+    let initial = &BITARCHIVE_MIGRATIONS[0];
+
+    assert_eq!(initial.version, 1, "schema v1 is version 1");
     assert_eq!(
         runner(BITARCHIVE_MIGRATIONS).supported_schema_version(),
-        SchemaVersion::NONE
+        SchemaVersion::new(1),
+        "a build carrying schema v1 supports exactly version 1"
     );
+    assert!(
+        !initial.description.is_empty(),
+        "the ledger records the migration's purpose, so it must be a real one"
+    );
+
+    // The statements are the schema itself, not a placeholder, and they are the
+    // schema's statements rather than a fixture that happens to sit in the crate.
+    assert!(
+        !initial.sql.contains("fixture_"),
+        "a fixture migration must not be reachable from the shipped catalogue"
+    );
+
+    for object in [
+        "CREATE TABLE games",
+        "CREATE TABLE releases",
+        "CREATE TABLE contents",
+        "CREATE VIRTUAL TABLE search_index",
+    ] {
+        assert!(
+            initial.sql.contains(object),
+            "the initial schema must contain `{object}`"
+        );
+    }
 }
 
 /// Migrations run in ascending order, and a later one can rely on an earlier one.
@@ -758,20 +814,29 @@ fn temporary_databases_are_isolated() {
             .expect("the fixture migrations must apply"),
     );
 
-    let second_database = second.open().expect("an empty database must open");
+    let second_database = second
+        .open()
+        .expect("a database with the shipped catalogue must open");
 
     assert_eq!(
         second_database
             .schema_version()
             .expect("the version must be readable"),
-        SchemaVersion::NONE,
-        "a migration applied in one database must not be visible in another"
+        SchemaVersion::new(1),
+        "the fixture migration applied to the first database must not be visible \
+         in the second, which carries its own catalogue"
     );
 
-    assert_eq!(
-        table_names(&second.inspect()),
-        vec!["schema_migrations"],
-        "the second database must carry no table of the first"
+    let second_tables = table_names(&second.inspect());
+
+    assert!(
+        !second_tables.contains(&"fixture_parents".to_owned()),
+        "the second database must carry no table of the first: {second_tables:?}"
+    );
+    assert!(
+        second_tables.contains(&"games".to_owned()),
+        "the second database must carry the schema its own catalogue defines: \
+         {second_tables:?}"
     );
 
     drop(second_database);

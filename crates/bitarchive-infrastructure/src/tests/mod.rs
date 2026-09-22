@@ -14,6 +14,11 @@
 //! off: they are separate implementations of the same ports, so a test can make
 //! one step fail and observe what the store does with the previously active
 //! runtime.
+//!
+//! The SQLite modules are the other half. [`database`] is the migration
+//! foundation and drives the runner with fixture migrations of its own;
+//! [`schema_v1`] asserts the schema the shipped catalogue produces, and touches no
+//! file outside a temporary database.
 
 use std::cell::RefCell;
 use std::fs;
@@ -34,6 +39,7 @@ use bitarchive_domain::runtime::{
 mod core_acquisition;
 mod database;
 mod database_support;
+mod schema_v1;
 
 /// The scaffolding the crate's tests build on, rather than each other's fixtures.
 ///

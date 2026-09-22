@@ -165,12 +165,14 @@ mod tests {
         drop(database);
     }
 
-    /// A fresh application starts at a schema version with no migration applied.
+    /// A fresh application starts at the schema version the shipped catalogue
+    /// produces.
     ///
-    /// Schema v1 is Issue #109, so the foundation on its own records version 0 and
-    /// creates only its own ledger.
+    /// The foundation on its own records version 0; the catalogue ships the initial
+    /// schema as migration 1 (`DATA_MODEL.md` §20.1), so a first start lands on
+    /// version 1 and creates the library structure with it.
     #[test]
-    fn a_fresh_application_starts_at_the_foundation_version() {
+    fn a_fresh_application_starts_at_the_shipped_schema_version() {
         let temporary = TempRoot::new();
 
         let database = open_database(&temporary.paths()).expect("the database must open");
@@ -179,7 +181,7 @@ mod tests {
             database
                 .schema_version()
                 .expect("the version must be readable"),
-            SchemaVersion::NONE
+            SchemaVersion::new(1)
         );
 
         drop(database);
