@@ -17,6 +17,16 @@ The parse distinguishes four things the model must not conflate:
     partial UNIQUE index         never a primary key, never an FK parent target
     ordinary (non-unique) index  not a key at all
 
+Two binding statements are checked for internal consistency rather than for shape,
+because a section may carry both halves of a contradiction: the source-removal rule
+of §19.2 (it deletes the removed source's `File` locations and no `ArchiveEntry`
+location, so it may not also forbid deleting `content_locations` as a whole) and the
+launch-resolution rule of §5.4 (the container-level `ArchiveEntry` key admits 0 or 1
+row for `(archive, content)`, so no passage may order several entry paths or present
+them as a normal state). The checks for both are deliberately narrow: this is not a
+natural-language prover, and it must not fire on the document explaining the defect
+it forbids.
+
 Run: python3 tools/check_data_model.py
 """
 import os
@@ -51,6 +61,61 @@ def banner(title):
 def norm(text):
     """Whitespace-normalised text, for comparing a declaration with its summary."""
     return re.sub(r'\s+', ' ', text).strip()
+
+
+# A claim may be legitimate when the same passage says the construct is gone,
+# forbidden or impossible. Used by the checks that reject re-introduced claims.
+NEGATED = re.compile(
+    r"\b(?:not|never|no|neither|without|nicht|removed|removes|dropped|drop|"
+    r"replaced|rather than|instead of|forbids?|refuses?|weaker|impossible|absent|"
+    r"returned to|reintroduc\w+|none|nothing|forbidden|refused|no longer)\b",
+    re.I)
+
+
+def paragraphs(text):
+    """Blocks a claim has to be judged within.
+
+    A claim and the sentence that rules it out often sit in the same paragraph, and
+    hard-wrapping must not split them. Markdown block structure (code fences, list
+    items, table rows, block-quote lines) still separates blocks, so a mutation in
+    one block cannot be excused by a negation in another.
+    """
+    out, buf, fence = [], [], False        # buf = [kind, raw_line, continuation…]
+    for raw in text.split('\n'):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith('```'):
+            fence = not fence
+            if buf:
+                out.append(' '.join(buf[1:]))
+                buf = []
+            continue
+        if fence:
+            continue
+        marker = re.match(r'^(?:[-*+]\s|>|#{1,6}\s|\d+\.\s|\|)', stripped)
+        if marker:
+            kind = 'li' if marker.group(0)[0] in '-*+0123456789' else marker.group(0)[0]
+            body = re.sub(r'^(?:[-*+]\s|>\s?|#{1,6}\s|\d+\.\s)', '', stripped)
+            grouped = bool(buf) and buf[0] == kind
+            if not grouped and buf:
+                out.append(' '.join(buf[1:]))
+                buf = []
+            if not buf:
+                buf = [kind, body]
+            else:
+                buf.append(body)
+            continue
+        if not stripped or not buf or buf[0] not in ('>', 'li'):
+            if buf:
+                out.append(' '.join(buf[1:]))
+                buf = []
+            if stripped:
+                buf = ['p', stripped]
+            continue
+        buf.append(stripped)        # a wrapped line of the same block
+    if buf:
+        out.append(' '.join(buf[1:]))
+    return [p for p in out if p.strip()]
 
 
 # --------------------------------------------------------------------------- #
@@ -611,12 +676,13 @@ if 'not a "forget everything"\noperation' not in DATA and \
 else:
     ok("§19.2 states the rebuild semantics from §19.3")
 
-# Source removal after the ArchiveEntry fix.
+# Source removal after the ArchiveEntry fix. The detailed form of this rule is
+# checked in section 14d; here the section only has to carry the same statements.
 s192 = DATA[DATA.index('### 19.2 '):DATA.index('### 19.3 ')]
 for needle, label in (("location_kind = 'File' AND source_id = X",
                        "source removal deletes File locations only"),
                       ('MUST NOT destroy an `ArchiveEntry`', 'entry survives'),
-                      ('location_kind = \'ArchiveEntry\'',
+                      ('no `ArchiveEntry` location, ever',
                        "source removal leaves ArchiveEntry locations alone")):
     if needle not in s192:
         fail(f"§19.2: missing rule — {label}")
@@ -845,6 +911,349 @@ else:
             ok("no RESTRICT cycle, so no pointer has to be pre-cleared")
     if re.search(r'\bUPDATE\s+(games|sessions)', block.group(0)):
         fail("the reset plan pre-clears pointers the order does not need")
+
+# --------------------------------------------------------------------------- #
+# 16b. The ArchiveEntry location key is the container-level product rule.
+# --------------------------------------------------------------------------- #
+banner("14b. One imported playable entry per archive is a database constraint")
+
+# `PRODUCT.md` §10 supports a ZIP only when it holds exactly one unambiguously
+# playable content, and `DATA_MODEL.md` §6.3 states "at most one playable entry is
+# imported per archive". The constraint that protects that rule is the
+# container-level key, not an entry-path key: a key over
+# (archive_content_id, archive_entry_path) accepts two playable entry rows for one
+# archive, and then `LaunchContent::ArchiveEntry { archive, content }` would have
+# two answers.
+ARCHIVE_KEY = ('archive_content_id',)
+ARCHIVE_PRED = "location_kind = 'ArchiveEntry'"
+FILE_KEY = ('source_id', 'relative_path')
+FILE_PRED = "location_kind = 'File'"
+
+loc_keys = keys.get('content_locations', {}).get('unique', [])
+loc_pairs = {(u, p) for u, p in loc_keys}
+
+# §3.8 must classify the same two keys: the audit table lists them as `U*` tuples,
+# so a mutable constraint surfaces there even when §5.2 is left alone.
+audit_row = re.search(r'^\| `content_locations` \|(.*?)\|\s*$', DATA, re.M)
+audit_keys = re.findall(r'U\*? \(([a-z_,\s]+)\)\s*WHERE\s*([^|;]+)', audit_row.group(1)) \
+    if audit_row else []
+audit_pairs = {(tuple(c.strip() for c in u.split(',')),
+                norm(p).rstrip('| ').strip().rstrip('`').strip())
+               for u, p in audit_keys}
+if audit_pairs and audit_pairs != loc_pairs:
+    fail(f"§3.8 does not classify the location keys of §5.2.\n      §3.8: "
+         f"{sorted(audit_pairs)}\n      §5.2: {sorted(loc_pairs)}")
+elif not audit_pairs:
+    fail("§3.8 does not list the content_locations keys as `U* (…) WHERE …`")
+else:
+    ok("§3.8 classifies exactly the two location keys of §5.2")
+
+if (FILE_KEY, FILE_PRED) not in loc_pairs:
+    fail(f"§5.2: the File location key {FILE_KEY} WHERE {FILE_PRED} is missing "
+         f"(found {sorted(loc_pairs)})")
+else:
+    ok("§5.2 File location key is UNIQUE (source_id, relative_path)")
+if (ARCHIVE_KEY, ARCHIVE_PRED) not in loc_pairs:
+    fail(f"§5.2: the ArchiveEntry location key is not "
+         f"UNIQUE (archive_content_id) WHERE {ARCHIVE_PRED} (found "
+         f"{sorted(loc_pairs)}). A key over (archive_content_id, "
+         f"archive_entry_path) admits several playable entries per archive, so "
+         f"LaunchContent::ArchiveEntry {{ archive, content }} could resolve to 2 "
+         f"rows.")
+else:
+    ok("§5.2 ArchiveEntry key is UNIQUE (archive_content_id) "
+       "WHERE location_kind = 'ArchiveEntry'")
+
+def claims_entry_path_key(sentence):
+    """True when the sentence puts archive_entry_path into a key.
+
+    The prose may name the entry path freely — as the technical attribute of the
+    entry row, or as the thing the *container* key replaces. Only a statement that a
+    key contains it is a regression.
+    """
+    if re.search(r'UNIQUE\s*\([^)]*archive_entry_path', sentence, re.I):
+        return True
+    if re.search(r'archive_entry_path\s*[`\'"]?\s*(?:is|as)\s+[^.;]{0,40}'
+                 r'key component', sentence, re.I):
+        if NEGATED.search(sentence):
+            return False
+    return bool(re.search(r'\bkeys?\b[^.;]{0,60}archive_entry_path', sentence, re.I) or
+                re.search(r'archive_entry_path[^.;]{0,60}\bkeys?\b', sentence, re.I) or
+                re.search(r'archive_entry_path[^.;]{0,60}key component',
+                          sentence, re.I))
+
+
+def negation_context(flat, start, end):
+    """The text that may rule a claim out: the paragraph plus the step before it."""
+    before = flat.rfind('\n\n', 0, start)
+    after = flat.find('\n\n', end)
+    return flat[(before + 2 if before != -1 else 0):(after if after != -1 else len(flat))]
+
+
+def first_key_sentence(text):
+    """The passage that first *claims* a key over archive_entry_path, if any.
+
+    Naming the entry path is not the defect — including it in a key is. The claim
+    has to say so (`UNIQUE (…)`, or `key` with `over`/`in`/`component`), which is
+    what the round-4 key did and what the round-5 rule removed.
+    """
+    flat = re.sub(r'\s+', ' ', text)
+    for mm in re.finditer(r'archive_entry_path', flat):
+        start, end = mm.start(), mm.end()
+        window = flat[max(0, start - 120):end + 120]
+        if not claims_entry_path_key(window):
+            continue
+        # A key over (archive_content_id) is the replacement, not the defect.
+        if re.search(r'UNIQUE\s*\(\s*archive_content_id\s*\)', window, re.I):
+            continue
+        if NEGATED.search(negation_context(flat, start, end)) or \
+           NEGATED.search(window):
+            continue
+        return window
+    return None
+
+
+if any('archive_entry_path' in u for u, _p in loc_keys):
+    fail("§5.2 declares a key component archive_entry_path; the container-level rule "
+         "replaces it, because a key over (archive_content_id, archive_entry_path) "
+         "admits several playable entries per archive")
+else:
+    ok("§5.2 declares no key component archive_entry_path")
+
+
+def key_window(text):
+    """The part of a table's own key declaration that may name a key component.
+
+    Only the declaration itself, not the prose around it: `archive_entry_path` is
+    legitimately named in §5.2's prose — as an attribute, and as the thing the
+    container-level key replaced — but never in a `UNIQUE` tuple.
+    """
+    flat = norm(text)
+    for mm in re.finditer(r'UNIQUE\s*\([^)]*\)', flat):
+        if 'archive_entry_path' in mm.group(0):
+            return mm.group(0)
+    return None
+
+
+claimed = first_key_sentence(DATA)
+if claimed:
+    fail("a key over archive_entry_path is claimed again, which weakens the "
+         f"container-level rule: …{claimed[:150]}…")
+elif key_window(sections.get('content_locations', '')):
+    fail("§5.2 declares a key containing archive_entry_path: "
+         f"…{key_window(sections['content_locations'])[:160]}…")
+elif key_window(CHECKLIST['content_locations']['uniqueness']):
+    fail("§20.1 row 9 declares a key containing archive_entry_path: "
+         f"…{key_window(CHECKLIST['content_locations']['uniqueness'])[:160]}…")
+else:
+    ok("no key over archive_entry_path is claimed anywhere")
+
+# `archive_entry_path` must stay declared as a plain column of the one entry row.
+if 'archive_entry_path' not in columns.get('content_locations', {}):
+    fail("§5.2 no longer declares the archive_entry_path column")
+else:
+    ok("archive_entry_path stays an ordinary column of the entry row")
+
+# --------------------------------------------------------------------------- #
+# 16c. Launch resolution: 0 or 1 row, never an entry-path tie-break.
+# --------------------------------------------------------------------------- #
+banner("14c. Launch resolution admits no entry-path tie-break (§5.4)")
+
+# An *entry-path* tie-break is the round-5 defect: the resolver must not choose
+# among several archive_entry_path values of one (archive, content) pair, because
+# the container-level constraint makes that state impossible. What must not come
+# back is a rule that *picks* one, or a passage that presents several entry paths as
+# a normal state. Documentation that describes the defect while saying it is gone,
+# forbidden or impossible is not a defect — which is exactly how §20.3 and this
+# script's own table describe it.
+ORDERING = (r'smallest|tie[- ]break|\bpicks?\b|\bchooses?\b|\bselects?\b|\bwins\b|'
+            r'\borders?\b|\bsorts?\b|one is chosen|resolv\w+')
+
+
+def key_claim_violation(sentence):
+    """True when a sentence makes several entry paths a key, an order or a state."""
+    if 'archive_entry_path' not in sentence and \
+       not re.search(r'\bentry[- ]paths?\b', sentence, re.I):
+        return False
+    if re.search(r'UNIQUE\s*\([^)]*archive_entry_path', sentence, re.I):
+        return True                    # the round-4 key itself
+    if re.search(r'archive_entry_path[^.;]{0,40}\bkeys?\b', sentence, re.I) or \
+       re.search(r'\bkeys?\b[^.;]{0,60}archive_entry_path', sentence, re.I) or \
+       re.search(r'archive_entry_path[^.;]{0,60}key component', sentence, re.I):
+        return True
+    plural = re.search(r'\b(?:several|multiple|two|more than one)\b[^.;]{0,60}'
+                       r'\bentry[- ]paths?\b', sentence, re.I) or \
+        re.search(r'\bentry[- ]paths?\b[^.;]{0,60}'
+                  r'\b(?:several|multiple|two|more than one)\b', sentence, re.I)
+    if plural and re.search(ORDERING, sentence, re.I):
+        return True
+    if re.search(r'\b(?:several|multiple|two|more than one)\b[^.;]{0,80}'
+                 r'archive_entry_path', sentence, re.I) and \
+       re.search(ORDERING, sentence, re.I):
+        return True
+    return False
+
+
+def sentence_of(flat, start, end):
+    """The sentence around a match, hard-wrapping removed.
+
+    A conjunction may carry the negation ("…, because the constraint makes that
+    impossible"), so the sentence is kept whole: from the previous full stop to the
+    next one, not truncated at the comma. Hard-wrapped lines are joined first, so
+    "the `ArchiveEntry` key of review round 4." is one sentence and not two.
+    """
+    flat = re.sub(r'\s+', ' ', flat)
+    begin = flat.rfind('. ', 0, start) + 1
+    finish = flat.find('. ', end)
+    finish = len(flat) if finish == -1 else finish + 1
+    return flat[begin:finish].strip()
+
+
+claims = []
+for mm in re.finditer(r'archive_entry_path|\bentry[- ]paths?\b', DATA, re.I):
+    sentence = sentence_of(DATA, mm.start(), mm.end())
+    if not key_claim_violation(sentence):
+        continue
+    if NEGATED.search(sentence):
+        continue        # "no entry-path tie-break exists", "resolver picks none"
+    claims.append(sentence)
+if claims:
+    for s in sorted(set(claims)):
+        fail("an entry-path key, order or legitimate state is stated again; the "
+             "container-level constraint makes several entry paths for one "
+             f"(archive, content) impossible — …{norm(s)[:170]}…")
+else:
+    ok("no entry-path key, no entry-path ordering, no several-entry-paths claim")
+
+# The container-level key is what replaces the tie-break, so §5.4 must say so.
+if 'UNIQUE (archive_content_id) WHERE location_kind = \'ArchiveEntry\'' not in DATA:
+    fail("the container-level ArchiveEntry key is not stated in the document, so "
+         "§5.4's 0-or-1-row resolution rests on nothing")
+else:
+    ok("§5.4's resolution is anchored in the stated key")
+
+# --------------------------------------------------------------------------- #
+# 16d. Source removal: File locations go, ArchiveEntry locations stay.
+# --------------------------------------------------------------------------- #
+banner("14d. Source removal deletes File locations only (§19.2)")
+
+s192 = DATA[DATA.index('### 19.2 '):DATA.index('### 19.3 ')]
+
+# (a) the binding rule must name the two kinds.
+for needle, label in (
+        ("The binding retention rule in one sentence.", "binding retention rule"),
+        ("belonging to X", "removal deletes the File locations of X"),
+        ("MUST NOT delete `ArchiveEntry`",
+         "removal must not delete an ArchiveEntry location"),
+        ("location_kind = 'File' AND source_id = X",
+         "the File delete predicate")):
+    if needle not in re.sub(r'\s+', ' ', s192):
+        fail(f"§19.2: the binding source-removal statement does not {label} "
+             f"(needle {needle!r} not found)")
+    else:
+        ok(f"§19.2: {label}")
+
+# (b) no sentence may forbid deleting content_locations in general while the same
+#     section deletes this source's File rows. That pair was the round-5 defect.
+def removal_clauses(body):
+    """Sentences that forbid a source removal from deleting a row type."""
+    out = []
+    for para in paragraphs(body):
+        for sentence in re.split(r'(?<=[.!?])\s+', norm(para)):
+            if not re.search(r'remov\w+|delet\w+', sentence, re.I):
+                continue
+            if not re.search(r'MUST NOT|may not|never|does not|doesn\'t',
+                             sentence, re.I):
+                continue
+            out.append(sentence)
+    return out
+
+
+def mentions_bare_content_locations(clause):
+    """True when the clause protects `content_locations` as a whole row type.
+
+    A clause that says `ArchiveEntry` `content_locations` is not protecting the
+    whole table, and a clause that names location_kind = 'File' is the intended
+    deletion statement, not a contradiction of it.
+    """
+    if 'content_locations' not in clause:
+        return False
+    if 'ArchiveEntry' in clause:
+        return False
+    if "location_kind" in clause:
+        return False
+    return True
+
+
+contradictions = [c for c in removal_clauses(s192) if mentions_bare_content_locations(c)]
+if contradictions:
+    for c in contradictions:
+        fail(f"§19.2 contradicts itself: the section deletes this source's "
+             f"content_locations rows and also forbids deleting content_locations "
+             f"in general — …{c[:160]}…")
+else:
+    ok("§19.2 never forbids deleting content_locations as a whole")
+
+# (c) the ArchiveEntry row is kept, and reachability is derived from the
+#     container's File locations.
+for needle, label in (
+        ("no `ArchiveEntry` location, ever", "an entry location is never deleted"),
+        ("A has no File location left", "the last File location is the reachability edge"),
+        ("the ArchiveEntry row REMAINS", "the row remains when unreachable"),
+        ("unreachable / not found through normal reconciliation",
+         "unreachable is a state, not a deletion"),
+        ("No `ArchiveEntry` row is ever deleted because of a source removal",
+         "the no-ArchiveEntry-deletion rule is stated in prose too")):
+    if needle not in s192:
+        fail(f"§19.2: missing the ArchiveEntry rule — {label}")
+    else:
+        ok(f"§19.2: {label}")
+
+# --------------------------------------------------------------------------- #
+# 16e. The EntryList fingerprint record stays independent of the import rule.
+# --------------------------------------------------------------------------- #
+banner("14e. EntryList is not reduced to one fingerprint per archive (§7.1)")
+
+LIST_PRED = "fingerprint_kind = 'EntryList'"
+fp_keys = keys.get('content_fingerprints', {}).get('unique', [])
+list_keys = [u for u, p in fp_keys if p == LIST_PRED]
+if not list_keys:
+    fail(f"§7.1: no unique key with predicate {LIST_PRED!r} (found "
+         f"{[(u, p) for u, p in fp_keys]})")
+else:
+    for u in list_keys:
+        if 'entry_path' not in u:
+            fail(f"§7.1: the EntryList key {u} no longer contains entry_path, so an "
+                 f"archive could hold only one EntryList fingerprint. An archive may "
+                 f"contain N physical entries and keep N fingerprints for diagnosis; "
+                 f"only imported playable ArchiveEntry locations are bounded.")
+        if 'content_id' not in u:
+            fail(f"§7.1: the EntryList key {u} is not scoped by content_id")
+        if 'archive_content_id' in u:
+            fail(f"§7.1: the EntryList key {u} is scoped by archive_content_id, "
+                 f"which is not even a column of content_fingerprints")
+    if all('entry_path' in u and 'content_id' in u and 'archive_content_id' not in u
+           for u in list_keys):
+        ok(f"§7.1 EntryList key keeps entry_path and is scoped per content: "
+           f"{list_keys}")
+
+# The document must state the distinction explicitly, not only in the key.
+for needle, label in (
+        ("archive may contain N physical entries", "N physical entries allowed"),
+        ("EntryList may store N fingerprints", "N fingerprints allowed"),
+        ("imported playable ArchiveEntry locations", "the bounded thing is named"),
+        ("at most 1", "the bound is 1")):
+    if needle not in DATA:
+        fail(f"the EntryList/ArchiveEntry distinction does not state that {label} "
+             f"(needle {needle!r} not found)")
+    else:
+        ok(f"the distinction states: {label}")
+
+if re.search(r'EntryList[^.\n]{0,80}\bat most one\b', DATA, re.I):
+    fail("a passage bounds EntryList to one row per archive; only imported playable "
+         "ArchiveEntry locations are bounded (§6.3, §7.1)")
+else:
+    ok("no passage bounds EntryList cardinality")
 
 # --------------------------------------------------------------------------- #
 # 17. Markdown structure and traceability to ARCHITECTURE.md.

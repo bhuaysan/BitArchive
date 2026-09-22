@@ -484,7 +484,7 @@ which may never be a primary key and never a foreign-key target.
 | `release_regions` | `(release_id, region)` | — | A | |
 | `release_languages` | `(release_id, language)` | — | A | |
 | `contents` | `(id)` | — | A | no `archive_content_id` column at all (§6.3) |
-| `content_locations` | `(row_id)` | `U* (source_id, relative_path) WHERE location_kind = 'File'`; `U* (archive_content_id, archive_entry_path) WHERE location_kind = 'ArchiveEntry'` | **B**/**D** | the `File` predicate pins `source_id`/`relative_path` and forbids the archive columns; the `ArchiveEntry` predicate pins `archive_content_id`/`archive_entry_path` and forbids source and path — one `CASE` check in §5.2 decides which |
+| `content_locations` | `(row_id)` | `U* (source_id, relative_path) WHERE location_kind = 'File'`; `U* (archive_content_id) WHERE location_kind = 'ArchiveEntry'` | **B**/**D** | the `File` predicate pins `source_id`/`relative_path` and forbids the archive columns; the `ArchiveEntry` predicate pins `archive_content_id` and forbids source and path — one `CASE` check in §5.2 decides which. `archive_entry_path` is an attribute of the one entry row, not a key component |
 | `content_derivations` | `(content_id, kind)` | — | A | |
 | `content_derivation_members` | `(content_id, kind, source_content_id)` | `U (content_id, kind, member_index)` | A | |
 | `content_fingerprints` | `(row_id)` | `U* (content_id, fingerprint_kind, algorithm) WHERE fingerprint_kind <> 'EntryList'`; `U* (content_id, fingerprint_kind, algorithm, entry_path) WHERE fingerprint_kind = 'EntryList'`; `U* (algorithm, digest) WHERE fingerprint_kind = 'Payload'` | **B**/**D** | the `EntryList` predicate is pinned by `CHECK ((fingerprint_kind = 'EntryList') = (entry_path IS NOT NULL))` |
@@ -835,26 +835,62 @@ not on the reference — so it is a **write-path rule and a required integrity t
   claim `source X / games/foo.rom` at the same time, so a launch would have two
   different answers for one file and reconciliation could not say which content it
   had just observed. This index alone also gives "the same content has one location
-  record per path", because it is the tighter of the two: a second row agreeing on
-  `(source_id, relative_path)` collides whatever its `content_id` is.
-- **`UNIQUE (archive_content_id, archive_entry_path) WHERE location_kind =
-  'ArchiveEntry'` — one entry of one container belongs to one content.** Without
-  this rule a re-scan that changed its mind about which entry is playable would
-  leave the losing content pointing at a location that now belongs to another
-  content. It likewise implies "one content has one location record per entry of a
-  container", for the same reason.
+  record per path": a second row agreeing on `(source_id, relative_path)` collides
+  whatever its `content_id` is.
+- **`UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'` — one
+  supported archive holds at most one imported playable entry.** This is
+  `PRODUCT.md` §10 expressed as a database constraint, and §6.3 states the product
+  rule it mirrors: a ZIP is supported only when it contains **exactly one**
+  unambiguously playable content, so BitArchive imports **at most one** playable
+  entry per `ArchiveContainer` content. Without this rule one container could carry
+  two `ArchiveEntry` rows — two entry paths for the same payload, or two different
+  playable contents — and the launch contract `ArchiveEntry { archive, content }`
+  (§5.4) would have more than one row to choose from.
 
-Two further keys from the previous revision are **removed as redundant**:
-`(content_id, source_id, relative_path)` and
-`(content_id, archive_content_id, archive_entry_path)` each contained one of the
-two indexes above as a prefix-set, so they could never reject a row the smaller key
-accepts. A redundant unique index is not free — it is a second thing to keep in
-step with the first — so the smallest set that protects both invariants is kept.
+  ```text
+  one ArchiveContainer content
+      → at most one imported playable ArchiveEntry location
+      → therefore at most one row for any (archive, content) pair
+  ```
+
+  The rule is about **what BitArchive imports**, not about what a ZIP physically
+  contains. A ZIP may hold N files and BitArchive still records **N** `EntryList`
+  fingerprints for it (§7.1, §7.2) — diagnostics stay complete. What is bounded is
+  the number of *playable entry locations* this archive contributes:
+
+  ```text
+  0 unambiguous playable entries   → unsupported / unknown, no ArchiveEntry location
+  1 unambiguous playable entry     → imported: exactly one ArchiveEntry location
+  2+ playable entries              → ambiguous: not regularly imported
+  ```
+
+  `archive_entry_path` therefore stays exactly what it is — the technical entry path
+  of the one imported entry row — and is deliberately **not** a key component of any
+  `ArchiveEntry` key.
+
+Two keys from an earlier revision are **removed**:
+
+- `(content_id, source_id, relative_path)` was redundant — it contained the `File`
+  index above as a prefix-set, so it could never reject a row the smaller key
+  accepts.
+- `(content_id, archive_content_id, archive_entry_path)` was the `ArchiveEntry` key
+  of review round 4. The container-level rule above now decides the same question
+  strictly earlier: a second `ArchiveEntry` row for one `archive_content_id` is
+  refused whatever its `content_id` **and** whatever its `archive_entry_path`, so
+  the entry path no longer needs to appear in a key at all. Keeping it would have
+  been a *weaker* key than the one that protects the invariant (it admits exactly
+  the two rows the product rule forbids), and no `UNIQUE` constraint is kept without
+  a fachliche reason.
+
+A redundant unique index is not free — it is a second thing to keep in step with the
+first — so the smallest set that protects both invariants is kept.
 
 Both remaining keys are **partial unique indexes over `location_kind`**, because the
 discriminator is what makes each key meaningful, and a partial index may never be
-mistaken for the table's primary key (§3.9). None of them depends on SQLite's
-`NULL`-are-distinct behaviour.
+mistaken for the table's primary key (§3.9). Neither depends on SQLite's
+`NULL`-are-distinct behaviour: the `File` predicate pins `source_id`/`relative_path`,
+the `ArchiveEntry` predicate pins `archive_content_id`, and the `CASE` check above
+forbids the archive columns for every `File` row (§3.5, §3.8).
 
 **Decision — the container relationship lives on the location, not on the
 content.** An earlier revision put `contents.archive_content_id` on the content,
@@ -893,16 +929,22 @@ on a path (invariant 2).
 - `(content_id)` — "where can this content be found" and launch content
   resolution.
 - `(state)` — the "missing content" and maintenance-queue queries.
-- `(archive_content_id)` WHERE `location_kind = 'ArchiveEntry'` — resolving a
-  container to the entries observed inside it, which is the path launch resolution
-  and container removal both take.
+
+No separate index on `archive_content_id` is declared: the partial unique index
+`UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'` already answers
+"the one imported entry of this container" — which is what launch resolution, source
+removal and container removal all ask — so a second index over the same column would
+be a duplicate of it.
 
 **Owner.** SQLite. **Lifecycle.** Persistent.
 
 **Retention.** A location is a *discovery*. It is marked `Missing`, never deleted
-while its content still exists (§19.4), and it is deleted only when its source is
-removed (§19.2) or when a library rebuild clears the scanned index
-(`PRODUCT.md` §40, §19.3).
+while its content still exists (§19.4), and it is deleted only when a library
+rebuild clears the scanned index (`PRODUCT.md` §40, §19.3) or when **its source** is
+removed — and a source removal deletes `File` rows only, because only they belong to
+a source. An `ArchiveEntry` location has no `source_id`, is never deleted by a source
+removal, and becomes unreachable rather than deleted when its container loses its
+last `File` location (§19.2).
 
 **Invariant protected.** Paths are locations, not identities (invariant 2); a
 content can be found in several places at once (`PRODUCT.md` §7.7); a missing
@@ -968,7 +1010,7 @@ The model supplies every one of those identities from tables in this document,
 | `LaunchContent` variant | This model |
 |---|---|
 | `File(content)` | the `Content` of kind `Content`; its `Present` location supplies source and relative path |
-| `ArchiveEntry { archive, content }` | `content` is the playable entry content and `archive` is the `ArchiveContainer`; together they name the `content_locations` row whose `location_kind = 'ArchiveEntry'`, whose `content_id` **is** `content` and whose `archive_content_id` **is** `archive` (§5.2). Both halves are identities, and the row supplies the technical `archive_entry_path` |
+| `ArchiveEntry { archive, content }` | `content` is the playable entry content and `archive` is the `ArchiveContainer`; together they name **the** `content_locations` row whose `location_kind = 'ArchiveEntry'`, whose `content_id` **is** `content` and whose `archive_content_id` **is** `archive` (§5.2). Both halves are identities, and the row supplies the technical `archive_entry_path` |
 | `ExistingPlaylist(content)` | the `Playlist` content whose location is the user's `.m3u` |
 | `ManagedPlaylist { path, members }` | a `content_derivations` row (§6.6): `content_id` is the managed playlist, `relative_path` is `path`, and the `content_derivation_members` rows are `members` in `member_index` order |
 
@@ -983,18 +1025,42 @@ content, and the third component — the entry path — is read from the locatio
 that the two identities select. `ARCHITECTURE.md` §14.2 was corrected in the same
 change (`AGENTS.md` §1), and ADR 0005 records the boundary.
 
+**Decision — `archive` alone already identifies the entry location.** §5.2's
+`UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'` is the product
+rule of `PRODUCT.md` §10 in relational form: at most one playable entry is imported
+per `ArchiveContainer`. The two identities of the launch contract are therefore not
+two halves of a *composite* key that could still be ambiguous — the container half
+is already unique, and the playable content half only has to **agree** with the row
+that the container half selects:
+
+```text
+ArchiveEntry { archive, content }
+        ↓
+archive_content_id = archive  AND  content_id = content
+        ↓
+0 rows   the archive contributes no imported playable entry, or the pair is wrong
+         → not available / readiness failure (ContentUnavailable, §21)
+1 row    use its archive_entry_path
+2+ rows  impossible by the partial unique index of §5.2
+```
+
+An archive that holds the same payload at two entry paths therefore never yields two
+rows: the second import is refused by the constraint, so the model needs no
+entry-path ordering and §5.4's resolution contains none.
+
 #### Launch resolution (binding)
 
-Resolution is a sequence of identity lookups with a deterministic tie-break, never
-a search over paths. It is the same procedure for every variant:
+Resolution is a sequence of identity lookups, never a search over paths. It is the
+same procedure for every variant:
 
 ```text
 Playable ContentId  +  optional Archive ContentId
         ↓  1. the content's location rows
 content_locations WHERE content_id = <playable>  [AND archive_content_id = <archive>]
-        ↓  2. exactly one row per shape is guaranteed by the unique indexes of §5.2
-        ↓     (for ArchiveEntry: one row per (archive_content_id, archive_entry_path),
-        ↓      and the pair itself is unique, so the row is selected by identity)
+        ↓  2. for an ArchiveEntry the container half is already unique:
+        ↓     UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'
+        ↓     admits 0 or 1 row for the pair, never 2 (§5.2), and the row's
+        ↓     archive_entry_path is read rather than chosen
    location_kind = 'File'          location_kind = 'ArchiveEntry'
         ↓                                  ↓ archive_content_id
    source_id + relative_path        ArchiveContainer content
@@ -1019,10 +1085,15 @@ content_locations WHERE content_id = <playable>  [AND archive_content_id = <arch
 >    The order is over stable identities and stored paths, so it is a pure function
 >    of the database and cannot depend on scan order, filesystem enumeration order
 >    or list position (`ARCHITECTURE.md` §53.22, §36.3).
-> 3. If an `ArchiveEntry` has several entry paths for one `(archive, content)` pair
->    — a legitimate archive holding the same payload twice — the resolver picks the
->    smallest `archive_entry_path`. The pair is unique per entry path, so this is
->    the only ambiguity the model admits, and it is resolved the same way.
+> 3. The `ArchiveEntry` row itself is **not** subject to that order. The container
+>    half of `ArchiveEntry { archive, content }` is unique across the entries one
+>    archive imports (§5.2), so the pair matches **0 or 1** row and its
+>    `archive_entry_path` is read, never chosen. Several entry paths for one
+>    `(archive, content)` pair are **impossible by database constraint**, not a
+>    legitimate state with a tie-break: an archive holding two playable entries is
+>    ambiguous and is not regularly imported at all (`PRODUCT.md` §10, §6.3). Step 2
+>    therefore only ever orders *physically identical copies of the container*, and
+>    no entry-path ordering exists anywhere in this model.
 > 4. If **no** candidate exists, resolution fails with the corresponding readiness
 >    issue (`ContentUnavailable`, or `SourceOffline` when the only locations belong
 >    to unavailable sources, `ARCHITECTURE.md` §21). It never falls back to a
@@ -1036,7 +1107,9 @@ content_locations WHERE content_id = <playable>  [AND archive_content_id = <arch
 This rule is stated once, here, and the readiness and session sections reference it
 rather than restating it. It is the only place in the model where more than one row
 can answer "where is this content", and the answer is a total order rather than an
-arbitrary pick.
+arbitrary pick. Note what the order covers: **several copies of one payload, never
+several entries of one archive** — for `ArchiveEntry` the database admits one row,
+so there is nothing to order and no entry-path tie-break exists.
 
 ---
 
@@ -1284,12 +1357,41 @@ archives is **one content with three locations**, not three contents.
 `LaunchContent::ArchiveEntry` is the entry **content**, so no additional identity
 type is introduced.
 
-**Decision — at most one playable entry is imported per archive.** A ZIP with
-zero or several playable entries is *ambiguous* and is recorded as an unsupported
-or unknown file rather than as a release (`PRODUCT.md` §10). BitArchive never
-extracts an archive persistently. Note what this does **not** say: it limits how
-many entries BitArchive *imports from one* archive, not how many archives may
-contain the same playable payload.
+**Decision — at most one playable entry is imported per archive, and the database
+enforces it.** `PRODUCT.md` §10 states the product rule exactly: a ZIP is supported
+only when it contains **exactly one unambiguously playable content**, and an archive
+with several ROMs is ambiguous and is not regularly imported. The three cases are:
+
+```text
+0 unambiguous playable entries   → unsupported / unknown, not a release
+1 unambiguous playable entry     → imported, one ArchiveEntry location
+2+ playable entries              → ambiguous, not regularly imported
+```
+
+A ZIP in either of the first two senses is recorded as an unsupported or unknown
+file rather than as a release, and BitArchive never extracts an archive
+persistently. The rule is relational, not a convention: §5.2 declares
+
+```text
+UNIQUE (archive_content_id)
+WHERE location_kind = 'ArchiveEntry'
+```
+
+so one `ArchiveContainer` content can hold **at most one** imported playable
+`ArchiveEntry` location, and a second one is refused by the schema whatever its
+`content_id` and whatever its `archive_entry_path`. `archive_entry_path` stays the
+ordinary technical entry path of that one row — it is not a key component anywhere.
+
+Note what this does **not** say, in either direction:
+
+- It limits how many entries BitArchive *imports from one* archive, **not** how many
+  archives may contain the same playable payload. The same payload in containers A
+  and B is one content with two `ArchiveEntry` locations (§5.2), each container
+  holding its own single imported entry.
+- It limits imported **playable entry locations**, **not** the fingerprint record of
+  what the archive contains. An ambiguous ZIP may still carry **N** `EntryList`
+  fingerprints in `content_fingerprints` — one per physical entry — because those are
+  diagnosis, not import (§7.1, §7.2), and no constraint counts them.
 
 ### 6.4 `release_regions`, `release_languages`
 
@@ -4025,24 +4127,58 @@ an entry inside it. Deleting entry rows "because they were under source X" is
 therefore not even expressible, and it would also be wrong — the same archive may
 still be present through another source or another path.
 
-> **Rules (binding).**
+> **Rules (binding).** The two location kinds are treated differently, and the
+> difference is not a detail — it is the whole rule:
 >
-> 1. Removing source X deletes the `content_locations` rows with
->    `location_kind = 'File' AND source_id = X`, and **no** row with
->    `location_kind = 'ArchiveEntry'`.
-> 2. Removing one `File` location of an archive MUST NOT destroy an `ArchiveEntry`
+> 1. **Removing source X deletes exactly one kind of row:** the `content_locations`
+>    rows with `location_kind = 'File' AND source_id = X`. Those are the paths under
+>    X's root, and they are the only locations that name a source at all.
+> 2. **Removing source X deletes no `ArchiveEntry` location, ever.** An
+>    `ArchiveEntry` row has no `source_id` (§5.2), so it cannot be "a location of
+>    source X" in the first place: it names a container content and the entry inside
+>    it, and the same archive may still be present through another source or another
+>    path. Deleting entry rows "because they were under source X" is therefore not
+>    even expressible, and it would also be wrong.
+> 3. Removing one `File` location of an archive MUST NOT destroy an `ArchiveEntry`
 >    relationship. As long as the `ArchiveContainer` content still has **one**
 >    remaining `File` location — in another source, or at another path — the entry
 >    is still physically reachable and its `ArchiveEntry` location stays valid,
 >    unchanged.
-> 3. Only when the container has **no** `File` location left does the entry become
+> 4. Only when the container has **no** `File` location left does the entry become
 >    unreachable. Even then the entry location row is **kept**, and the observed
 >    state is decided by the ordinary reconciliation rules of §19.4: the
 >    container's remaining locations are not present, so the entry is reported as
 >    not found, and the `ContentId`s on both sides survive untouched.
-> 4. A source removal MUST NOT delete a `games`, `releases`, `contents`,
->    `content_locations`, `manual_overrides`, `provider_values`, `sessions`,
->    `save_states` or `media_assets` row, and MUST NOT touch the file system.
+> 5. A source removal MUST NOT delete a `games`, `releases`, `contents`,
+>    `manual_overrides`, `provider_values`, `sessions`, `save_states` or
+>    `media_assets` row, and MUST NOT touch the file system. Together with rules 1
+>    and 2 this is the complete deletion statement of this section: the `File`
+>    locations of the removed source go, **nothing else does**.
+>
+> **The binding retention rule in one sentence.** Removing source X deletes only
+> `File` `content_locations` belonging to X. It MUST NOT delete `ArchiveEntry`
+> `content_locations` or any fachliche identity, user state, metadata history or
+> external file.
+
+**What happens to an `ArchiveEntry` when a source is removed.** An `ArchiveEntry`
+has no `source_id` of its own, so its reachability is decided by its container's
+`File` locations and by nothing else. The whole case analysis is:
+
+```text
+remove the File location   Source 1 / games/foo.zip   of ArchiveContainer A
+        ↓
+A still has another Present File location (Source 2 / backup/foo.zip)
+        → the ArchiveEntry location of A stays reachable and unchanged
+
+A has no File location left
+        → the ArchiveEntry row REMAINS
+        → it becomes unreachable / not found through normal reconciliation
+        → both ContentIds and every fachliche row stay untouched
+```
+
+No `ArchiveEntry` row is ever deleted because of a source removal, and no
+`ArchiveEntry` row is ever deleted because its container went offline. "Not found"
+is a state (§19.4), exactly as it is for a loose file.
 
 So "the container is gone" is a **state**, not a deletion, exactly as it is for a
 plain file: re-adding the source or replugging the volume makes the same entry
@@ -4324,12 +4460,15 @@ their deletion state by state (§19.5).
 | A location is not seen by an eligible scan | `content_locations.state = 'Missing'`; `last_seen_at` is not advanced |
 | A source is `Offline` / `PermissionDenied` / `Missing` | **No** location is marked missing at all |
 | A content has no `Present` location | It is "not found": it leaves the launchable set but keeps its identity, fingerprints and every referencing row |
+| An `ArchiveContainer` loses its last `File` location | Its `ArchiveEntry` location row is **kept** and becomes unreachable, never deleted: the container has no present copy, so the entry is "not found" like any other location, and the playable `ContentId` is untouched (§19.2) |
 | The file reappears | The next scan sets `state = 'Present'` and advances `last_seen_at`; because the identity was never dropped, all metadata and statistics are still attached |
 
 > **Rule (binding).** A missing content never deletes a game, a release, or a
 > content, and neither does a library rebuild. Only the **full reset** removes
 > those rows, and even it touches nothing outside BitArchive's own data area
-> (§19.3).
+> (§19.3). "Unreachable" is an observation state, and it never removes an
+> `ArchiveEntry` location either: the only deletion that touches `content_locations`
+> at all removes the `File` rows of one removed source (§19.2).
 
 ### 19.5 Deleting a Save State
 
@@ -4366,7 +4505,7 @@ thumbnail disappears from BitArchive — and no other asset breaks.
 | Structure | Lifetime | Retention rule |
 |---|---|---|
 | `library_sources` | Persistent | Kept; removal sets `removed_at` |
-| `content_locations` | Persistent | Kept while the content exists; `Missing` is a state, not a deletion. Cleared by a library rebuild and re-derived by the re-scan (§19.3) |
+| `content_locations` | Persistent | Kept while the content exists; `Missing` is a state, not a deletion. A source removal deletes that source's `File` rows only and no `ArchiveEntry` row; a library rebuild clears the table and the re-scan re-derives it (§19.2, §19.3) |
 | `games`, `releases`, `contents` | Persistent | **Only a full reset** (§19.3). A library rebuild keeps all three |
 | `release_regions`, `release_languages` | Persistent | Cascade with their release (intrinsic parts) |
 | `content_fingerprints` | Persistent | **Recognition evidence.** `Payload` rows are kept across a library rebuild, because re-identification depends on them; `Container`/`EntryList` rows are re-derived. Rows are replaced on recompute and deleted with their content (§7.1, §19.3) |
@@ -4477,7 +4616,7 @@ constraints, and this table must agree with them.
 | 6 | `release_regions` | §6.4 | none | `(release_id, region)` | none |
 | 7 | `release_languages` | §6.4 | none | `(release_id, language)` | none |
 | 8 | `contents` | §6.3 | `ContentId` | `(id)` | none (FK `(release_id, game_id)` → #5) |
-| 9 | `content_locations` | §5.2 | none | `(row_id)` `INTEGER` | `UNIQUE (source_id, relative_path) WHERE location_kind = 'File'`; `UNIQUE (archive_content_id, archive_entry_path) WHERE location_kind = 'ArchiveEntry'` |
+| 9 | `content_locations` | §5.2 | none | `(row_id)` `INTEGER` | `UNIQUE (source_id, relative_path) WHERE location_kind = 'File'`; `UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'` |
 | 10 | `content_derivations` | §6.6 | none | `(content_id, kind)` | none |
 | 11 | `content_derivation_members` | §6.6 | none | `(content_id, kind, source_content_id)` | `UNIQUE (content_id, kind, member_index)` |
 | 12 | `content_fingerprints` | §7.1 | none | `(row_id)` `INTEGER` | `UNIQUE (content_id, fingerprint_kind, algorithm) WHERE fingerprint_kind IN ('Payload', 'Container')`; `UNIQUE (content_id, fingerprint_kind, algorithm, entry_path) WHERE fingerprint_kind = 'EntryList'`; `UNIQUE (algorithm, digest) WHERE fingerprint_kind = 'Payload'` |
@@ -4546,8 +4685,21 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
 1. A 16-byte value that is not a UUIDv7 is **rejected** on read, per table, and
    never silently replaced (§3.3).
 2. A digest column is never a primary key and never a foreign key target (§3.4).
-3. `content_locations` rejects two contents claiming the same archive entry, and
-   rejects two contents claiming the same `File` path of one source (§5.2).
+3. `content_locations` rejects a **second `ArchiveEntry` row for one container**, and
+   rejects two contents claiming the same `File` path of one source (§5.2). The
+   `ArchiveEntry` half is asserted three times, because the constraint must bite
+   regardless of which other column differs:
+   - a second row for the same `archive_content_id` with the **same** `content_id`
+     and a different `archive_entry_path` is **rejected**;
+   - a second row for the same `archive_content_id` with a **different**
+     `content_id` is **rejected**;
+   - the **first** `ArchiveEntry` row for a container is **accepted**, so the
+     constraint bounds the count without forbidding the supported case.
+   This is `PRODUCT.md` §10 ("genau einen eindeutig spielbaren Content") and
+   `§6.3`'s "at most one playable entry is imported per archive" expressed as a
+   database fact. A second `ArchiveEntry` row with a *different* `archive_entry_path`
+   is not a legitimate "same payload twice" state: the archive was ambiguous at scan
+   time and is not regularly imported.
 4. `contents` rejects a `release_id` whose release belongs to a different
    `game_id` (§6.3).
 5. **Both location shapes are exactly the architecture's sum type** (§5.2). The
@@ -4669,9 +4821,22 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
     a `Payload` or `Container` row with an entry path is refused, an `EntryList`
     row without one is refused, and two `EntryList` rows may share a digest as long
     as their `(content_id, entry_path)` differs.
-34. **The same entry bytes may occur in several archives** (§7.1): two contents in
-    two different containers may each carry an `EntryList` row with the same
-    digest; no global uniqueness applies to `EntryList`.
+34. **The same entry bytes may occur in several archives, and one archive may carry
+    several `EntryList` fingerprints** (§7.1): two contents in two different
+    containers may each carry an `EntryList` row with the same digest, since no
+    global uniqueness applies to `EntryList`. And an archive may hold **N**
+    `EntryList` rows — one per physical entry — in *addition to* its single imported
+    playable `ArchiveEntry` location: the `EntryList` key stays
+    `(content_id, fingerprint_kind, algorithm, entry_path)`, so no constraint reduces
+    the fingerprint record of an archive to one row, and an ambiguous ZIP that is
+    *not* imported still keeps its full multi-row `EntryList` for diagnosis
+    (§6.3). The distinction the test asserts:
+
+    ```text
+    archive may contain N physical entries      → yes
+    EntryList may store N fingerprints          → yes
+    imported playable ArchiveEntry locations    → at most 1 (§5.2)
+    ```
 35. **`media_assets` declares no natural-key unique constraint** (§10.1): two asset
     rows may share a digest, a provider or a locale, and slot uniqueness is
     enforced by `media_asset_references` alone.
@@ -4710,14 +4875,47 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
     no section of this document states otherwise. Test 29 asserts the table set;
     this test asserts the *statement*, so that a section drifting back to
     "a rebuild forgets the content identities" fails.
-42. **One playable payload may be loose and inside several archives at once**
+42. **`ArchiveEntry { archive, content }` matches 0 or 1 row, never 2** (§5.2, §5.4):
+    a lookup on `archive_content_id = archive AND content_id = content` returns at
+    most one row by the partial unique index, so its `archive_entry_path` is *read*
+    rather than selected from a set. The required assertions are the whole case
+    analysis from §5.4:
+
+    - the pair matches **one** row for an imported entry → that row's
+      `archive_entry_path` is the launch entry path;
+    - the pair matches **zero** rows → the resolver reports the readiness result of
+      §5.4 rule 4 (`ContentUnavailable`, or `SourceOffline` when the only container
+      locations belong to unavailable sources) and never guesses;
+    - the pair can match **two** rows only if the schema lost its uniqueness
+      constraint, so the test asserts the schema makes `2+` impossible **and** that
+      no resolver implementation contains a secondary ordering over entry paths.
+      An `archive_entry_path` tie-break is not a permitted fallback for a missing
+      constraint: the constraint is the rule, and a resolver that sorts entry paths
+      is failing this test rather than handling a case.
+43. **A source removal deletes the removed source's `File` locations and nothing
+    else** (§19.2). Four assertions, all required:
+    - removing source X deletes the `content_locations` rows with
+      `location_kind = 'File' AND source_id = X`;
+    - removing source X deletes **no** `ArchiveEntry` location — not one, not even
+      for a container that had all of its `File` locations under X;
+    - if an `ArchiveContainer` still has another `File` location (another source or
+      another path), its `ArchiveEntry` location stays reachable, unchanged;
+    - if its **final** `File` location disappears, the `ArchiveEntry` row
+      **remains** and becomes unreachable / not found through normal
+      reconciliation: the row is still there, readiness reports it as unavailable,
+      and both `ContentId`s survive untouched. Re-adding the source makes the same
+      entry reachable again with no identity having moved.
+    The test also asserts that no other table loses a row: `games`, `releases`,
+    `contents`, `manual_overrides`, `provider_values`, `sessions`, `save_states`
+    and `media_assets` are unchanged, and no external file is touched.
+44. **One playable payload may be loose and inside several archives at once**
     (§5.2): the same payload digest observed as `source X / loose.gba`, as
     `container A / ROMS/loose.gba` and as `container B / ROMS/loose.gba` is **one**
     content with **three** location rows — one `File` and two `ArchiveEntry` — and
     not three contents. Removing one of the container `File` locations leaves both
-    `ArchiveEntry` rows valid (§19.2 rule 2); removing the container's last `File`
+    `ArchiveEntry` rows valid (§19.2 rule 3); removing the container's last `File`
     location leaves the rows present but unreachable.
-43. **Save-state addressing is technical and slot-based** (§15.1): a discovered
+45. **Save-state addressing is technical and slot-based** (§15.1): a discovered
     file's slot is stored as the integer RetroArch uses — including `-1` for the
     `Auto` state — and a file whose name encodes no slot stores `slot IS NULL`
     rather than a substituted token. Discovery is idempotent: indexing the same
@@ -4729,12 +4927,12 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
 
 #### Structural checks that run against this document
 
-Tests 1–43 above are assertions schema v1 and the repository ports must satisfy at
+Tests 1–45 above are assertions schema v1 and the repository ports must satisfy at
 run time. A subset of the *document's own* consistency is checkable statically, and
 it is checked by a script in the repository so that the review findings that
 motivated it — a foreign key naming a column its own table does not own, a
-partial index labelled as a primary key, a sentinel colliding with a real locale —
-cannot recur silently:
+partial index labelled as a primary key, a sentinel colliding with a real locale, a
+retention rule contradicted by its own section — cannot recur silently:
 
 ```bash
 python3 tools/check_data_model.py
@@ -4752,6 +4950,10 @@ The script verifies, against `DATA_MODEL.md` alone:
 | **no locale sentinel exists** and no valid BCP-47 tag stands in for `NULL` | the round-4 defect: mapping a language-neutral locale to the real tag `und`, collapsing the two |
 | the `content_locations` shape check pins both variants in **both** directions | an `ArchiveEntry` that also carries `source_id`/`relative_path` |
 | **no section claims a library rebuild deletes `games`, `releases` or `contents`** | the round-4 defect: §19.2 calling a rebuild "forget everything" |
+| **the `ArchiveEntry` location key is exactly `UNIQUE (archive_content_id)` over its predicate**, and no key over `archive_entry_path` exists | the round-5 defect: `UNIQUE (archive_content_id, archive_entry_path)` admitting two playable entry rows for one ZIP, so `LaunchContent::ArchiveEntry { archive, content }` could resolve to 2 rows |
+| **no section orders several `archive_entry_path` values, and no entry-path tie-break is described as a legitimate state** | the round-5 defect: §5.4 resolving an impossible ambiguity by "smallest `archive_entry_path`" instead of relying on the constraint |
+| **§19.2's binding source-removal rule deletes `File` locations only and forbids deleting an `ArchiveEntry` location** | the round-5 defect: the same section both deleting `content_locations` of the source and stating that a source removal MUST NOT delete a `content_locations` row |
+| **the `EntryList` fingerprint key still contains `entry_path`**, so an archive's fingerprint record is not reduced to one row | the round-5 near-miss: copying the location rule onto `content_fingerprints` and allowing only one `EntryList` per archive |
 | **`ARCHITECTURE.md` contains no `ArchiveEntryId`** and its `LaunchContent` matches this document | a source-of-truth contradiction surviving a change |
 | every key is declared as a `UNIQUE` tuple, not as free prose | a constraint that no `CREATE TABLE` could be derived from |
 | every PK/UNIQUE key column is a defined column | a unique constraint on a column nobody declared |
@@ -4770,6 +4972,17 @@ lint checks a reviewer already runs — and, since this round, **in the same CI
 workflow as those checks** (`Rust quality` runs `python3 tools/check_data_model.py`
 as its own step, `.github/workflows/ci.yml`), so the document cannot drift on a
 branch whose CI is green.
+
+**The round-5 rules were verified to fail on their own mutations.** Each was applied
+to a scratch copy and reverted, never committed:
+
+| Mutation | Expected |
+|---|---|
+| §19.2 forbids deleting a `content_locations` row again while still deleting the source's `File` rows | FAIL |
+| the entry-path component is put back into the `ArchiveEntry` key — in §5.2, in §20.1 alone, or in §3.8 alone | FAIL |
+| §5.4 lets one `(archive, content)` pair own several entry paths again and resolves them by ordering the paths | FAIL |
+| the `EntryList` key loses `entry_path`, so an archive could hold only one fingerprint | FAIL |
+| unmutated document (positive control) | PASS |
 
 ### 20.4 Open points this document deliberately does not decide
 

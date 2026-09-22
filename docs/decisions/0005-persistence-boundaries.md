@@ -34,6 +34,15 @@ container and the entry path **instead of** a source path, and the launch contra
 names two identities with no entry identity (§1a, §2); and the library rebuild is
 stated once as an index reset that keeps every identity (§5a).*
 
+*Revised in review round 5: the archive-container link keeps its shape, but its
+uniqueness is now the container-level rule `UNIQUE (archive_content_id) WHERE
+location_kind = 'ArchiveEntry'`, so one archive can hold at most one imported
+playable entry and `LaunchContent::ArchiveEntry { archive, content }` resolves to
+**0 or 1** row instead of being disambiguated by an entry-path tie-break (§1a, §2,
+§5a and Consequences); and the source-removal rule is stated once, deleting the
+removed source's `File` locations and explicitly **no** `ArchiveEntry` location
+(§5).*
+
 ## Context
 
 `DATA_MODEL.md` is the first document that fixes BitArchive's persisted shape.
@@ -152,6 +161,35 @@ name a fourth type, `ArchiveEntryId`, for the same thing, which made the two
 authoritative documents contradict each other. The architecture was corrected in
 the same change, because a superseded decision must not survive in a source-of-truth
 document (`AGENTS.md` §1).
+
+**The container half of that pair is unique, and that is what makes the contract
+relational** (review round 5). Review of PR #113 found that naming two identities
+was not yet enough: with `UNIQUE (archive_content_id, archive_entry_path) WHERE
+location_kind = 'ArchiveEntry'` the same content could still be located twice in one
+archive — `/foo.gba` and `/backup/foo.gba` — so `ArchiveEntry { archive, content }`
+would have matched two rows and `DATA_MODEL.md` §5.4 had to admit it and break the
+tie by smallest `archive_entry_path`.
+
+That tie-break was a workaround for a missing constraint, not a rule, and the
+product already forbids the state it handled: `PRODUCT.md` §10 supports a ZIP only
+when it holds exactly one unambiguously playable content, and an archive with
+several ROMs is ambiguous and not regularly imported. The model therefore states the
+product rule relationally instead:
+
+```text
+UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'
+      one ArchiveContainer → at most one imported playable ArchiveEntry location
+      therefore            → at most one row per (archive, content)
+```
+
+The narrower entry-path key is dropped rather than kept beside it: it is **weaker**
+than the container-level rule, because it accepts exactly the two rows the product
+rule forbids, so keeping it would have protected nothing. `archive_entry_path`
+remains ordinary technical information of the single entry row, and a resolver reads
+it instead of choosing among several. §20.3 tests 3 and 42 are the regression tests
+(one playable entry accepted, a second refused whatever its content or path), and the
+model checker fails if the container-level key is weakened again or an entry-path
+ordering reappears in the document.
 
 ### 2. Store what cannot be derived; derive what can
 
@@ -290,6 +328,16 @@ is the authority for "this build is installed".
 - **Missing content is a state, not a deletion.** An offline, permission-denied or
   unplugged source marks nothing missing at all, and a content with no present
   location keeps its identity, fingerprints and every referencing row.
+- **A source removal deletes exactly one kind of location** (review round 5).
+  Removing source X deletes the `content_locations` rows with
+  `location_kind = 'File' AND source_id = X` and **no** `ArchiveEntry` location,
+  because only a `File` location belongs to a source at all. An `ArchiveEntry`
+  location whose container loses its last `File` location is *kept* and becomes
+  unreachable / not found, never deleted — the same "state, not a deletion" rule as
+  for a loose file. `DATA_MODEL.md` §19.2 stated both halves and, in one revision,
+  contradicted itself by also declaring that a source removal MUST NOT delete a
+  `content_locations` row; that wording is gone, and the model checker now fails
+  when the two halves disagree again.
 - **Destructive reconciliation requires a scan that completed its whole target**
   (invariant 18). Eligibility is a stored fact on the scan run, not an inference
   from counters, because a run that skipped an unreadable subtree looks successful
@@ -407,6 +455,25 @@ in the document that a rebuild deletes `games`, `releases` or `contents`.
   key, and — because SQLite rejects it — never a foreign-key parent target either.
   This is what lets the schema-v1 Issue derive `CREATE TABLE` statements without
   re-deciding an identity.
+- **A constraint that protects an invariant is stated at the level the invariant
+  lives on.** The imported-playable-entry rule belongs to the *archive container*,
+  so its key is `UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'`
+  and not a key over `(archive_content_id, archive_entry_path)`. The narrower key
+  accepted exactly the two rows the product rule forbids, so the launch contract
+  could not be resolved without an entry-path tie-break. Round 5 removed the weaker
+  key and the tie-break together: one archive → at most one imported playable entry,
+  so `ArchiveEntry { archive, content }` matches 0 or 1 row by construction. The
+  `File` shape keeps `UNIQUE (source_id, relative_path)`, and a schema v1 therefore
+  has exactly two location keys:
+
+  ```text
+  UNIQUE (source_id, relative_path)   WHERE location_kind = 'File'
+  UNIQUE (archive_content_id)         WHERE location_kind = 'ArchiveEntry'
+  ```
+
+  The `EntryList` fingerprint key is deliberately *not* tightened the same way: an
+  archive may contain N physical entries and keep N `EntryList` rows for diagnosis,
+  because that rule is about the *import*, not about what the ZIP contains.
 - **Only the full reset destroys all BitArchive-owned database state**, and it
   destroys no external file.
 - **The local firmware SHA-256 and the trusted reference hashes are separate
@@ -440,6 +507,9 @@ in the document that a rebuild deletes `games`, `releases` or `contents`.
 | Map a language-neutral locale to a reserved tag (`'und'`) so one non-null key can cover both shapes | `und` **is** a valid BCP-47 tag meaning *undetermined*, so the token collides with a real fachliche value: a genuine `und` and "language-neutral" would become one key, and the read path would rewrite the real tag into `NULL`. Two exhaustive partial indexes (`IS NULL` / `IS NOT NULL`) express both shapes without inventing a value. |
 | Label the scope partial unique indexes of `core_selection_overrides`, `retroarch_setting_overrides` and `core_option_overrides` the "primary key" | SQLite has no partial primary key, so the table would have had **no** primary key at all, and schema v1 could not have created it. Those tables declare `row_id INTEGER PRIMARY KEY` for storage and keep their business uniqueness in the partial indexes. |
 | Give an `ArchiveEntry` location a `source_id`/`relative_path` as well, so it knows which copy of the archive was seen | Redundant with the container's own `File` location and able to contradict it: the entry is the same entry whichever copy of the archive is on disk, and the container may legitimately have several `File` locations. The entry names the container by identity and resolves the physical file through it. |
+| Key the `ArchiveEntry` location by `(archive_content_id, archive_entry_path)` | It is *weaker* than the product rule it was meant to protect: it accepts two playable entries for one archive — the same payload at two entry paths, or two different playable contents — so `ArchiveEntry { archive, content }` could match two rows. Round 5 replaced it with `UNIQUE (archive_content_id) WHERE location_kind = 'ArchiveEntry'`; the narrower key accepted exactly the rows `PRODUCT.md` §10 forbids and protected nothing. |
+| Break the tie among several `archive_entry_path` values by picking the smallest | Disambiguates a state the product does not have. `PRODUCT.md` §10 does not regularly import an archive with several playable entries, so the answer is "not imported", not "the smallest path wins". Relying on an ordering would also have hidden a missing constraint behind resolver behaviour. |
+| Reduce `EntryList` to one fingerprint per archive because one archive has at most one *playable* entry | Conflates what BitArchive imports with what the ZIP contains. A ZIP may hold N files and the `EntryList` fingerprints describe them for diagnosis; the cardinality rule is about imported playable `ArchiveEntry` locations, not about the fingerprint record (`DATA_MODEL.md` §6.3, §7.1). |
 | Leave `save_states.slot` nullable because it is "optional" | `slot` was a component of both slot keys, so a nullable `slot` let a re-scan stack duplicate rows for one physical file. Round 4 replaced those keys with the physical-file key, and `slot` is now an attribute rather than a key component (`DATA_MODEL.md` §15.1). |
 | Declare a natural-key unique constraint on `media_assets` | Three of its four columns (`locale`, `provider_id`, `content_digest`) are independently nullable, so the constraint constrained nothing for the common rows and could not be repaired by a single partial predicate. Slot uniqueness belongs in `media_asset_references`. |
 | Let persistent data hold the core build id as loose text instead of an anchor table | Four columns repeated across four tables, no place to record the pinned digest, and no way to express "same build" without comparing text. The anchor is one row and one 16-byte foreign key. |
@@ -462,7 +532,11 @@ in the document that a rebuild deletes `games`, `releases` or `contents`.
 - ADR 0001 (managed runtime acquisition), ADR 0002 (managed core acquisition),
   ADR 0003 (managed launch composition), ADR 0004 (launch readiness and
   preparation)
-- `DATA_MODEL.md` (this ADR records the cross-cutting decisions it applies)
+- `DATA_MODEL.md` (this ADR records the cross-cutting decisions it applies);
+  §3.5/§3.8 (the nullable-key rule and its audit), §5.2/§5.4 (the two location
+  keys and launch resolution), §6.3 (at most one imported playable entry per
+  archive), §7.1 (`EntryList` cardinality), §19.2 (source removal) and §20.3 (the
+  required integrity tests) are the sections these decisions are read from
 - Issue #33 (Data Model), Issue #34 (SQLite foundation and migration runner),
   Issue #35 (first persistence Issue, with the repository ports),
   Issue #41 (firmware index and managed component metadata),
