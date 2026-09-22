@@ -309,7 +309,7 @@ fn serve(
 ///
 /// # The order is the guarantee
 ///
-/// These three steps are separate functions *because* they have to run in this
+/// The steps below are separate functions *because* they have to run in this
 /// order, and the order is what Issue #34's refusal requires:
 ///
 /// ```text
