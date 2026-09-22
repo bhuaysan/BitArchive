@@ -33,6 +33,12 @@ use bitarchive_domain::runtime::{
 
 mod core_acquisition;
 
+/// The isolated-database helper and the database foundation's tests.
+///
+/// Visible to the crate so a later test module can open a temporary database the
+/// same way (#34), and not only the tests in this file.
+pub(crate) mod database;
+
 /// The executable path inside a modern macOS RetroArch build, as the official
 /// universal artifact lays it out.
 const EXECUTABLE_IN_BUNDLE: &str = "RetroArch.app/Contents/MacOS/RetroArch";
