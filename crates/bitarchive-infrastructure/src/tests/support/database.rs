@@ -15,7 +15,7 @@
 //! let temporary = TempDatabase::new();
 //! let database = temporary.open()?;
 //!
-//! assert_eq!(database.schema_version()?, SchemaVersion::NONE);
+//! assert_eq!(database.schema_version()?, SchemaVersion::new(1));
 //! ```
 //!
 //! Test-only: this module is compiled under `cfg(test)` and is `pub(crate)`, so

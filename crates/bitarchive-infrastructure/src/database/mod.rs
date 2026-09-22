@@ -28,15 +28,17 @@
 //! newer BitArchive version is therefore refused while it is still exactly as its
 //! own version left it (see `executor::open_connection`).
 //!
-//! # What this is not
+//! # What is here, and what is not
 //!
-//! There is no BitArchive table yet. Schema v1 — `games`, `releases`, `contents`,
-//! the library sources, the fingerprints, the search projection — is Issue #109
-//! and arrives as the first migration of [`migrations`]. Establishing the
-//! foundation without it is what keeps the meaning of a schema version
-//! unambiguous: an empty database is at version 0, and version 1 is schema v1.
+//! The schema is schema v1, and it arrives as the first migration of
+//! [`migrations`]: `games`, `releases`, `contents`, their locations and
+//! fingerprints, the library sources, the scan and scrape records, the management
+//! of cores and runtimes, the configuration and save-state tables, and the FTS5
+//! search projection. The meaning of a schema version stays unambiguous because
+//! the ledger is the only source of it: a database carrying the ledger and nothing
+//! else is at version 0 — the foundation's own state — and version 1 is schema v1.
 //!
-//! There are no repositories either. Later Issues add them on top of
+//! There are no repositories yet. Later Issues add them on top of
 //! [`Database`], which is why its execution methods take a closure over the
 //! connection rather than exposing one: a repository is written inside this
 //! crate, where SQLite is allowed to appear, and the layers above it are not.
