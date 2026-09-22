@@ -689,7 +689,7 @@ pub enum LaunchContent {
     File(ContentId),
     ArchiveEntry {
         archive: ContentId,
-        entry: ArchiveEntryId,
+        content: ContentId,
     },
     ExistingPlaylist {
         playlist: ContentId,
@@ -700,6 +700,34 @@ pub enum LaunchContent {
     },
 }
 ```
+
+Ein `ArchiveEntry` wird durch **zwei Identitäten** adressiert: den
+`ArchiveContainer`-Content und den spielbaren Entry-Content. Der technische
+Entry-Pfad ist **keine eigene Identität** und wird auch nicht im Launch-Vertrag
+dupliziert — er wird über die `ArchiveEntry`-Content-Location aufgelöst
+(`archive_content_id` + `content_id`, §14.1), deren Entry-Pfad durch einen
+UNIQUE-Index eindeutig ist.
+
+Damit gibt es kein `ArchiveEntryId`: ein Entry ist bereits vollständig durch
+(Container-Content, spielbarer Content, Entry-Pfad) bestimmt, und ein vierter
+Identitätstyp ohne fachlichen Inhalt wäre eine zweite Wahrheit.
+
+Die Auflösung erfolgt ausschließlich über Identitäten, nie über Pfadvergleiche:
+
+```text
+spielbarer ContentId + Container-ContentId
+        ↓ ArchiveEntry-Content-Location
+archive_entry_path
+        ↓ ArchiveContainer
+eine Present File-Location des Containers (deterministisch gewählt)
+        ↓
+Start: Archivpfad + Entry-Pfad
+```
+
+Hat der Container mehrere `Present` File-Locations, wird genau eine
+deterministisch gewählt; `DATA_MODEL.md` §5.4 ist die bindende Regel dafür.
+Gibt es keine, ist das ein Readiness-Ergebnis (`ContentUnavailable`,
+`SourceOffline`, §21) und kein Fallback auf einen anderen Pfad.
 
 ### 14.3 Multi-Disc
 

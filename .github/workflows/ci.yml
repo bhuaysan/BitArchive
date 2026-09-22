@@ -66,3 +66,12 @@ jobs:
 
       - name: Build workspace
         run: cargo build --workspace --locked
+
+      # DATA_MODEL.md is source of truth for schema v1 (Issue #33/#109). The
+      # checker derives every key from the document itself and fails on a
+      # foreign key whose parent is only a partial index, on a partial index
+      # presented as a primary key, on a locale sentinel, and on a section that
+      # contradicts the binding library-rebuild semantics. It runs here so the
+      # document cannot drift on a branch whose CI is green.
+      - name: Check data model
+        run: python3 tools/check_data_model.py

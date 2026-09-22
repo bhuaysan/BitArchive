@@ -1,625 +1,893 @@
 #!/usr/bin/env python3
-"""Structural checks over DATA_MODEL.md (extended after review round 2).
+"""Structural checks over DATA_MODEL.md and its interface to ARCHITECTURE.md.
 
-The previous FK check validated only the PARENT side, so a foreign key that named
-a column its own table does not own went unnoticed. This version checks the child
-side too, and the lifecycle/retention/rebuild rules added in this round.
+One source of truth for keys
+----------------------------
+This script keeps **no key list of its own**. Every primary key and every unique
+constraint is parsed out of `DATA_MODEL.md` (the per-table `**Domain identity.**` /
+`**Storage primary key.**` / `**Business uniqueness.**` declarations), and the
+summary table in §20.1 is parsed as well and compared against them. An earlier
+version carried a hand-maintained `PK` map next to a derived one; the two drifted,
+and the stale copy silently accepted a nullable key component.
+
+The parse distinguishes four things the model must not conflate:
+
+    storage PRIMARY KEY          exactly one per table, never partial
+    full UNIQUE key              the only kind a foreign key may reference
+    partial UNIQUE index         never a primary key, never an FK parent target
+    ordinary (non-unique) index  not a key at all
+
+Run: python3 tools/check_data_model.py
 """
-import re, sys
-
 import os
+import re
+import sys
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEXT = open(os.path.join(ROOT, 'DATA_MODEL.md'), encoding='utf-8').read()
-LINES = TEXT.split('\n')
+DATA_PATH = os.path.join(ROOT, 'DATA_MODEL.md')
+ARCH_PATH = os.path.join(ROOT, 'ARCHITECTURE.md')
+
+DATA = open(DATA_PATH, encoding='utf-8').read()
+ARCH = open(ARCH_PATH, encoding='utf-8').read()
+
 FAILS = []
-def fail(m):
-    FAILS.append(m); print("  XX " + m)
 
-# ------------------------------------------------------- table bodies and edges
-# Every table's markdown body, keyed by table name, plus the FK graph derived from
-# the **Foreign keys.** paragraphs. Built once because several checks need them.
-hpat_all = re.compile(r'^#{3,4}\s+(?:\d+\.\d+\s+)?`([a-z_]+)`|^\*\*`([a-z_]+)`\*\*')
-tb, _cur = {}, None
-for _line in TEXT.split('\n'):
-    _m = hpat_all.match(_line)
-    if _m:
-        _cur = _m.group(1) or _m.group(2)
-        tb.setdefault(_cur, [])
+
+def fail(msg):
+    FAILS.append(msg)
+    print("  XX " + msg)
+
+
+def ok(msg):
+    print("  OK " + msg)
+
+
+def banner(title):
+    print("\n" + "=" * 74)
+    print(title)
+    print("=" * 74)
+
+
+def norm(text):
+    """Whitespace-normalised text, for comparing a declaration with its summary."""
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# --------------------------------------------------------------------------- #
+# 1. The table list comes from the document's own §20.1 checklist.
+# --------------------------------------------------------------------------- #
+banner("1. §20.1 is the table list; every table declares its identity and keys")
+
+m = re.search(r'### 20\.1 Tables.*?\n(\|.*?)\n\n', DATA, re.S)
+if not m:
+    fail("§20.1 check-list table not found")
+    print("RESULT: cannot continue without §20.1")
+    sys.exit(1)
+
+CHECKLIST = {}
+for line in m.group(1).split('\n'):
+    if not line.startswith('|'):
         continue
-    if _cur is not None:
-        tb[_cur].append(_line)
-
-def parse_foreign_keys(block):
-    """child -> {parent: action} from a **Foreign keys.** paragraph.
-
-    A paragraph may pack several references onto one line:
-      `a → p.id` — `RESTRICT`. `b → q.id` — `SET NULL`. `c → r.id` — `CASCADE`.
-    so the paragraph is walked reference by reference, and each reference's action
-    is read from the text between it and the next reference. A reference with no
-    explicit action defaults to RESTRICT, which is SQLite's rule.
-    """
-    refs = list(re.finditer(r'`([^`]*?→[^`]*?)`', block, re.S))
-    out = {}
-    for i, rm in enumerate(refs):
-        par = re.search(r'→\s*([a-z_]+)[.(]', rm.group(1))
-        if not par:
-            continue
-        gap_end = refs[i + 1].start() if i + 1 < len(refs) else len(block)
-        gap = block[rm.end():gap_end]
-        act = ('CASCADE' if re.search(r'\bCASCADE\b', gap)
-               else 'SET NULL' if re.search(r'SET NULL', gap)
-               else 'RESTRICT')
-        out[par.group(1)] = act
-    return out
-
-
-edges = {}                                  # child -> {parent: action}
-for _n, _ls in tb.items():
-    _fk = re.search(r'\*\*Foreign keys\.\*\*(.*?)(?=\n\*\*[A-Z]|\Z)', '\n'.join(_ls), re.S)
-    if not _fk:
+    cells = [c.strip() for c in line.strip('|').split('|')]
+    if len(cells) != 6 or not cells[0].isdigit():
         continue
-    _e = parse_foreign_keys(_fk.group(1))
-    if _e:
-        edges[_n] = _e
+    name = re.match(r'`([a-z_]+)`', cells[1])
+    if not name:
+        continue
+    CHECKLIST[name.group(1)] = dict(
+        row=int(cells[0]), section=cells[2], domain=cells[3],
+        pk=cells[4], uniqueness=cells[5])
+print(f"  {len(CHECKLIST)} tables in §20.1")
+if len(CHECKLIST) < 37:
+    fail(f"§20.1 lists only {len(CHECKLIST)} tables")
 
-def declaration_chunk(rest):
-    """The text a key declaration covers: from just after its bold marker up to the
-    next bold marker or the end of the block. Leading whitespace is skipped first,
-    because a marker like `**Unique constraints.**` is commonly followed by a blank
-    line before its bullets."""
-    rest = rest.lstrip('\n')
-    stop = re.search(r'\n\*\*[A-Z]|\n\n[A-Z]|\n#{2,4} ', rest)
+# --------------------------------------------------------------------------- #
+# 2. Section boundaries, per table.
+# --------------------------------------------------------------------------- #
+TABLE_MARKER = re.compile(
+    r'^(?:#{3,4}\s+(?:\d+\.\d+\s+)?`([a-z_]+)`[^\n]*'   # ### 5.1 `library_sources`
+    r'|\*\*`([a-z_]+)`\*\*[^\n]*)$',                     # **`scrape_run_items`**
+    re.M)
+
+marks = []
+for mm in TABLE_MARKER.finditer(DATA):
+    name = mm.group(1) or mm.group(2)
+    if name in CHECKLIST:
+        marks.append((name, mm.start(), mm.end()))
+
+# A table may be marked more than once (a heading plus a bold re-reference);
+# the FIRST marker owns the section, and the section runs to the next marker of
+# any known table.
+first = {}
+for name, start, end in marks:
+    first.setdefault(name, (start, end))
+
+ordered = sorted(((v[0], k) for k, v in first.items()))
+sections = {}
+for i, (start, name) in enumerate(ordered):
+    end = ordered[i + 1][0] if i + 1 < len(ordered) else len(DATA)
+    sections[name] = DATA[start:end]
+
+missing_sections = [t for t in CHECKLIST if t not in sections]
+if missing_sections:
+    fail(f"no section found for: {sorted(missing_sections)}")
+
+# --------------------------------------------------------------------------- #
+# 3. Columns, from the standard four-column column tables.
+# --------------------------------------------------------------------------- #
+COL_ROW = re.compile(r'^\| `([a-z_]+)` \| ([^|]+?) \| (yes|no) \|', re.M)
+
+columns = {}      # table -> {column: (type, nullable)}
+for name, body in sections.items():
+    cols = {}
+    for cm in COL_ROW.finditer(body):
+        cols[cm.group(1)] = (cm.group(2).strip(), cm.group(3) == 'yes')
+    if cols:
+        columns[name] = cols
+print(f"  columns parsed for {len(columns)} tables")
+
+# --------------------------------------------------------------------------- #
+# 4. Declarations: identity, primary key, uniqueness.
+# --------------------------------------------------------------------------- #
+def decl_chunk(body, marker_end):
+    """Text a declaration covers: to the next bold marker, heading or paragraph."""
+    rest = body[marker_end:].lstrip('\n')
+    stop = re.search(r'\n\*\*[A-Z]|\n#{2,4} ', rest)
     return rest[:stop.start()] if stop else rest
 
 
-def is_unique_entry(chunk, match):
-    """True when this tuple is declared UNIQUE. Section wording is inconsistent:
-    some tables use `**Unique constraints.**`, others `**Unique constraints /
-    indexes.**` and then mark only the unique entries with the word UNIQUE. The
-    sentence containing the tuple decides."""
-    start = chunk.rfind('\n', 0, match.start()) + 1
-    end = chunk.find('\n', match.end())
-    sentence = chunk[start: end if end != -1 else len(chunk)]
-    return re.search(r'unique', sentence, re.I) is not None
+TUPLE = re.compile(r'\(([a-z_,\s]+)\)')
+UNIQUE_RE = re.compile(r'UNIQUE\s*\(([a-z_,\s]+)\)(.*?)(?=UNIQUE\s*\(|\Z)', re.S)
 
 
-def is_declared_key(chunk, match):
-    """True when the parenthesised tuple at `match` is DECLARED as a key.
+def predicate_of(tail):
+    """The WHERE predicate of a unique declaration, normalised.
 
-    Negated statements declare the absence of a constraint and are not keys:
-      "There is no unique constraint on (release_id, disc_index)"
-      "`(digest)` is **not** unique"
+    Handles inline backticked predicates, predicates broken across a line, and
+    the SQL-comment-aligned predicates of the §9.3/§9.4 code blocks.
     """
-    after = chunk[match.end(): match.end() + 90]
-    before = chunk[max(0, match.start() - 110): match.start()]
-    neg_after = re.search(r'[`\s]*(is\s+)?\*{0,2}not\*{0,2}\b', after, re.I)
-    neg_before = re.search(r'\b(no|not|never)\b', before, re.I)
-    return not (neg_after or neg_before)
+    cut = re.search(r'`|--|\n\s*\n', tail)
+    text = tail[:cut.start()] if cut else tail
+    text = text.split('\n- ')[0]
+    text = re.sub(r'\s+', ' ', text).strip().rstrip('.,;:')
+    w = re.search(r'WHERE\s+(.*)$', text, re.I)
+    return w.group(1).strip() if w else ''
 
 
-# ------------------------------------------------------------------ parse tables
-tables, cur = {}, None
-for line in LINES:
-    m = (re.match(r'^#{3,4}\s+\d+\.\d+\s+`([a-z_]+)`', line)
-         or re.match(r'^#{4}\s+`([a-z_]+)`', line)
-         or re.match(r'^\*\*`([a-z_]+)`\*\*\s*$', line))
-    if m:
-        cur = m.group(1); tables.setdefault(cur, set()); continue
-    if line.startswith('|') and cur:
-        cells = [c.strip() for c in line.strip('|').split('|')]
-        if len(cells) >= 2 and re.fullmatch(r'`[a-z_]+`', cells[0]):
-            tables[cur].add(cells[0].strip('`'))
+keys = {}         # table -> {'pk': tuple|'rowid', 'unique': [(tuple, predicate)]}
+domains = {}      # table -> declared domain identity text
+undeclared = []
 
-tables['release_regions'] = {'release_id', 'region'}
-tables['release_languages'] = {'release_id', 'language'}
-# `release_regions` and `release_languages` share one heading, so key tuples that
-# mention `language` belong to the latter and tuples that mention `region` to the
-# former. Route them before check 6 runs.
-KEY_OWNER_HINT = {'language': 'release_languages', 'region': 'release_regions'}
-tables.setdefault('search_index', {'game_id'})
-for name, sec, nxt in [('core_selection_overrides', r'### 12\.3', r'### 12\.4'),
-                       ('component_index_state', r'### 12\.7', r'^## 13\.'),
-                       ('schema_migrations', r'### 18\.1', r'### 18\.2')]:
-    blk = re.search(sec + r'.*?(?=' + nxt + r')', TEXT, re.S | re.M)
-    cols = set(re.findall(r'^\| `([a-z_]+)` \|', blk.group(0), re.M))
-    tables.setdefault(name, set()).update(cols)
+for name in sorted(CHECKLIST, key=lambda t: CHECKLIST[t]['row']):
+    body = sections.get(name, '')
+    cols = columns.get(name, {})
 
-PK = {
- 'systems': [('system_id',), ('catalog_key',)],
- 'library_sources': [('id',), ('location', 'platform_locator_kind')],
- 'games': [('id',)],
- 'releases': [('id',), ('id', 'game_id'), ('game_id', 'release_key')],
- 'contents': [('id',)],
- 'release_regions': [('release_id', 'region')],
- 'release_languages': [('release_id', 'language')],
- 'content_locations': [('content_id', 'location_kind', 'source_id', 'relative_path'),
-                       ('content_id', 'source_id', 'relative_path', 'archive_entry_path'),
-                       ('source_id', 'relative_path', 'archive_entry_path'),
-                       ('source_id', 'relative_path')],
- 'content_derivations': [('content_id', 'kind')],
- 'content_derivation_members': [('content_id', 'kind', 'source_content_id'),
-                                ('content_id', 'kind', 'member_index')],
- 'content_fingerprints': [('content_id', 'fingerprint_kind', 'algorithm'),
-                          ('content_id', 'fingerprint_kind', 'algorithm', 'entry_path'),
-                          ('algorithm', 'fingerprint_kind', 'digest', 'byte_size')],
- 'scan_runs': [('id',)], 'scan_run_issues': [('scan_run_id', 'issue_index')],
- 'metadata_fields': [('field_key',)], 'metadata_providers': [('provider_id',)],
- 'provider_values': [('provider_id', 'subject_kind', 'subject_id', 'field_key', 'locale', 'value_index')],
- 'manual_overrides': [('subject_kind', 'subject_id', 'field_key', 'locale')],
- 'scrape_runs': [('id',)], 'scrape_run_items': [('scrape_run_id', 'game_id')],
- 'media_assets': [('id',)],
- 'media_asset_references': [('subject_kind', 'subject_id', 'logical_key')],
- 'firmware_entries': [('relative_path',)], 'firmware_index_state': [('singleton',)],
- 'cores': [('core_id',), ('component_key',)],
- 'core_selection_overrides': [('scope_system_id',), ('scope_game_id',), ('scope_release_id',)],
- 'core_versions': [('core_version_id',), ('component_key', 'platform', 'build_id'),
-                   ('core_id', 'platform', 'build_id')],
- 'runtime_versions': [('runtime_version_id',), ('component_key', 'platform', 'version')],
- 'managed_components': [('component_class', 'component_key', 'platform', 'version')],
- 'component_index_state': [('singleton',)],
- 'retroarch_setting_overrides': [('setting_key',), ('scope_system_id', 'setting_key'),
-                                 ('scope_game_id', 'setting_key')],
- 'core_option_schemas': [('core_version_id',)],
- 'core_option_definitions': [('core_version_id', 'option_key')],
- 'core_option_overrides': [('core_version_id', 'option_key')],
- 'save_states': [('id',), ('release_id', 'core_id', 'core_version_id', 'slot'),
-                 ('release_id', 'core_id', 'core_version_label', 'slot'),
-                 ('file_relative_path',)],
- 'sessions': [('id',)], 'schema_migrations': [('version',)],
-}
+    dm = re.search(r'\*\*Domain identity\.\*\*(.*?)(?=\n\*\*[A-Z]|\Z)', body, re.S)
+    pm = re.search(r'\*\*Storage primary key\.\*\*(.*?)(?=\n\*\*[A-Z]|\Z)', body, re.S)
+    # `**Primary key.**` is the pre-round-4 marker; it must not come back.
+    legacy = re.search(r'\*\*Primary key\.\*\*(.*?)(?=\n\*\*[A-Z]|\Z)', body, re.S)
+    um = re.search(r'\*\*Business uniqueness\.\*\*(.*?)(?=\n\*\*[A-Z]|\Z)', body, re.S)
+
+    if legacy:
+        fail(f"{name}: uses the retired '**Primary key.**' marker: "
+             f"{norm(legacy.group(1))[:90]!r}")
+    if not dm:
+        fail(f"{name}: no '**Domain identity.**' declaration")
+    if not pm:
+        fail(f"{name}: no '**Storage primary key.**' declaration")
+        undeclared.append(name)
+        continue
+    if not um:
+        fail(f"{name}: no '**Business uniqueness.**' declaration")
+        undeclared.append(name)
+        continue
+
+    domains[name] = norm(dm.group(1))
+
+    # ---- primary key
+    chunk = decl_chunk(body, body.index('**Storage primary key.**') +
+                       len('**Storage primary key.**'))
+    tuples = [norm(t.group(1)) for t in TUPLE.finditer(chunk)]
+    valid = [t for t in tuples if all(c.strip() in cols for c in t.split(','))]
+    if valid:
+        if tuples and tuples[0] != valid[0]:
+            fail(f"{name}: primary key names a column the table does not declare: "
+                 f"({tuples[0]})")
+        pk = tuple(c.strip() for c in valid[0].split(','))
+    elif 'rowid' in chunk:
+        pk = 'rowid'                      # FTS5 implicit rowid (§17.4)
+    else:
+        fail(f"{name}: primary key is not a column tuple and is not FTS5 rowid: "
+             f"{norm(chunk)[:90]!r}")
+        undeclared.append(name)
+        continue
+    sentence = re.split(r'(?<=[.;])\s', norm(chunk))[0]
+    if 'partial' in sentence.lower():
+        fail(f"{name}: the primary key declaration mentions 'partial'; a partial "
+             f"index is never a primary key (§3.9)")
+    keys[name] = dict(pk=pk, unique=[])
+
+    # ---- uniqueness
+    ubody = decl_chunk(body, body.index('**Business uniqueness.**') +
+                       len('**Business uniqueness.**'))
+    for umatch in UNIQUE_RE.finditer(ubody):
+        ucols = tuple(c.strip() for c in norm(umatch.group(1)).split(','))
+        pred = predicate_of(umatch.group(2))
+        keys[name]['unique'].append((ucols, pred))
+
+declared = [t for t in CHECKLIST if t not in undeclared]
+print(f"  {len(declared)} tables declare domain identity, primary key and uniqueness")
+
+# --------------------------------------------------------------------------- #
+# 5. Every declared key column exists, and every table has exactly one PK.
+# --------------------------------------------------------------------------- #
+banner("2. Key columns exist; exactly one storage primary key per table")
+
+for name in sorted(declared, key=lambda t: CHECKLIST[t]['row']):
+    cols = columns.get(name, {})
+    if not cols:
+        if keys[name]['pk'] == 'rowid':
+            print(f"  note: {name} is an FTS5 projection (rowid key, no column table)")
+        else:
+            fail(f"{name}: no column table found, so its keys cannot be verified")
+        continue
+    pk = keys[name]['pk']
+    if pk != 'rowid':
+        for c in pk:
+            if c not in cols:
+                fail(f"{name}: primary key column {c!r} is not a declared column")
+    for ucols, _pred in keys[name]['unique']:
+        for c in ucols:
+            if c not in cols:
+                fail(f"{name}: unique key column {c!r} is not a declared column")
+
+row_id_tables = [t for t in declared if keys[t]['pk'] == ('row_id',)]
+print(f"  row_id storage key: {', '.join(sorted(row_id_tables))}")
+
+# --------------------------------------------------------------------------- #
+# 6. §20.1 must agree with the per-table declarations.
+# --------------------------------------------------------------------------- #
+banner("3. §20.1 agrees with every per-table declaration")
+
+for name in sorted(declared, key=lambda t: CHECKLIST[t]['row']):
+    row = CHECKLIST[name]
+    pk_txt = norm(row['pk'])
+    pk = keys[name]['pk']
+    pk_plain = norm(pk_txt.replace('`', ''))
+    if pk == 'rowid':
+        if 'rowid' not in pk_plain:
+            fail(f"§20.1 row {row['row']} ({name}): storage key does not name rowid")
+    else:
+        expected = '(' + ', '.join(pk) + ')'
+        if pk_plain != expected and not pk_plain.startswith(expected + ' '):
+            fail(f"§20.1 row {row['row']} ({name}): storage key {pk_plain!r} does "
+                 f"not name the declared primary key {expected!r}")
+    section_domain = domains.get(name, '')
+    if norm(row['domain']) == 'none':
+        if not section_domain.lower().startswith('none'):
+            fail(f"§20.1 row {row['row']} ({name}): §20.1 says domain identity 'none' "
+                 f"but the section declares {section_domain[:50]!r}")
+    elif norm(row['domain']) not in section_domain:
+        fail(f"§20.1 row {row['row']} ({name}): §20.1 names domain identity "
+             f"{norm(row['domain'])!r}, which the section does not declare "
+             f"({section_domain[:50]!r})")
+    want = {(u, p) for u, p in keys[name]['unique']}
+    have = set()
+    for umatch in UNIQUE_RE.finditer(row['uniqueness']):
+        ucols = tuple(c.strip() for c in norm(umatch.group(1)).split(','))
+        have.add((ucols, predicate_of(umatch.group(2))))
+    if want != have:
+        fail(f"§20.1 row {row['row']} ({name}): business uniqueness differs from "
+             f"the section.\n      section: {sorted(want)}\n      §20.1   : {sorted(have)}")
+print("  storage keys and unique rules compared row by row")
+
+# §20.1 row 37 is the FTS5 projection, whose section is §17.4.
+if 'rowid' not in norm(CHECKLIST['search_index']['pk']):
+    fail("§20.1: search_index has no rowid storage key")
+
+# --------------------------------------------------------------------------- #
+# 7. No key component is nullable without a predicate that pins it.
+# --------------------------------------------------------------------------- #
+banner("4. No nullable key component without a pinning predicate (§3.5, §3.8)")
+
+for name in sorted(declared, key=lambda t: CHECKLIST[t]['row']):
+    cols = columns.get(name, {})
+    body = sections[name]
+    pk = keys[name]['pk']
+    if pk != 'rowid':
+        nullable = [c for c in pk if cols.get(c, (None, False))[1]]
+        if nullable:
+            fail(f"{name}: primary key {pk} contains nullable column(s) {nullable}; "
+                 f"a nullable key component disables the key in SQLite")
+    for ucols, pred in keys[name]['unique']:
+        nullable = [c for c in ucols if cols.get(c, (None, False))[1]]
+        if not nullable:
+            continue
+        if not pred:
+            fail(f"{name}: unique key {ucols} contains nullable column(s) {nullable} "
+                 f"and has no partial predicate")
+            continue
+        for c in nullable:
+            pinned = (f"{c} IS NOT NULL" in body) or (c in pred and 'IS ' in pred.upper())
+            if not pinned:
+                fail(f"{name}: unique key {ucols} has predicate {pred!r}, which does "
+                     f"not prove {c} is non-NULL for the rows it covers")
+        print(f"  {name:28} {str(ucols):58} pinned by {pred!r}")
+
+audit = re.search(r'### 3\.8 .*?(?=\n---\n)', DATA, re.S)
+if not audit:
+    fail("§3.8 (nullable-key audit) is missing")
+else:
+    absent = [t for t in declared if f"`{t}`" not in audit.group(0)]
+    if absent:
+        fail(f"§3.8 does not classify: {sorted(absent)}")
+    else:
+        print(f"  §3.8 classifies all {len(declared)} tables")
+if '### 3.9 One real primary key per table' not in DATA:
+    fail("§3.9 (one real primary key per table) is missing")
+
+# --------------------------------------------------------------------------- #
+# 8. Foreign keys: child side, parent side, and parent-key eligibility.
+# --------------------------------------------------------------------------- #
+banner("5. Foreign keys: both sides, and parent keys SQLite will accept")
+
+HEADINGS = re.compile(
+    r'^(?:#{3,4}\s+(?:\d+\.\d+\s+)?`([a-z_]+)`[^\n]*'
+    r'|\*\*`([a-z_]+)`\*\*[^\n]*)$', re.M)
+
+
+def table_at(pos):
+    owners = [mm for mm in HEADINGS.finditer(DATA[:pos])
+              if (mm.group(1) or mm.group(2)) in CHECKLIST]
+    if not owners:
+        return None
+    return owners[-1].group(1) or owners[-1].group(2)
+
+
+COMPOSITE = (r'`\(([a-z_,\s]+)\)\s*\u2192\s*([a-z_]+)\(([a-z_,\s]+)\)`\s*[\u2014-]\s*'
+             r'`?([A-Z][A-Z ]*?)`?(?=[,.;\s]|$)')
+SIMPLE = r'`([a-z_]+)\s*\u2192\s*([a-z_]+)\.([a-z_]+)`'
+# A single child column referencing a composite parent key:
+#   `content_id -> content_fingerprints(algorithm, digest)`
+TO_COMPOSITE = r'`([a-z_]+)\s*\u2192\s*([a-z_]+)\(([a-z_,\s]+)\)`'
+
+ALL_REFS = [mm for mm in re.finditer(
+    TO_COMPOSITE + '|' + SIMPLE + '|' + COMPOSITE, DATA)]
+
+
+def action_after(pos):
+    """The delete behaviour of the reference ending at `pos`: the first action
+    token before the next reference, or RESTRICT (SQLite's default)."""
+    end = min([mm.start() for mm in ALL_REFS if mm.start() >= pos] or [pos + 60])
+    context = DATA[pos:end]
+    hits = [(context.index(a), a) for a in ('CASCADE', 'SET NULL', 'RESTRICT')
+            if a in context]
+    return min(hits)[1] if hits else 'RESTRICT'
+
+
+fks, spans = [], []
+for fm in re.finditer(TO_COMPOSITE, DATA):
+    if any(a <= fm.start() < b for a, b in spans):
+        continue
+    spans.append((fm.start(), fm.end()))
+    fks.append(dict(child=table_at(fm.start()), child_cols=[fm.group(1)],
+                    parent=fm.group(2),
+                    parent_cols=[c.strip() for c in fm.group(3).split(',')],
+                    action=action_after(fm.end()),
+                    line=DATA[:fm.start()].count('\n') + 1))
+for fm in re.finditer(COMPOSITE, DATA):
+    spans.append((fm.start(), fm.end()))
+    fks.append(dict(child=table_at(fm.start()),
+                    child_cols=[c.strip() for c in fm.group(1).split(',')],
+                    parent=fm.group(2),
+                    parent_cols=[c.strip() for c in fm.group(3).split(',')],
+                    action=fm.group(4).strip(),
+                    line=DATA[:fm.start()].count('\n') + 1))
+for fm in re.finditer(SIMPLE, DATA):
+    if any(a <= fm.start() < b for a, b in spans):
+        continue
+    action = action_after(fm.end())
+    fks.append(dict(child=table_at(fm.start()), child_cols=[fm.group(1)],
+                    parent=fm.group(2), parent_cols=[fm.group(3)],
+                    action=action,
+                    line=DATA[:fm.start()].count('\n') + 1))
+
+eligible_targets = {}
+for name in declared:
+    pk = keys[name]['pk']
+    targets = set()
+    if pk != 'rowid':
+        targets.add(pk)
+    for ucols, pred in keys[name]['unique']:
+        if not pred:
+            targets.add(ucols)
+    eligible_targets[name] = targets
+
+partial_only = {}
+for name in declared:
+    partial = {ucols for ucols, pred in keys[name]['unique'] if pred}
+    full = eligible_targets[name]
+    partial_only[name] = partial - full
+
+valid_fks = 0
+for fk in fks:
+    problems = []
+    child, parent = fk['child'], fk['parent']
+    if child not in CHECKLIST:
+        problems.append(f"child table {child!r} is not a §20.1 table")
+    else:
+        ccols = columns.get(child, {})
+        for c in fk['child_cols']:
+            if c not in ccols:
+                problems.append(f"child column {child}.{c} is not declared")
+    if parent not in CHECKLIST:
+        problems.append(f"parent table {parent!r} is not a §20.1 table")
+    else:
+        pcols = columns.get(parent, {})
+        for c in fk['parent_cols']:
+            if c not in pcols:
+                problems.append(f"parent column {parent}.{c} is not declared")
+        want = tuple(fk['parent_cols'])
+        if want not in eligible_targets[parent]:
+            if want in partial_only[parent]:
+                problems.append(
+                    f"parent key {want} of {parent} is a PARTIAL unique index; "
+                    f"SQLite rejects it as a foreign-key target (foreign key mismatch)")
+            else:
+                problems.append(
+                    f"parent key {want} is neither the primary key nor a full "
+                    f"UNIQUE key of {parent} (has {sorted(eligible_targets[parent])})")
+        # SET NULL requires nullable child columns.
+        if fk['action'] == 'SET NULL':
+            ccols = columns.get(child, {})
+            for c in fk['child_cols']:
+                if c in ccols and not ccols[c][1]:
+                    problems.append(
+                        f"delete behaviour SET NULL on {child}.{c}, which is NOT NULL")
+    if problems:
+        for p in problems:
+            fail(f"L{fk['line']}: " + p)
+    else:
+        valid_fks += 1
+print(f"  foreign keys parsed: {len(fks)}   valid: {valid_fks}")
+if not fks:
+    fail("no foreign keys parsed at all; the parser is probably broken")
+
+# --------------------------------------------------------------------------- #
+# 9. Locale: no sentinel, and the two exhaustive partial indexes.
+# --------------------------------------------------------------------------- #
+banner("6. A locale is never encoded by a sentinel (§3.5, §9.3, §9.4)")
+
+if 'locale_key' in DATA:
+    fail("DATA_MODEL.md still mentions `locale_key`, the removed storage sentinel")
+else:
+    ok("no `locale_key` column anywhere")
+if 'COALESCE(locale' in DATA:
+    fail("DATA_MODEL.md still maps NULL to a tag with COALESCE(locale, …)")
+else:
+    ok("no COALESCE(locale, …) normalisation")
+
+for t, pk in (('provider_values', '(provider_id, subject_kind, subject_id, field_key, value_index)'),
+              ('manual_overrides', '(subject_kind, subject_id, field_key)')):
+    rules = {tuple(u): p for u, p in keys.get(t, {}).get('unique', [])}
+    want_null = [u for u, p in rules.items() if p == 'locale IS NULL']
+    want_tag = [u for u, p in rules.items() if p == 'locale IS NOT NULL']
+    if not want_null or not want_tag:
+        fail(f"{t}: expected an exhaustive pair of partial unique indexes "
+             f"(locale IS NULL / locale IS NOT NULL), found {sorted(rules.items())}")
+    else:
+        ok(f"{t}: locale split into IS NULL / IS NOT NULL partial indexes")
+    if 'locale' not in columns.get(t, {}):
+        fail(f"{t}: no `locale` column")
+    elif columns[t]['locale'][1] is False:
+        fail(f"{t}: `locale` is NOT NULL, so language-neutral rows are unrepresentable")
+
+if "und" in DATA and not re.search(r'never.*`und`|`und`.*never', DATA, re.I):
+    fail("DATA_MODEL.md mentions `und` without stating that it is a real tag, "
+         "not a marker")
+else:
+    ok("`und` is documented as a real BCP-47 tag")
+if 'canonical case' not in DATA or 'COLLATE NOCASE' not in DATA:
+    fail("the locale canonicalisation rule (canonical case + COLLATE NOCASE) is absent")
+else:
+    ok("locale canonicalisation is stated and enforced by the indexes")
+
+# --------------------------------------------------------------------------- #
+# 10. content_locations: both variants pinned in both directions.
+# --------------------------------------------------------------------------- #
+banner("7. content_locations matches ContentLocation (both variants, both ways)")
+
+loc = sections.get('content_locations', '')
+need = [
+    ("File requires source_id", "WHEN 'File'         THEN source_id IS NOT NULL"),
+    ("File requires relative_path", "AND relative_path IS NOT NULL"),
+    ("File forbids archive_content_id", "AND archive_content_id IS NULL"),
+    ("File forbids archive_entry_path", "AND archive_entry_path IS NULL"),
+    ("ArchiveEntry forbids source_id", "WHEN 'ArchiveEntry' THEN source_id IS NULL"),
+    ("ArchiveEntry forbids relative_path", "AND relative_path IS NULL"),
+    ("ArchiveEntry requires archive_content_id", "AND archive_content_id IS NOT NULL"),
+    ("ArchiveEntry requires archive_entry_path", "AND archive_entry_path IS NOT NULL"),
+]
+for label, needle in need:
+    if needle not in loc:
+        fail(f"content_locations CASE check: missing {label}")
+    else:
+        print(f"  OK {label}")
+if 'archive_content_id' in columns.get('contents', {}):
+    fail("contents declares archive_content_id; the container link belongs to the "
+         "location (§5.2)")
+else:
+    ok("contents owns no archive_content_id")
+if 'ContentLocation' not in DATA:
+    fail("§5.2 does not reference ARCHITECTURE.md's ContentLocation")
+
+# --------------------------------------------------------------------------- #
+# 11. Archive entries and the architecture agree.
+# --------------------------------------------------------------------------- #
+banner("8. ArchiveEntry: DATA_MODEL.md and ARCHITECTURE.md say the same thing")
+
+lc = re.search(r'### 14\.2 LaunchContent(.*?)(?=\n### 14\.3)', ARCH, re.S)
+if not lc:
+    fail("ARCHITECTURE.md §14.2 LaunchContent not found")
+else:
+    block = lc.group(1)
+    for needle in ('archive: ContentId', 'content: ContentId'):
+        if needle not in block:
+            fail(f"ARCHITECTURE.md §14.2 LaunchContent lacks {needle!r}")
+        else:
+            ok(f"ARCHITECTURE.md §14.2: {needle}")
+    if 'ExistingPlaylist' not in block or 'ManagedPlaylist' not in block:
+        fail("ARCHITECTURE.md §14.2 lost a LaunchContent variant")
+
+for line_no, line in enumerate(ARCH.split('\n'), 1):
+    if 'ArchiveEntryId' in line and not re.search(
+            r'\b(kein|keine|no|not|never|without)\b', line, re.I):
+        fail(f"ARCHITECTURE.md L{line_no}: states an ArchiveEntryId identity that "
+             f"DATA_MODEL.md does not have: {line.strip()[:90]!r}")
+print("  no un-negated ArchiveEntryId in ARCHITECTURE.md")
+for needle in ('no `ArchiveEntryId`', 'archive_entry_path'):
+    if needle not in DATA:
+        fail(f"DATA_MODEL.md does not state {needle!r}")
+
+# --------------------------------------------------------------------------- #
+# 12. Library rebuild: one meaning, everywhere.
+# --------------------------------------------------------------------------- #
+banner("9. Library rebuild means the same thing in every section (§19.2, §19.3)")
+
+DESTRUCTIVE = [
+    (r'forget everything', "calls a library rebuild 'forget everything'"),
+    (r'rebuild[^.]{0,80}\b(?:deletes?|clears?|removes?)\b[^.]{0,80}'
+     r'\b(?:games|releases|contents)\b',
+     "says a library rebuild deletes games/releases/contents"),
+    (r'\b(?:games|releases|contents)\b[^.]{0,60}\b(?:are|is)\s+'
+     r'(?:deleted|cleared|removed|reset)\b[^.]{0,40}rebuild',
+     "says games/releases/contents are deleted by a rebuild"),
+    (r'resets? the index\s*\u2014\s*contents', "lists contents as reset by a rebuild"),
+]
+# A sentence may mention a rebuild and an identity table and still be correct: it
+# may be stating what the rebuild KEEPS ("clears the index but keeps the
+# content"), or stating the rule that forbids the wrong wording. Only an
+# unqualified destructive claim is a defect.
+ALLOWED_IN_SENTENCE = (r'\b(?:keeps?|kept|preserv\w*|retains?|retained|survives?|'
+                       r'stays?|remains?|stable)\b'
+                       r'|\b(?:not|never|no|nothing|neither|without|cannot)\b')
+SCAN_SECTIONS = [sections.get(t, '') for t in
+                 ('library_sources', 'content_locations', 'games', 'releases',
+                  'contents', 'content_fingerprints', 'media_assets',
+                  'provider_values', 'manual_overrides')]
+rebuild_block = re.search(r'#### Library rebuild(.*?)#### Full reset', DATA, re.S)
+if not rebuild_block:
+    fail("§19.3 'Library rebuild' block not found")
+else:
+    for name, start in [('§19.2 section', DATA.index('### 19.2 ')),
+                        ('§19.7 section', DATA.index('### 19.7 '))]:
+        end = DATA.index('###', start + 5)
+        SCAN_SECTIONS.append(DATA[start:end])
+    for section in SCAN_SECTIONS:
+        for sentence in re.split(r'(?<=[.!?])\s+', section):
+            flat = re.sub(r'\s+', ' ', sentence)
+            for pattern, why in DESTRUCTIVE:
+                hit = re.search(pattern, flat, re.I | re.S)
+                if not hit:
+                    continue
+                if re.search(ALLOWED_IN_SENTENCE, flat, re.I):
+                    continue        # a keep-statement or the rule that forbids it
+                fail(f"{why}: …{flat[max(0, hit.start() - 60):hit.end() + 60]}…")
+    if 'forget' in rebuild_block.group(1):
+        fail("§19.3 itself mentions forgetting")
+
+keep_table = rebuild_block.group(1)
+for t in ('games', 'releases', 'contents'):
+    row = re.search(r'\| `games`, `releases`, `contents` \|(.*?)\|', keep_table)
+    if not row:
+        fail(f"§19.3 rebuild table has no row for {t}")
+    elif '**kept**' not in row.group(1):
+        fail(f"§19.3 rebuild table does not keep {t}")
+if '**kept**' in keep_table:
+    ok("§19.3 keeps every identity row")
+if 'not a "forget everything"\noperation' not in DATA and \
+   'not a "forget everything"' not in DATA:
+    fail("§19.2 does not state that a rebuild is not a 'forget everything' operation")
+else:
+    ok("§19.2 states the rebuild semantics from §19.3")
+
+# Source removal after the ArchiveEntry fix.
+s192 = DATA[DATA.index('### 19.2 '):DATA.index('### 19.3 ')]
+for needle, label in (("location_kind = 'File' AND source_id = X",
+                       "source removal deletes File locations only"),
+                      ('MUST NOT destroy an `ArchiveEntry`', 'entry survives'),
+                      ('location_kind = \'ArchiveEntry\'',
+                       "source removal leaves ArchiveEntry locations alone")):
+    if needle not in s192:
+        fail(f"§19.2: missing rule — {label}")
+    else:
+        ok(f"§19.2: {label}")
+
+# --------------------------------------------------------------------------- #
+# 13. Save states: technical addressing, no sentinel.
+# --------------------------------------------------------------------------- #
+banner("10. Save states: technical addressing without a sentinel (§15.1)")
+
+ss = sections.get('save_states', '')
+
+
+def only_in_removed_context(body, needle):
+    """True when every occurrence of `needle` sits in a sentence that says the
+    construct was removed or does not exist."""
+    for sentence in re.split(r'(?<=[.!?:])\s+', re.sub(r'\s+', ' ', body)):
+        if needle not in sentence:
+            continue
+        if not re.search(r'\b(?:removed|gone|no longer|absent|deleted|not|never|'
+                         r'no|without|earlier revision|previous revision)\b',
+                         sentence, re.I):
+            return False
+    return True
+
+
+if 'empty-string sentinel' in ss and not only_in_removed_context(
+        ss, 'empty-string sentinel'):
+    fail("§15.1 reintroduced an empty-string slot sentinel")
+elif "slot = ''" in ss:
+    fail("§15.1 assigns meaning to an empty-string slot value")
+else:
+    ok("no empty-string slot sentinel")
+if 'state_name' in ss and not only_in_removed_context(ss, 'state_name'):
+    fail("§15.1 declares `state_name`, for which no technical RetroArch property "
+         "is established")
+else:
+    ok("no `state_name` column")
+slot_row = re.search(r'^\| `slot` \| ([^|]+?) \| (yes|no) \|', ss, re.M)
+if not slot_row:
+    fail("§15.1 declares no `slot` column")
+else:
+    if 'INTEGER' not in slot_row.group(1):
+        fail(f"§15.1 slot is {slot_row.group(1).strip()}; a RetroArch slot is a "
+             f"number, not a name")
+    else:
+        ok(f"slot is {slot_row.group(1).strip()}, Null={slot_row.group(2)}")
+    if slot_row.group(2) == 'no':
+        fail("§15.1 slot is NOT NULL, which forces a sentinel for the state that "
+             "is not addressed by a numbered slot")
+if 'slot' in ' '.join(keys.get('save_states', {}).get('pk', ())) or \
+   any('slot' in u for u, _ in keys.get('save_states', {}).get('unique', [])):
+    fail("§15.1 uses `slot` as a key component again")
+else:
+    ok("slot is an attribute, not a key component")
+phys = [u for u, p in keys.get('save_states', {}).get('unique', [])
+        if u == ('file_relative_path',)]
+if not phys:
+    fail("§15.1 does not declare UNIQUE (file_relative_path), so discovery is not "
+         "idempotent")
+else:
+    ok("UNIQUE (file_relative_path) makes discovery idempotent")
+
+# --------------------------------------------------------------------------- #
+# 14. Polymorphic references have a write-path rule and a test.
+# --------------------------------------------------------------------------- #
+banner("11. Polymorphic subject references are defined, not implied")
+for t in ('provider_values', 'manual_overrides', 'media_asset_references'):
+    body = sections.get(t, '')
+    checks = {
+        'states the reference is polymorphic': 'polymorphic' in body.lower(),
+        'names the subject kinds': 'Game' in body and 'Release' in body,
+        'states it cannot be a foreign key':
+            'not a foreign key' in body.lower() or
+            'cannot be a declarative foreign key' in body.lower(),
+        'names the write path': 'write path' in body.lower(),
+        'names the integrity test': '§20.3' in body,
+    }
+    for label, present in checks.items():
+        if not present:
+            fail(f"{t}: polymorphic reference — does not {label}")
+    if all(checks.values()):
+        print(f"  OK {t}: polymorphic, kind-bounded, write-path rule + test named")
+
+# --------------------------------------------------------------------------- #
+# 15. Derived-data checks that survived the rewrite.
+# --------------------------------------------------------------------------- #
+banner("12. Rebuildable ownership, lifetimes and run retention")
+
 REBUILDABLE = {'managed_components', 'component_index_state', 'firmware_entries',
                'firmware_index_state', 'search_index', 'content_derivations',
                'content_derivation_members'}
-
-def heading_before(pos):
-    hs = list(re.finditer(r'^#{3,4}\s+\d+\.\d+\s+`([a-z_]+)`|^#{4}\s+`([a-z_]+)`|^\*\*`([a-z_]+)`\*\*\s*$',
-                          TEXT[:pos], re.M))
-    if not hs: return None
-    return next((g for g in hs[-1].groups() if g), None)
-
-# ------------------------------------------------------------------ parse FKs
-# Declared forms:
-#   - `child -> parent(col)` — ACTION
-#   - `(child_a, child_b) -> parent(a, b)` — ACTION
-# Prose forms such as `content_id -> contents.id` describe a value, not a table
-# owning the column, and are deliberately NOT parsed as declarations.
-COMPOSITE = r'`\(([a-z_,\s]+)\)\s*→\s*([a-z_]+)\(([a-z_,\s]+)\)`\s*[—-]\s*`?([A-Z][A-Z ]*?)`?(?=[,.;\s]|$)'
-SIMPLE    = r'`([a-z_]+)\s*→\s*([a-z_]+)\.([a-z_]+)`'
-fks, spans = [], []
-for m in re.finditer(COMPOSITE, TEXT):
-    spans.append((m.start(), m.end()))
-    fks.append(dict(child=heading_before(m.start()),
-                    child_cols=[c.strip() for c in m.group(1).split(',')],
-                    parent=m.group(2),
-                    parent_cols=[c.strip() for c in m.group(3).split(',')],
-                    line=TEXT[:m.start()].count('\n') + 1))
-for m in re.finditer(SIMPLE, TEXT):
-    if any(a <= m.start() < b for a, b in spans): continue
-    fks.append(dict(child=heading_before(m.start()), child_cols=[m.group(1)],
-                    parent=m.group(2), parent_cols=[m.group(3)],
-                    line=TEXT[:m.start()].count('\n') + 1))
-
-print("=" * 74)
-print("1-5. FK: child table, child columns, parent table, parent columns, parent key")
-print("=" * 74)
-valid = 0
-for fk in fks:
-    ok = True
-    if fk['child'] not in tables:
-        fail(f"L{fk['line']}: child table '{fk['child']}' unknown"); ok = False
-    else:
-        for c in fk['child_cols']:
-            if c not in tables[fk['child']]:
-                fail(f"L{fk['line']}: child column '{fk['child']}.{c}' is NOT a column of "
-                     f"{fk['child']} (has {len(tables[fk['child']])} cols)"); ok = False
-    if fk['parent'] not in tables:
-        fail(f"L{fk['line']}: parent table '{fk['parent']}' unknown"); ok = False
-    else:
-        for c in fk['parent_cols']:
-            if c not in tables[fk['parent']]:
-                fail(f"L{fk['line']}: parent column '{fk['parent']}.{c}' is NOT a column"); ok = False
-    if ok:
-        want = set(fk['parent_cols'])
-        if not any(set(k) == want for k in PK.get(fk['parent'], [])):
-            fail(f"L{fk['line']}: parent key {tuple(fk['parent_cols'])} is not PK/UNIQUE of "
-                 f"{fk['parent']}"); ok = False
-    if ok: valid += 1
-print(f"  foreign keys parsed: {len(fks)}   valid: {valid}")
-
-print("\n" + "=" * 74); print("6. PK/UNIQUE key columns all exist"); print("=" * 74)
-# `declared_keys` is defined in section 19 below; build the same map here from the
-# document so this check needs no hand-maintained list.
-_keys_here = {}
-for _t, _ls in tb.items():
-    _body = '\n'.join(_ls)
-    for _marker in (r'\*\*Primary key\.\*\*', r'\*\*Unique constraints[^*]*\*\*'):
-        for _mm in re.finditer(_marker, _body):
-            _chunk = declaration_chunk(_body[_mm.end():])
-            _is_pk = 'Primary key' in _mm.group(0)
-            _is_unique_block = 'Unique constraints' in _mm.group(0)
-            for _tm in re.finditer(r'\(([^)]*)\)', _chunk):
-                _cols = [c.strip() for c in _tm.group(1).split(',')]
-                if not _cols or not all(re.fullmatch(r'[a-z_]+', c) for c in _cols):
-                    continue
-                if (_is_pk or _is_unique_block or is_unique_entry(_chunk, _tm)) and is_declared_key(_chunk, _tm):
-                    _keys_here.setdefault(_t, set()).add(tuple(_cols))
-_checked = 0
-for _t, _keys in list(_keys_here.items()):
-    for _k in list(_keys):
-        for _col, _owner in KEY_OWNER_HINT.items():
-            if _col in _k and _owner != _t:
-                _keys_here.setdefault(_owner, set()).add(_k)
-                _keys.discard(_k)
-for _t, _keys in _keys_here.items():
-    if _t not in tables:
-        continue
-    for _k in sorted(_keys):
-        for _c in _k:
-            if _c not in tables[_t]:
-                fail(f"{_t}: key column '{_c}' (in {_k}) is not a defined column")
-            else:
-                _checked += 1
-print(f"  {_checked} key columns verified against the declared columns")
-
-print("\n" + "=" * 74); print("8. No persistent table references a rebuildable table"); print("=" * 74)
-bad = [f for f in fks if f['parent'] in REBUILDABLE]
-for f in bad: fail(f"L{f['line']}: {f['child']} -> rebuildable {f['parent']}")
+bad = [fk for fk in fks if fk['parent'] in REBUILDABLE]
+for fk in bad:
+    fail(f"L{fk['line']}: {fk['child']} references rebuildable {fk['parent']}")
 print(f"  rebuildable: {sorted(REBUILDABLE)}")
 print("  inbound references: none" if not bad else "")
 
-print("\n" + "=" * 74); print("10. One lifetime per declared structure"); print("=" * 74)
 LIFE = ['Persistent', 'Rebuildable', 'SessionScoped', 'Temporary']
-head = None
-for i, line in enumerate(LINES, 1):
-    h = re.match(r'^#{3,4}\s+(.*)$', line)
-    if h: head = h.group(1)
-    if '**Lifecycle.**' in line:
-        frag = line.split('**Lifecycle.**', 1)[1].strip()
-        frag = re.split(r'(?<=[.;])\s', frag)[0]      # first sentence only
-        labels = set(re.findall(r'\*\*(' + '|'.join(LIFE) + r')\*\*', frag)) | \
-                 set(re.findall(r'(?<!\*)\b(' + '|'.join(LIFE) + r')\b(?!\*)', frag))
-        if len(labels) > 1:
-            fail(f"L{i} [{head[:44]}]: multiple lifetimes {sorted(labels)}: {frag[:80]}")
-print("  done")
-
-print("\n" + "=" * 74); print("13. Re-identification path declared"); print("=" * 74)
-for needle in ["fingerprint_kind='Payload'", 'recognition evidence']:
-    if needle not in TEXT: fail(f"missing re-identification element: {needle}")
-print("  recognition evidence + Payload lookup present")
-
-print("\n" + "=" * 74); print("9. Retention executable under FK delete behaviour"); print("=" * 74)
-pruned = ['scan_runs', 'scrape_runs']
-for fk in fks:
-    if fk['parent'] not in pruned:
+for line_no, line in enumerate(DATA.split('\n'), 1):
+    if '**Lifecycle.**' not in line:
         continue
-    # the action may be on the same line or on the next one
-    context = ' '.join(LINES[fk['line'] - 1: fk['line'] + 2])
-    act = next((a for a in ('CASCADE', 'SET NULL', 'RESTRICT') if f'`{a}`' in context), None)
-    print(f"  {fk['child']}.{fk['child_cols'][0]} -> {fk['parent']}: {act or 'UNKNOWN'}")
-    if act is None:
-        fail(f"L{fk['line']}: run reference has no declared delete behaviour")
-    elif act == 'RESTRICT':
-        fail(f"L{fk['line']}: RESTRICT on a prunable run reference blocks run retention")
+    frag = line.split('**Lifecycle.**', 1)[1].strip()
+    frag = re.split(r'(?<=[.;])\s', frag)[0]
+    labels = set(re.findall(r'\*\*(' + '|'.join(LIFE) + r')\*\*', frag)) | \
+             set(re.findall(r'(?<!\*)\b(' + '|'.join(LIFE) + r')\b(?!\*)', frag))
+    if len(labels) > 1:
+        fail(f"L{line_no}: multiple lifetimes {sorted(labels)}: {frag[:70]}")
+ok("every declared lifecycle names exactly one lifetime")
 
-print("\n" + "=" * 74); print("12. Multi-row derivations can hold 2..N members"); print("=" * 74)
+print("  run references and their declared delete behaviour:")
+for fk in fks:
+    if fk['parent'] not in ('scan_runs', 'scrape_runs'):
+        continue
+    print(f"    {fk['child']}.{fk['child_cols'][0]} -> {fk['parent']}: {fk['action']}")
+    if fk['action'] == 'RESTRICT':
+        fail(f"L{fk['line']}: RESTRICT on a prunable run reference blocks run "
+             f"retention (§19.7)")
+
+banner("13. Derivations, recognition evidence and rebuild semantics")
 need = [
- ("PK admits N members", "(content_id, kind, source_content_id)" in TEXT),
- ("order unique", "(content_id, kind, member_index)" in TEXT),
- ("member_count >= 2", "member_count >= 2" in TEXT or "`>= 2` for `ManagedPlaylist`" in TEXT),
- ("cross-row invariant stated", "MUST equal the number of `content_derivation_members` rows" in TEXT),
+    ("PK admits N members", "(content_id, kind, source_content_id)" in DATA),
+    ("order unique", "UNIQUE (content_id, kind, member_index)" in DATA),
+    ("member_count >= 2", "member_count >= 2" in DATA),
+    ("cross-row invariant stated",
+     "MUST equal the number of `content_derivation_members` rows" in DATA),
 ]
-for label, ok in need:
-    print(f"  {'OK' if ok else 'XX'} {label}")
-    if not ok: fail("derivation: " + label)
+for label, present in need:
+    print(f"  {'OK' if present else 'XX'} {label}")
+    if not present:
+        fail("derivation: " + label)
 
-print("\n" + "=" * 74); print("13. Library rebuild leaves a deterministic re-identification path"); print("=" * 74)
 chain = [
- ("retained identity",        "retained:  ContentId C" in TEXT),
- ("retained evidence",        "canonical Payload fingerprint" in TEXT),
- ("rescan match by digest",   "lookup:" in TEXT and "fingerprint_kind='Payload'" in TEXT),
- ("explicitly not by path",   "path-free" in TEXT),
- ("identity stays stable",    "GameId / ReleaseId / ContentId stay stable" in TEXT),
- ("lookup is a function",     "returns one row or none" in TEXT or "return *one* row or none" in TEXT),
+    ("retained identity", "retained:  ContentId C" in DATA),
+    ("retained evidence", "canonical Payload fingerprint" in DATA),
+    ("rescan match by digest", "fingerprint_kind='Payload'" in DATA),
+    ("explicitly not by path", "path-free" in DATA),
+    ("identity stays stable", "GameId / ReleaseId / ContentId stay stable" in DATA),
+    ("lookup is a function", "returns one row or none" in DATA),
 ]
-for label, ok in chain:
-    print(f"  {'OK' if ok else 'XX'} {label}")
-    if not ok: fail("rebuild path: " + label)
+for label, present in chain:
+    print(f"  {'OK' if present else 'XX'} {label}")
+    if not present:
+        fail("rebuild path: " + label)
 
-print("\n" + "=" * 74); print("11. Library-rebuild table is the single retention authority"); print("=" * 74)
-block = re.search(r'#### Library rebuild.*?(?=#### Full reset)', TEXT, re.S).group(0)
+block = re.search(r'#### Library rebuild.*?(?=#### Full reset)', DATA, re.S).group(0)
 rows = []
 for line in block.split('\n'):
-    if not line.startswith('|'): continue
+    if not line.startswith('|'):
+        continue
     cells = [c.strip() for c in line.strip('|').split('|')]
-    if len(cells) < 3: continue
-    v = 'cleared' if cells[1].startswith('**cleared**') else ('kept' if cells[1].startswith('**kept**') else None)
-    if v: rows.append((cells[0], v))
-print(f"  rebuild table rows: {len(rows)}")
+    if len(cells) < 3:
+        continue
+    value = ('cleared' if cells[1].startswith('**cleared**')
+             else 'kept' if cells[1].startswith('**kept**') else None)
+    if value:
+        rows.append((cells[0], value))
 cleared = {n for n, v in rows if v == 'cleared'}
 kept = {n for n, v in rows if v == 'kept'}
-print(f"  cleared ({len(cleared)}): " + "; ".join(sorted(cleared)))
-print(f"  kept ({len(kept)}): " + "; ".join(k[:48] for k in sorted(kept)))
-must_keep = ['games', 'releases', 'contents', 'content_fingerprints', 'manual_overrides',
-             'sessions', 'save_states', 'media_assets', 'media_asset_references']
-for t in must_keep:
+print(f"  rebuild table rows: {len(rows)}; cleared {len(cleared)}; kept {len(kept)}")
+for t in ('games', 'releases', 'contents', 'content_fingerprints',
+          'manual_overrides', 'sessions', 'save_states', 'media_assets',
+          'media_asset_references'):
     if not any(t in k for k in kept):
         fail(f"library rebuild does not explicitly keep {t}")
-must_clear = ['content_locations', 'scan_runs', 'scan_run_issues', 'provider_values', 'search_index']
-for t in must_clear:
+for t in ('content_locations', 'scan_runs', 'scan_run_issues', 'provider_values',
+          'search_index'):
     if not any(t in c for c in cleared):
         fail(f"library rebuild does not explicitly clear {t}")
 
-# --------------------------------------------------- 17. archive location shape
-print("\n" + "=" * 74); print("17. Archive relationship lives on the location"); print("=" * 74)
-if 'archive_content_id' in tables.get('contents', set()):
-    fail("contents still declares archive_content_id; the container link belongs on content_locations (5.2)")
-else:
-    print("  contents: no archive_content_id column  OK")
-for col in ('archive_content_id', 'archive_entry_path'):
-    if col not in tables.get('content_locations', set()):
-        fail(f"content_locations is missing the {col} column")
-    else:
-        print(f"  content_locations.{col}: present  OK")
-if "WHEN 'ArchiveEntry' THEN archive_content_id IS NOT NULL" not in TEXT:
-    fail("content_locations does not require archive_content_id for ArchiveEntry rows")
-else:
-    print("  ArchiveEntry check requires container + entry path  OK")
-if "WHEN 'File'         THEN archive_content_id IS NULL" not in TEXT:
-    fail("content_locations does not forbid archive columns on File rows")
-else:
-    print("  File check forbids both archive columns  OK")
+# --------------------------------------------------------------------------- #
+# 16. Full-reset order, parsed from the document and checked against the FK graph.
+# --------------------------------------------------------------------------- #
+banner("14. The documented full-reset order is executable")
 
-# ------------------------------------------------- 18. payload recognition key
-print("\n" + "=" * 74); print("18. Payload recognition key == lookup key"); print("=" * 74)
-if "`(algorithm, digest)` WHERE `fingerprint_kind = 'Payload'` — UNIQUE" not in TEXT:
-    fail("the Payload recognition index is not declared as UNIQUE (algorithm, digest)")
-else:
-    print("  partial UNIQUE (algorithm, digest) WHERE Payload  OK")
-if "`(algorithm, fingerprint_kind, digest, byte_size)` unique" in TEXT and "earlier revision" not in TEXT:
-    fail("the old nullable-byte_size recognition constraint is still declared")
-for needle in ("fingerprint_kind='Payload'", "fingerprint_kind = 'Payload'"):
-    if needle in TEXT:
-        print(f"  lookup uses the same predicate: {needle}  OK")
-        break
-else:
-    fail("no Payload lookup predicate found in 19.3")
-if 'byte_size' in PK.get('content_fingerprints', [()])[0]:
-    fail("byte_size is part of a content_fingerprints key but is nullable")
-else:
-    print("  byte_size is not part of any key  OK")
+edges = {}
+for fk in fks:
+    if fk['child'] in CHECKLIST and fk['parent'] in CHECKLIST and fk['action'] == 'RESTRICT':
+        edges.setdefault(fk['child'], set()).add(fk['parent'])
 
-# ------------------------------------------------------ 19. nullable key audit
-print("\n" + "=" * 74); print("19. No key relies on NULL semantics"); print("=" * 74)
-# Tables whose keys include a nullable column, each needing a documented strategy.
-NULLABLE_KEY_STRATEGY = {
-    # table: ('normalised'|'partial'|'check', explanation fragment that must appear)
-    'provider_values':      ('normalised', 'locale_key'),
-    'manual_overrides':     ('normalised', 'locale_key'),
-    'locale_key':           ('normalised', 'locale_key'),   # never a real table key
-    'content_fingerprints': ('check',      "entry_path IS NOT NULL"),
-    'content_locations':    ('check',      "archive_content_id IS NOT NULL"),
-    'core_selection_overrides': ('partial', "scope_kind = 'System'"),
-    'retroarch_setting_overrides': ('partial', "scope_kind = 'System'"),
-    'core_option_overrides': ('partial',   "scope_kind = 'CoreDefaults'"),
-    'save_states':          ('partial',    'core_version_id IS NULL'),
-    'sessions':             ('partial',    "state = 'Active'"),
-    'media_assets':         ('dropped',    'no natural-key unique constraint'),
-}
-nullable_cols = {}
-for t, ls in tb.items():
-    d = {}
-    for line in ls:
-        if line.startswith('|'):
-            c = [x.strip() for x in line.strip('|').split('|')]
-            if len(c) >= 3 and re.fullmatch(r'`[a-z_]+`', c[0]):
-                d[c[0].strip('`')] = (c[2].lower() == 'yes')
-    if d: nullable_cols[t] = d
-
-# Keys are DERIVED from the document, not hand-maintained: every parenthesised
-# column tuple that appears in a "Primary key" or "Unique constraints" declaration
-# is a key of that table. A stale hand-written list would let a nullable key
-# component slip through, which is the class of defect this check exists for.
-declared_keys = {}
-for t, ls in tb.items():
-    body = '\n'.join(ls)
-    for marker in (r'\*\*Primary key\.\*\*', r'\*\*Unique constraints[^*]*\*\*'):
-        for mm in re.finditer(marker, body):
-            # the declaration runs to the next bold marker or double newline
-            chunk = declaration_chunk(body[mm.end():])
-            is_pk_marker = 'Primary key' in mm.group(0)
-            # A block headed "Unique constraints" declares unique keys in every
-            # bullet; only a block that mixes constraints with plain indexes needs
-            # the word UNIQUE in the individual sentence.
-            is_unique_block = 'Unique constraints' in mm.group(0)
-            for tm in re.finditer(r'\(([^)]*)\)', chunk):
-                cols = [c.strip() for c in tm.group(1).split(',')]
-                if not cols or not all(re.fullmatch(r'[a-z_]+', c) for c in cols):
-                    continue
-                if (is_pk_marker or is_unique_block or is_unique_entry(chunk, tm)) and is_declared_key(chunk, tm):
-                    declared_keys.setdefault(t, set()).add(tuple(cols))
-# Tables whose key is stated in prose rather than a parenthesised tuple
-declared_keys.setdefault('schema_migrations', set()).add(('version',))
-declared_keys.setdefault('metadata_fields', set()).add(('field_key',))
-declared_keys.setdefault('metadata_providers', set()).add(('provider_id',))
-declared_keys.setdefault('systems', set()).add(('system_id',))
-declared_keys.setdefault('systems', set()).add(('catalog_key',))
-declared_keys.setdefault('cores', set()).add(('core_id',))
-declared_keys.setdefault('cores', set()).add(('component_key',))
-for t in ('firmware_index_state', 'component_index_state'):
-    declared_keys.setdefault(t, set()).add(('singleton',))
-# A normalised key column must exist as a declared column, and the CHECK that pins
-# it to its nullable source must be present -- otherwise the normalisation is only a
-# naming convention and the key is still unenforced.
-for t, keys in PK.items():
-    for k in keys:
-        for c in k:
-            if c.endswith('_key') and c not in tables.get(t, set()):
-                fail(f"{t}: key uses the normalised column {c!r}, which the table does not declare")
-            if c == 'locale_key' and t in ('provider_values', 'manual_overrides'):
-                if "CHECK (locale_key = COALESCE(locale, 'und'))" not in TEXT:
-                    fail(f"{t}: locale_key is not pinned to locale by its CHECK, so the "
-                         f"normalisation is unenforced")
-# A key component whose row text declares NOT NULL must not be marked nullable in
-# the Null column: the two statements in one row would contradict each other, and a
-# nullable component is exactly what disables a key in SQLite.
-for t, ls in tb.items():
-    for line in ls:
-        if not line.startswith('|'):
-            continue
-        c = [x.strip() for x in line.strip('|').split('|')]
-        if len(c) < 3 or not re.fullmatch(r'`[a-z_]+`', c[0]):
-            continue
-        col = c[0].strip('`')
-        desc = c[3] if len(c) > 3 else ''
-        # Only an UNCONDITIONAL NOT NULL claim contradicts Null=yes. A qualified claim
-        # ("NOT NULL only for EntryList rows", "NOT NULL iff ...") is pinned by a CHECK
-        # or a partial predicate instead, which the strategy check below verifies.
-        # tolerate the markdown backticks around `NOT NULL`
-        qualified = re.search(r'NOT NULL`?\s+(only|iff|when|for)\b|NOT NULL`?\s+exactly', desc, re.I)
-        claims_not_null = re.search(r'\bNOT NULL\b', desc, re.I) and not qualified
-        if c[2].lower() == 'yes' and claims_not_null:
-            if any(col in k for k in declared_keys.get(t, ())):
-                fail(f"{t}.{col}: row says NOT NULL but the Null column says yes, and the "
-                     f"column is a key component -- the key would be unenforced")
-            else:
-                print(f"  note: {t}.{col} says NOT NULL in prose but Null=yes (not a key component)")
-
-for t, keys in declared_keys.items():
-    if t not in nullable_cols:
-        continue
-    for k in sorted(keys):
-        unknown = [c for c in k if c in ('id',) or c.endswith('id') or True]
-        # only report a nullable component that is a real declared column
-        nul = [c for c in k if nullable_cols[t].get(c, False)]
-        if not nul:
-            continue
-        if t not in NULLABLE_KEY_STRATEGY:
-            fail(f"{t}: key {tuple(k)} contains nullable column(s) {nul} with no documented strategy (3.5/3.8)")
-            continue
-        kind, needle = NULLABLE_KEY_STRATEGY[t]
-        # locate the table's section and require the documented strategy text
-        hpat2 = re.compile(r'^#{3,4}\s+(?:\d+\.\d+\s+)?`' + re.escape(t) + r'`|^\*\*`' + re.escape(t) + r'`\*\*', re.M)
-        hm = hpat2.search(TEXT)
-        section = TEXT[hm.start(): hm.start() + 12000] if hm else ''
-        # The content_locations File keys are NOT NULL; only the ArchiveEntry key
-        # has a nullable component, and its CHECK pins it.
-        if t == 'content_locations' and 'archive_entry_path' in nul:
-            if "archive_entry_path IS NOT NULL" in section:
-                print(f"  {t:28} {nul} -> check strategy documented  OK")
-                continue
-        if needle not in section:
-            fail(f"{t}: nullable key column(s) {nul} lack the documented {kind} strategy ({needle!r} not found in the section)")
-        else:
-            print(f"  {t:28} {nul} -> {kind} strategy documented  OK")
-if '### 3.8' not in TEXT:
-    fail("3.8 (nullable-key audit) is missing")
-else:
-    print("  3.8 nullable-key audit present  OK")
-
-# ------------------------------------------- 21. locale sentinel handling
-print("\n" + "=" * 74); print("21. language-neutral sentinel is storage-only"); print("=" * 74)
-if "CHECK (locale_key = COALESCE(locale, 'und'))" not in TEXT:
-    fail("the locale_key CHECK tying locale_key to locale is missing")
-else:
-    print("  CHECK (locale_key = COALESCE(locale, 'und')) present  OK")
-for t in ('provider_values', 'manual_overrides'):
-    hm = re.search(r'^#{3,4}\s+\d+\.\d+\s+`' + t + r'`', TEXT, re.M)
-    sec = TEXT[hm.start(): hm.start() + 9000] if hm else ''
-    # Pull the declared primary key out of the section and inspect its components.
-    # Only the first parenthesised key list after the marker is the key.
-    pk_line = re.search(r'\*\*Primary key\.\*\*[^(]*\(([^)]*)\)', sec, re.S)
-    pk_cols = [c.strip() for c in pk_line.group(1).split(',')] if pk_line else []
-    if 'locale_key' not in sec:
-        fail(f"{t} does not use locale_key")
-    elif 'locale' in pk_cols:
-        fail(f"{t} still lists the nullable `locale` in its primary key: {pk_cols}")
-    elif 'locale_key' not in pk_cols:
-        fail(f"{t} primary key does not contain locale_key: {pk_cols}")
-    else:
-        print(f"  {t:20} key uses locale_key, not locale  OK")
-if 'locale_key = \'und\'' not in TEXT:
-    fail("the resolver does not name the 'und' sentinel for the language-neutral step")
-else:
-    print("  resolver names the sentinel explicitly  OK")
-
-# ----------------------------------------------------------- 20. full reset order
-print("\n" + "=" * 74); print("20. Documented full-reset order is executable"); print("=" * 74)
-EXPECTED_RESET = """core_option_overrides core_option_definitions core_option_schemas
-retroarch_setting_overrides core_selection_overrides save_states
-content_derivation_members content_derivations content_fingerprints
-content_locations sessions contents release_regions release_languages
-releases scrape_run_items scrape_runs media_asset_references media_assets
-games provider_values manual_overrides
-scan_run_issues scan_runs library_sources core_versions runtime_versions
-cores managed_components systems metadata_providers metadata_fields
-schema_migrations""".split()
-restrict = {c: {p for p, a in pars.items() if a == 'RESTRICT'} for c, pars in edges.items()}
-restrict = {c: ps for c, ps in restrict.items() if ps}
-pos = {t: i for i, t in enumerate(EXPECTED_RESET)}
-missing_tables = [t for t in restrict if t not in pos]
-if missing_tables:
-    fail(f"the documented reset order omits tables that have foreign keys: {missing_tables}")
-violations = [(c, p) for c, pars in restrict.items() if c in pos
-              for p in pars if p in pos and pos[p] < pos[c]]
-if violations:
-    for c, p in violations:
-        fail(f"reset order deletes {p} before its RESTRICT child {c}")
-else:
-    print(f"  {len(EXPECTED_RESET)} tables ordered; every RESTRICT child precedes its parent  OK")
-    # The document claims there is NO RESTRICT cycle and that no pointer pre-clearing
-    # is therefore needed. Verify that claim rather than asserting it.
-    colour, cyc = {}, []
-    def _dfs(u, stack):
-        colour[u] = 1; stack.append(u)
-        for v in sorted(restrict.get(u, ())):
-            if colour.get(v, 0) == 1:
-                cyc.append(stack[stack.index(v):] + [v])
-            elif colour.get(v, 0) == 0:
-                _dfs(v, stack)
-        stack.pop(); colour[u] = 2
-    for _n in sorted(restrict):
-        if colour.get(_n, 0) == 0:
-            _dfs(_n, [])
-    seen, uniq = set(), []
-    for c in cyc:
-        k = tuple(sorted(set(c)))
-        if k not in seen:
-            seen.add(k); uniq.append(c)
-    if uniq:
-        fail(f"the model contains a RESTRICT cycle {uniq}, so the documented order cannot "
-             f"be a plain child-before-parent order and a pointer must be pre-cleared")
-    else:
-        print("  no RESTRICT cycle in the declared foreign keys  OK")
-# The documented plan is PARSED from the document and checked against the FK graph,
-# so mutating the order in the document (not just in this script) is detected.
-block = re.search(r'```text\n 1\. DELETE core_option_overrides.*?```', TEXT, re.S)
+block = re.search(r'```text\n 1\. DELETE core_option_overrides.*?```', DATA, re.S)
 if not block:
-    fail("the full-reset plan block was not found in 19.3")
+    fail("the full-reset plan block was not found in §19.3")
 else:
-    # Exact document position: the order of the DELETE statements as written.
-    # Step numbers alone cannot order two tables that share a step, and the plan
-    # deliberately deletes core_versions before cores inside step 14.
     documented = [t for raw in block.group(0).split('\n')
                   for t in re.findall(r'DELETE\s+([a-z_]+)', raw)]
-    doc_pos = {}
+    pos = {}
     for i, t in enumerate(documented):
-        doc_pos.setdefault(t, i)
-    if sorted(doc_pos) != sorted(EXPECTED_RESET):
-        fail(f"the documented reset order lists a different table set than expected: "
-             f"{sorted(set(doc_pos) ^ set(EXPECTED_RESET))}")
-    doc_violations = [(c, p) for c, pars in restrict.items()
-                      if c in doc_pos for p in pars
-                      if p in doc_pos and doc_pos[p] < doc_pos[c] and p != c]
-    if doc_violations:
-        for c, p in doc_violations:
-            fail(f"the DOCUMENTED reset order deletes parent {p} (position {doc_pos[p]}) "
-                 f"before its RESTRICT child {c} (position {doc_pos[c]})")
-    else:
-        print(f"  parsed {len(doc_pos)} tables from the document; order is valid  OK")
-    if 'UPDATE games' in block.group(0) or 'UPDATE sessions' in block.group(0):
-        fail("the reset plan still pre-clears pointers that the order does not need")
-    else:
-        print("  no unnecessary pointer pre-clearing  OK")
+        pos.setdefault(t, i)
+    missing = [t for t in edges if t not in pos]
+    if missing:
+        fail(f"the reset order omits tables with RESTRICT foreign keys: {missing}")
+    violations = [(c, p) for c, parents in edges.items() if c in pos
+                  for p in parents if p in pos and pos[p] < pos[c] and p != c]
+    for c, p in violations:
+        fail(f"the documented reset order deletes parent {p} before its RESTRICT "
+             f"child {c}")
+    if not violations:
+        print(f"  parsed {len(pos)} tables; every RESTRICT child precedes its parent")
+        colour, cycles = {}, []
+
+        def dfs(u, stack):
+            colour[u] = 1
+            stack.append(u)
+            for v in sorted(edges.get(u, ())):
+                if colour.get(v, 0) == 1:
+                    cycles.append(stack[stack.index(v):] + [v])
+                elif colour.get(v, 0) == 0:
+                    dfs(v, stack)
+            stack.pop()
+            colour[u] = 2
+
+        for node in sorted(edges):
+            if colour.get(node, 0) == 0:
+                dfs(node, [])
+        seen, unique = set(), []
+        for cycle in cycles:
+            k = tuple(sorted(set(cycle)))
+            if k not in seen:
+                seen.add(k)
+                unique.append(cycle)
+        if unique:
+            fail(f"the model contains a RESTRICT cycle {unique}")
+        else:
+            ok("no RESTRICT cycle, so no pointer has to be pre-cleared")
+    if re.search(r'\bUPDATE\s+(games|sessions)', block.group(0)):
+        fail("the reset plan pre-clears pointers the order does not need")
+
+# --------------------------------------------------------------------------- #
+# 17. Markdown structure and traceability to ARCHITECTURE.md.
+# --------------------------------------------------------------------------- #
+banner("15. Markdown structure and ARCHITECTURE.md traceability")
+
+fences = DATA.count('\n```')
+if fences % 2:
+    fail(f"unbalanced code fences in DATA_MODEL.md ({fences} fence lines)")
+else:
+    ok(f"{fences // 2} code blocks, fences balanced")
+for section in ('## Appendix A', '## Appendix B'):
+    if section not in DATA:
+        fail(f"{section} is missing")
+
+def arch_section(number):
+    mm = re.search(r'^## ' + str(number) + r'\..*?(?=\n---\n)', ARCH, re.S | re.M)
+    return mm.group(0) if mm else ''
+
+
+sec54 = arch_section(54)
+areas = re.findall(r'^- (.+)$', sec54, re.M)
+appendix_a = DATA[DATA.index('## Appendix A'):DATA.index('## Appendix B')]
+missing_areas = [a for a in areas if f'| {a} ' not in appendix_a
+                 and f'| {a} |' not in appendix_a]
+if not areas:
+    fail("ARCHITECTURE.md §54 lists no areas to trace")
+elif missing_areas:
+    fail(f"Appendix A does not trace §54 areas: {missing_areas}")
+else:
+    ok(f"Appendix A traces all {len(areas)} §54 areas")
+
+sec53 = arch_section(53)
+invariants = re.findall(r'^(\d+)\. ', sec53, re.M)
+appendix_b = DATA[DATA.index('## Appendix B'):]
+missing_inv = [n for n in invariants
+               if not re.search(r'^\| ' + n + r'\. ', appendix_b, re.M)]
+if not invariants:
+    fail("ARCHITECTURE.md §53 lists no invariants to trace")
+elif missing_inv:
+    fail(f"Appendix B does not trace §53 invariants: {missing_inv}")
+else:
+    ok(f"Appendix B traces all {len(invariants)} §53 invariants")
 
 print("\n" + "=" * 74)
 print("RESULT:", "ALL CHECKS PASS" if not FAILS else f"{len(FAILS)} FAILURE(S)")

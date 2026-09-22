@@ -26,6 +26,14 @@ nullable key components normalized or pinned, with `DATA_MODEL.md` §3.5/§3.8 s
 and auditing the rule; and the full-reset order replaced with one that was executed
 against SQLite (Consequences).*
 
+*Revised in review round 4: the locale sentinel was removed, because a valid BCP-47
+tag must never stand in for `NULL` (§2); domain identity, storage primary key and
+business uniqueness are stated as three separate things, so a partial unique index
+is never called a primary key (§2); the `ArchiveEntry` location carries the
+container and the entry path **instead of** a source path, and the launch contract
+names two identities with no entry identity (§1a, §2); and the library rebuild is
+stated once as an index reset that keeps every identity (§5a).*
+
 ## Context
 
 `DATA_MODEL.md` is the first document that fixes BitArchive's persisted shape.
@@ -130,6 +138,20 @@ reference.
 minting a `ManagedComponentId` inside the rebuildable component index and
 referencing it from persistent tables. It was found in review and corrected by the
 split above. `DATA_MODEL.md` §20.3 test 22 is the regression test.
+
+**The same rule now applies to archive entries, and it is why no entry identity
+exists** (review round 4). An entry is not an entity that must be referenced; it is
+a *location* inside a container, so it needs no identity — and the architecture
+already models it that way: `ARCHITECTURE.md` §14.1 puts `ArchiveEntry` inside
+`ContentLocation`, addressed by a container `ContentId` and an entry path.
+
+`DATA_MODEL.md` therefore keeps the container link on the location and resolves a
+launch from **two identities** — the container content and the playable content —
+plus the entry path that their location row holds. `ARCHITECTURE.md` §14.2 used to
+name a fourth type, `ArchiveEntryId`, for the same thing, which made the two
+authoritative documents contradict each other. The architecture was corrected in
+the same change, because a superseded decision must not survive in a source-of-truth
+document (`AGENTS.md` §1).
 
 ### 2. Store what cannot be derived; derive what can
 
@@ -325,6 +347,13 @@ rebuild, and neither is a full reset: only the full reset removes `games`,
 kind deletes a ROM, ISO, firmware or save-state file. `DATA_MODEL.md` §19.3 defines
 all three.
 
+**Stated once, and checked against the rest of the document.** Review round 4 found
+that `DATA_MODEL.md` §19.2 still described a library rebuild as "forget everything
+and scan again" and listed `contents` among the things it resets, contradicting the
+binding table in §19.3. A rebuild resets the **index**, never the **identity**, so
+that wording is corrected and the model checker now fails on any statement anywhere
+in the document that a rebuild deletes `games`, `releases` or `contents`.
+
 ## Consequences
 
 - Schema v1 derives its types, keys and constraints from `DATA_MODEL.md` without
@@ -345,21 +374,39 @@ all three.
 - Where `ARCHITECTURE.md` wording is stale relative to an accepted ADR, the ADR
   wins and `DATA_MODEL.md` follows it: a core's store version segment is its
   **build id**, not a version string (ADR 0002 §6).
-- **Every key column is `NOT NULL` or normalized.** SQLite treats `NULL` values as
-  distinct in unique indexes and does not forbid `NULL` in a composite primary key,
-  so a nullable key component silently disables the constraint for exactly the rows
-  where it matters. `DATA_MODEL.md` §3.5 states the rule, §3.8 audits every key
-  against it, and the model uses two devices: a **storage sentinel** for a nullable
-  *fachliche* value that belongs in a key (`locale_key = COALESCE(locale, 'und')`),
-  and a **partial index predicate** where a discriminator already pins the column.
-  The sentinel is a storage device, never a fachliche value: it is not rendered,
-  not translated and not matched. A nullable key component with neither device is a
-  defect, and the checker rejects it.
+- **Every key column is `NOT NULL`, or the key is a partial index whose predicate
+  proves it.** SQLite treats `NULL` values as distinct in unique indexes and does
+  not forbid `NULL` in a composite primary key, so a nullable key component silently
+  disables the constraint for exactly the rows where it matters. `DATA_MODEL.md`
+  §3.5 states the rule and §3.8 audits every key against it. Two devices are used,
+  and neither is a sentinel:
+
+  - a **partial index predicate** where a discriminator already pins the column
+    (a scope kind, a fingerprint kind, a location kind); and
+  - an **exhaustive pair** `WHERE locale IS NULL` / `WHERE locale IS NOT NULL`
+    where the nullable column has exactly one fachliche meaning that no token may
+    absorb.
+
+  A locale is **never** encoded by a reserved tag. An earlier revision mapped
+  `NULL` to `'und'` and claimed the read path mapped it back, which both collapsed
+  a genuine BCP-47 `und` value onto "language-neutral" and would have rewritten it
+  on read (§2). A nullable key component with neither device is a defect, and the
+  checker rejects it.
 - **A library rebuild is a reset of the index, not of the library.** It keeps
   games, releases, contents, payload fingerprints, manual overrides, sessions,
   statistics, media and configuration, clears the scan-derived index and the
   scraped values, and then rescans. The retained payload fingerprint is what makes
-  the re-identification path deterministic.
+  the re-identification path deterministic. No section of `DATA_MODEL.md` may
+  describe the operation as deleting or forgetting an identity; the sections are
+  checked against each other for exactly this drift.
+- **Domain identity, storage primary key and business uniqueness are three
+  different things**, stated separately for every table (`DATA_MODEL.md` §3.9).
+  A table whose uniqueness rules are all partial still needs an implementable
+  primary key, which is a UUIDv7 identity where the row is an entity and
+  `row_id INTEGER PRIMARY KEY` otherwise. A partial unique index is never a primary
+  key, and — because SQLite rejects it — never a foreign-key parent target either.
+  This is what lets the schema-v1 Issue derive `CREATE TABLE` statements without
+  re-deciding an identity.
 - **Only the full reset destroys all BitArchive-owned database state**, and it
   destroys no external file.
 - **The local firmware SHA-256 and the trusted reference hashes are separate
@@ -390,9 +437,11 @@ all three.
 | Put the archive-container link on `contents` instead of on the location | Makes a content belong to exactly one container, so the same payload observed loose and inside two archives could not be one content with three locations — and it reintroduces a self-referencing deletion cycle. `ARCHITECTURE.md` §14.1 defines the relationship as a variant of `ContentLocation`. |
 | Keep `UNIQUE (algorithm, fingerprint_kind, digest, byte_size)` and look up on three columns | The constraint would not cover the lookup: `byte_size` is nullable and SQLite treats `NULL`s as distinct, so two `Payload` rows could share a digest. It was also too strong for `EntryList`, forbidding the same entry bytes in two archives. |
 | Leave `locale` nullable inside the primary keys of `provider_values`/`manual_overrides` | A nullable key component disables the key for the language-neutral rows — exactly the duplicates the key exists to prevent. |
-| Leave `save_states.slot` nullable because it is "optional" | `slot` is a component of both slot keys, so a nullable `slot` let a re-scan stack duplicate rows for one physical file. The empty-string sentinel keeps the keys enforced. |
+| Map a language-neutral locale to a reserved tag (`'und'`) so one non-null key can cover both shapes | `und` **is** a valid BCP-47 tag meaning *undetermined*, so the token collides with a real fachliche value: a genuine `und` and "language-neutral" would become one key, and the read path would rewrite the real tag into `NULL`. Two exhaustive partial indexes (`IS NULL` / `IS NOT NULL`) express both shapes without inventing a value. |
+| Label the scope partial unique indexes of `core_selection_overrides`, `retroarch_setting_overrides` and `core_option_overrides` the "primary key" | SQLite has no partial primary key, so the table would have had **no** primary key at all, and schema v1 could not have created it. Those tables declare `row_id INTEGER PRIMARY KEY` for storage and keep their business uniqueness in the partial indexes. |
+| Give an `ArchiveEntry` location a `source_id`/`relative_path` as well, so it knows which copy of the archive was seen | Redundant with the container's own `File` location and able to contradict it: the entry is the same entry whichever copy of the archive is on disk, and the container may legitimately have several `File` locations. The entry names the container by identity and resolves the physical file through it. |
+| Leave `save_states.slot` nullable because it is "optional" | `slot` was a component of both slot keys, so a nullable `slot` let a re-scan stack duplicate rows for one physical file. Round 4 replaced those keys with the physical-file key, and `slot` is now an attribute rather than a key component (`DATA_MODEL.md` §15.1). |
 | Declare a natural-key unique constraint on `media_assets` | Three of its four columns (`locale`, `provider_id`, `content_digest`) are independently nullable, so the constraint constrained nothing for the common rows and could not be repaired by a single partial predicate. Slot uniqueness belongs in `media_asset_references`. |
-| Mint an identity for a rebuildable index row and reference it from persistent data | Violates the corollary of decision 1a: a rebuild could re-mint the identity and detach save states, sessions and overrides. The installed-state index is keyed by the artifact itself instead. |
 | Let persistent data hold the core build id as loose text instead of an anchor table | Four columns repeated across four tables, no place to record the pinned digest, and no way to express "same build" without comparing text. The anchor is one row and one 16-byte foreign key. |
 | Point a core assignment at the installed-state index | The target is not unique (several builds per core and platform), and it would make a fachliche assignment depend on an artifact being installed, so a not-yet-installed core could not be configured. |
 | Keep `RESTRICT` on provenance links from long-lived data to prunable runs | Makes the documented 90-day run retention unexecutable: a rule that says "prune old runs" cannot coexist with a constraint that refuses to delete a run a surviving row mentions. |

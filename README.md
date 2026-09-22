@@ -316,16 +316,34 @@ Die vollständigen Entwicklungsregeln stehen in [`docs/DEVELOPMENT.md`](./docs/D
 
 ### Dokument- und Modellprüfung
 
-`DATA_MODEL.md` wird zusätzlich statisch geprüft. Das Skript validiert die
-Modellkonsistenz direkt aus dem Dokument — unter anderem, dass jeder Foreign Key
-eine existierende Child- und Parent-Spalte nennt, dass kein persistenter Datensatz
-auf eine rebuildbare Tabelle verweist, dass jede Struktur genau eine Lifetime
-besitzt, dass Retention-Regeln und FK-Verhalten zusammenpassen und dass ein
-Library Rebuild den Re-Identifikationspfad erhält:
+`DATA_MODEL.md` wird zusätzlich statisch geprüft. Das Skript liest seine
+Schlüsseldefinitionen **ausschließlich aus dem Dokument** (keine eigene Schlüsselliste)
+und validiert unter anderem:
+
+- jeder Foreign Key nennt eine existierende Child- und Parent-Spalte, und sein
+  Parent-Key ist ein echter Primary Key oder ein vollständiger UNIQUE-Key —
+  **niemals** ein partieller Unique-Index (den SQLite als FK-Ziel ablehnt);
+- jede Tabelle deklariert **genau einen** implementierbaren Storage-Primary-Key,
+  und kein partieller Index wird als Primary Key bezeichnet;
+- Domain Identity, Storage Primary Key und Business Uniqueness werden getrennt
+  geführt und stimmen mit der Checkliste in §20.1 überein;
+- kein Key-Bestandteil ist nullable ohne pinning-Prädikat, und **kein Locale-Wert
+  wird durch einen Sentinel ersetzt** (ein echtes BCP-47-Tag ist niemals `NULL`);
+- die `ArchiveEntry`-/`File`-Form der Content-Location stimmt mit
+  `ARCHITECTURE.md` §14.2 überein, und `ARCHITECTURE.md` enthält kein
+  `ArchiveEntryId`;
+- keine Stelle im Dokument behauptet, ein Library Rebuild lösche `games`,
+  `releases` oder `contents`;
+- die dokumentierte Full-Reset-Reihenfolge ist gegen den FK-Graph ausführbar, es
+  gibt keinen `RESTRICT`-Zyklus, und der Re-Identifikationspfad bleibt erhalten.
 
 ```bash
 python3 tools/check_data_model.py
 ```
+
+Der Check läuft zusätzlich in GitHub Actions als eigener Schritt des Workflows
+`Rust quality` (`.github/workflows/ci.yml`), damit das Dokument nicht auf einem
+Branch mit grüner CI abdriften kann.
 
 ## Repository
 
