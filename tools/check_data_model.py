@@ -1256,28 +1256,35 @@ else:
     ok("no passage bounds EntryList cardinality")
 
 # --------------------------------------------------------------------------- #
-# 16f. content_locations has exactly two deletion operations, and neither is an
-#      observation. §19.4 must not present the source removal as the only one.
+# 14f. §19.4 separates the known content_locations retention cases and must not
+#      close the set in either direction: not by presenting the source removal as
+#      the only deletion, and not by fixing a total count of deletion operations
+#      while the per-game index reset is still owned by #53.
 # --------------------------------------------------------------------------- #
-banner("14f. content_locations retention: two deletions, no observation (§19.4)")
+banner("14f. content_locations retention: cases separate, no closed count (§19.4)")
 
 s194 = DATA[DATA.index('### 19.4 '):DATA.index('### 19.5 ')]
 
-# (a) the two explicit operations are named, each with its own scope. The needles
-#     are matched against the whitespace-normalised section, so hard-wrapping and
-#     the block-quote markers do not decide whether a rule is present.
+# (a) the known cases are named, each with its own scope, and the undecided one is
+#     delegated rather than invented. The needles are matched against the
+#     whitespace-normalised section, so hard-wrapping and the block-quote markers do
+#     not decide whether a rule is present.
 s194_flat = re.sub(r'>\s*', '', norm(s194))
 for needle, label in (
         ("An ordinary missing or unreachable observation never deletes a "
          "`content_locations` row.", "observation deletes nothing"),
-        ("A source removal is the one targeted deletion.",
-         "source removal named as a deletion"),
-        ("A library rebuild is the separate whole-index reset.",
-         "library rebuild named as the other deletion"),
-        ("It clears **all**", "the rebuild clears all rows, not one source's"),
+        ("A source removal deletes only the removed source's `File` locations.",
+         "source removal named with its exact scope"),
+        ("and it **never** deletes an `ArchiveEntry` location",
+         "source removal spares ArchiveEntry locations"),
+        ("A library rebuild clears all `content_locations` rows",
+         "library rebuild clears all rows, not one source's"),
         ("specified by §19.3", "the rebuild clear points at §19.3"),
-        ("deleted in exactly those two explicit operations, and by no third one.",
-         "exactly two operations, no third")):
+        ("A full reset removes `content_locations` together with all other "
+         "BitArchive-owned database state.",
+         "full reset removes content_locations"),
+        ("deletion semantics stay with the scan-reconciliation work (#53",
+         "the per-game index reset is delegated to #53")):
     if needle not in s194_flat:
         fail(f"§19.4 does not state that {label} (needle {needle!r} not found)")
     else:
@@ -1303,6 +1310,48 @@ if only_hits:
              f"clears ALL content_locations in a library rebuild")
 else:
     ok("§19.4 does not present one operation as the only content_locations deletion")
+
+# (b2) the round-7 defect, in the other direction: closing the set by fixing a total
+#      number of the operations that delete a `content_locations` row. §19.3's full
+#      reset deletes the table too, and the exact scope of the per-game
+#      "Indexeintrag zurücksetzen" is still owned by #53 (§19.3), so the known cases
+#      define the rule without claiming to be all of them.
+#
+#      Scoped to §19.4 like the check above: §20.3 quotes the rejected wordings when
+#      it lists the mutations they were verified against, and a check must not fire
+#      on the document explaining the defect it forbids.
+CLOSED_COUNT_CLAIMS = [
+    (r'deleted in exactly those \w+', 'the set closed as "exactly those …"'),
+    (r'and by no (?:third|other|further|fourth) one', '"and by no third one"'),
+    (r'exactly (?:two|three|four|five|six|\d+) (?:explicit )?'
+     r'(?:deletion|delete|removal)\w* operations?',
+     'a counted set of deletion operations'),
+    (r'exactly (?:two|three|four|five|six|\d+) operations? '
+     r'(?:that )?(?:may |can |could |will )?(?:ever )?(?:delet|clear|remov)\w*',
+     'a counted set of operations that delete'),
+    (r'\b(?:two|three|four|five) (?:explicit )?(?:deletion|delete|removal)\w* '
+     r'operations?\b', 'a bare count of deletion operations'),
+    (r'no (?:third|other|further|fourth) operation\b[^.\n]{0,80}'
+     r'\b(?:delet|clear|remov)\w*', 'a claim that no further operation deletes'),
+    # The two "only operations" forms need a deletion verb in reach: §19.4 says the
+    # full reset is the only operation that destroys *identities*, which is a
+    # different claim and stays true.
+    (r'only these operations?\b[^.\n]{0,80}\b(?:delet|clear|remov)\w*',
+     '"only these operations delete"'),
+    (r'(?:are|is) the only operations?\b[^.\n]{0,80}\b(?:delet|clear|remov)\w*',
+     '"are the only operations that delete"'),
+    (r'(?:complete|exhaustive|closed) (?:list|set|count|number|enumeration) of '
+     r'(?:the )?(?:deletion|delete|removal)', 'a "complete/exhaustive" deletion set'),
+]
+closed_hits = [(m.group(0), label) for pattern, label in CLOSED_COUNT_CLAIMS
+               for m in re.finditer(pattern, s194_flat, re.I)]
+if closed_hits:
+    for hit, label in closed_hits:
+        fail(f"§19.4 closes the set of content_locations deletion operations — "
+             f"…{hit[:120]}… ({label}) — but §19.3's full reset deletes the table as "
+             f"well, and the per-game index reset is still owned by #53")
+else:
+    ok("§19.4 claims no total count of content_locations deletion operations")
 
 # (c) an observation may never delete a row: missing, unreachable, offline and
 #     "not found" are states. Checked in §19.4 and in the retention summary.
@@ -1446,29 +1495,39 @@ if deleting_states:
 else:
     ok("no section lets a missing/unreachable/offline observation delete a row")
 
-# (d) the three cases must be enumerated together somewhere, so no two of them can
-#     be merged silently again: §19.4's binding rule and §20.3 test 46.
+# (d) the known cases must be enumerated together somewhere, so no two of them can
+#     be merged silently again: §19.4's binding rule and §20.3 test 46. The needles
+#     assert the cases, not a count of them.
 for needle, label in (
         ("An ordinary missing or unreachable observation never deletes",
          "§19.4 separates the observation case"),
-        ("A source removal is the one targeted deletion",
-         "§19.4 names the source removal"),
-        ("A library rebuild is the separate whole-index reset",
+        ("A source removal deletes only the removed source's `File` locations",
+         "§19.4 names the source removal and its scope"),
+        ("A library rebuild clears all `content_locations` rows",
          "§19.4 names the rebuild"),
-        ("`content_locations` has exactly two deletion operations, and neither is an\n"
-         "    observation",
-         "§20.3 test 46 asserts the three cases stay distinct")):
+        ("A full reset removes `content_locations` together with all other",
+         "§19.4 names the full reset as a deletion of the table"),
+        ("scan-reconciliation work (#53", "§19.4 delegates the per-game reset to #53"),
+        ("`content_locations` retention operations remain distinct",
+         "§20.3 test 46 asserts the cases stay distinct"),
+        ("its exact deletion scope belongs to #53",
+         "§20.3 test 46 leaves the per-game scope to #53")):
     if needle not in DATA:
-        fail(f"the three content_locations cases are not enumerated together: {label}")
+        fail(f"the content_locations retention cases are not enumerated together: "
+             f"{label}")
     else:
-        ok(f"the three cases are enumerated: {label}")
+        ok(f"the cases are enumerated: {label}")
 
-# (e) §19.7 must still say the same three things (and is not reformulated if it does).
+# (e) §19.7 must still say the same things about content_locations (and is not
+#     reformulated if it does). Its row is the retention summary the other sections
+#     are read against, so the four known cases have to survive there too.
 s197_flat = norm(DATA[DATA.index('### 19.7 '):DATA.index('### 19.8 ')])
 for needle, label in (
         ("`Missing` is a state, not a deletion", "the state is not a deletion"),
         ("deletes that source's `File` rows only", "source removal deletes File rows only"),
-        ("a library rebuild clears the table", "the rebuild clears the table")):
+        ("a library rebuild clears the table", "the rebuild clears the table"),
+        ("the full reset drops it with the rest of the state",
+         "the full reset drops the table with the state")):
     if needle not in s197_flat:
         fail(f"§19.7 retention summary does not state that {label} "
              f"(needle {needle!r} not found)")
