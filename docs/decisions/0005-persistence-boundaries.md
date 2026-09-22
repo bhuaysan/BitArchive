@@ -19,6 +19,13 @@ introspection result (§1a, §2); and the library rebuild defined as an index re
 that keeps the payload fingerprints as recognition evidence, distinct from a
 per-game index reset and from a full reset (§5a).*
 
+*Revised in review round 3: the archive-container link moved from `contents` to the
+`ArchiveEntry` location, so one content may be loose and in several archives; the
+`Payload` recognition index narrowed to exactly the lookup columns and made partial;
+nullable key components normalized or pinned, with `DATA_MODEL.md` §3.5/§3.8 stating
+and auditing the rule; and the full-reset order replaced with one that was executed
+against SQLite (Consequences).*
+
 ## Context
 
 `DATA_MODEL.md` is the first document that fixes BitArchive's persisted shape.
@@ -302,9 +309,15 @@ invariant 2 forbids. The fingerprint is therefore not scan index: it is the
 than a fresh start. `Container` and `EntryList` fingerprints describe a specific
 archive's packaging, are not needed for identification, and are re-derived.
 
-The lookup is a function rather than a guess because `DATA_MODEL.md` §7.1 makes
-`(algorithm, fingerprint_kind, digest, byte_size)` **unique** for `Payload` rows,
-so one payload digest maps to exactly one content.
+The lookup is a function rather than a guess because `DATA_MODEL.md` §7.1 declares
+a **partial unique index over exactly the columns the lookup uses** —
+`(algorithm, digest) WHERE fingerprint_kind = 'Payload'` — so one payload digest maps
+to exactly one content. The constraint and the lookup being the *same* key is the
+point: an earlier revision declared a global constraint over
+`(algorithm, fingerprint_kind, digest, byte_size)` and looked up on three of those
+four columns, which guaranteed nothing, because `byte_size` is nullable and SQLite
+treats `NULL` values in a unique index as distinct. The global form was also too
+strong, forbidding the same entry bytes from appearing in two different archives.
 
 **Distinct from the other two operations.** A per-game index reset is not a library
 rebuild, and neither is a full reset: only the full reset removes `games`,
@@ -332,6 +345,16 @@ all three.
 - Where `ARCHITECTURE.md` wording is stale relative to an accepted ADR, the ADR
   wins and `DATA_MODEL.md` follows it: a core's store version segment is its
   **build id**, not a version string (ADR 0002 §6).
+- **Every key column is `NOT NULL` or normalized.** SQLite treats `NULL` values as
+  distinct in unique indexes and does not forbid `NULL` in a composite primary key,
+  so a nullable key component silently disables the constraint for exactly the rows
+  where it matters. `DATA_MODEL.md` §3.5 states the rule, §3.8 audits every key
+  against it, and the model uses two devices: a **storage sentinel** for a nullable
+  *fachliche* value that belongs in a key (`locale_key = COALESCE(locale, 'und')`),
+  and a **partial index predicate** where a discriminator already pins the column.
+  The sentinel is a storage device, never a fachliche value: it is not rendered,
+  not translated and not matched. A nullable key component with neither device is a
+  defect, and the checker rejects it.
 - **A library rebuild is a reset of the index, not of the library.** It keeps
   games, releases, contents, payload fingerprints, manual overrides, sessions,
   statistics, media and configuration, clears the scan-derived index and the
@@ -364,6 +387,11 @@ all three.
 | Delete a content row when its file disappears | Makes a temporarily unmounted volume indistinguishable from a deletion, and destroys the fingerprint that lets the content be recognized when it returns. |
 | Store generated session `.cfg` files and logs as data | `ARCHITECTURE.md` §28 and invariant 7 make them session artifacts, not truth. |
 | Put scan or scrape jobs in one generic job table now | `ARCHITECTURE.md` §30.4 keeps job persistence with the Issue that implements job recovery; only the fachliche run histories reconciliation depends on are modelled. |
+| Put the archive-container link on `contents` instead of on the location | Makes a content belong to exactly one container, so the same payload observed loose and inside two archives could not be one content with three locations — and it reintroduces a self-referencing deletion cycle. `ARCHITECTURE.md` §14.1 defines the relationship as a variant of `ContentLocation`. |
+| Keep `UNIQUE (algorithm, fingerprint_kind, digest, byte_size)` and look up on three columns | The constraint would not cover the lookup: `byte_size` is nullable and SQLite treats `NULL`s as distinct, so two `Payload` rows could share a digest. It was also too strong for `EntryList`, forbidding the same entry bytes in two archives. |
+| Leave `locale` nullable inside the primary keys of `provider_values`/`manual_overrides` | A nullable key component disables the key for the language-neutral rows — exactly the duplicates the key exists to prevent. |
+| Leave `save_states.slot` nullable because it is "optional" | `slot` is a component of both slot keys, so a nullable `slot` let a re-scan stack duplicate rows for one physical file. The empty-string sentinel keeps the keys enforced. |
+| Declare a natural-key unique constraint on `media_assets` | Three of its four columns (`locale`, `provider_id`, `content_digest`) are independently nullable, so the constraint constrained nothing for the common rows and could not be repaired by a single partial predicate. Slot uniqueness belongs in `media_asset_references`. |
 | Mint an identity for a rebuildable index row and reference it from persistent data | Violates the corollary of decision 1a: a rebuild could re-mint the identity and detach save states, sessions and overrides. The installed-state index is keyed by the artifact itself instead. |
 | Let persistent data hold the core build id as loose text instead of an anchor table | Four columns repeated across four tables, no place to record the pinned digest, and no way to express "same build" without comparing text. The anchor is one row and one 16-byte foreign key. |
 | Point a core assignment at the installed-state index | The target is not unique (several builds per core and platform), and it would make a fachliche assignment depend on an artifact being installed, so a not-yet-installed core could not be configured. |

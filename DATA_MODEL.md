@@ -335,6 +335,52 @@ A unique constraint expresses a fachliche rule:
   file-system case policy), the constraint is a **partial unique index over that
   discriminator** rather than a nullable column trick.
 
+#### Key columns are NOT NULL, or normalized (binding)
+
+> **Rule (binding).** Every column that participates in a primary key or a unique
+> constraint MUST be `NOT NULL`, **or** the constraint MUST be a partial unique
+> index whose predicate proves the column is non-`NULL` for every row it covers.
+
+This is not a style rule. SQLite treats `NULL` values as **distinct from each
+other** in `UNIQUE` indexes, and it does not forbid `NULL` in the columns of a
+composite `PRIMARY KEY` either. Measured on SQLite:
+
+```text
+CREATE TABLE t (a TEXT NOT NULL, loc TEXT, vi INTEGER NOT NULL,
+                PRIMARY KEY (a, loc, vi));
+INSERT INTO t VALUES ('p', NULL, 0);   -- accepted
+INSERT INTO t VALUES ('p', NULL, 0);   -- accepted again: the PK did not collide
+```
+
+So a nullable component silently turns a declared key into **no constraint at
+all** for exactly the rows where the column is `NULL`, which is precisely the
+interesting case. Two consequences follow, and both are answered by the same rule:
+
+1. **A logical key over a nullable column is a bug.** Either the column becomes
+   `NOT NULL` with an explicit storage normalisation for "not set", or the
+   constraint is split into partial indexes whose predicates pin the column.
+   §9.3 and §9.4 do the former for `locale`; every scope index does the latter.
+2. **`NULL` in a key column is never used to mean "any".** A `NULL` is a value the
+   schema happens to permit, not a wildcard; where a rule needs "any value",
+   it is expressed as several partial indexes rather than one nullable key.
+
+**Storage normalisation is not a fachliche value.** Where a reserved storage token
+stands in for "not set" (currently only the `locale_key` sentinel of §9.3), the
+token is a *storage* device: it is never rendered to the user, never translated,
+and never treated as the language it happens to spell. Domain types keep the
+nullable, fachliche shape (`Option<Locale>`); the token exists only so that the
+database can compare rows.
+
+**Partial indexes are the preferred escape hatch**, because they make the
+guarantee explicit rather than relying on `NULL` semantics: a predicate such as
+`WHERE scope_kind = 'System'` proves that `scope_system_id` is the key component
+for exactly those rows, and §13.1/§12.3 pair each predicate with a `CHECK` that the
+scope kind and the populated scope column agree.
+
+§3.8 classifies every key in the model against this rule, and
+`tools/check_data_model.py` fails when a declared key component is nullable without
+a partial predicate or a documented normalisation.
+
 ### 3.6 Text comparison and case sensitivity
 
 The default comparison for text columns is **case-sensitive**. Case-insensitive
@@ -361,6 +407,67 @@ delete behavior explicitly, and a cascade is used only where the child rows are
 `release_regions` and `release_languages` (§6.4). For everything else the rule
 is expressed in §19, because the fachliche meaning of "delete a library source"
 is not "delete every game that was ever seen there" (`PRODUCT.md` §7.3).
+
+### 3.8 Audit of every key against the nullable-key rule
+
+Every primary key and unique constraint in the model is listed here with the
+classification required by §3.5. This is a complete audit, not a sample: a new key
+that is not in this table is a modelling omission, and
+`tools/check_data_model.py` fails when it finds one.
+
+```text
+A  safe — every key column is NOT NULL
+B  safe — a partial predicate proves the column is non-NULL for the rows it covers
+C  safe — a storage normalisation replaces NULL in the key (locale_key)
+D  safe — the key is the table's single-column row identity, so NULL is impossible
+```
+
+| Table | Key | Class | Note |
+|---|---|---|---|
+| `schema_migrations` | `(version)` | A | |
+| `library_sources` | `(id)`; `(location, platform_locator_kind)` | A | both columns `NOT NULL` |
+| `systems` | `(system_id)`; `(catalog_key)` | A | |
+| `games` | `(id)` | A | `default_release_id` is nullable but **not** in a key |
+| `releases` | `(id)`; `(id, game_id)`; `(game_id, release_key)` | A | `release_key` is `NOT NULL` |
+| `release_regions` / `release_languages` | `(release_id, region)` / `(release_id, language)` | A | |
+| `contents` | `(id)` | A | no `archive_content_id` column at all (§6.3) |
+| `content_locations` | the four partial indexes of §5.2 | **B**/**C** | the two `File` keys are all-`NOT NULL`; the two `ArchiveEntry` keys have `archive_entry_path`, which the §5.2 `CASE` check pins per kind |
+| `content_derivations` | `(content_id, kind)` | A | |
+| `content_derivation_members` | `(content_id, kind, source_content_id)`; `(content_id, kind, member_index)` | A | |
+| `content_fingerprints` | `(content_id, fingerprint_kind, algorithm)`; `(content_id, fingerprint_kind, algorithm, entry_path)`; `(algorithm, digest) WHERE fingerprint_kind = 'Payload'` | **B** | the `EntryList` PK is covered by `CHECK (fingerprint_kind = 'EntryList') = (entry_path IS NOT NULL)`; the recognition index is partial |
+| `scan_runs` | `(id)` | A | |
+| `scan_run_issues` | `(scan_run_id, issue_index)` | A | |
+| `metadata_fields` | `(field_key)` | A | |
+| `metadata_providers` | `(provider_id)` | A | |
+| `provider_values` | `(provider_id, subject_kind, subject_id, field_key, locale_key, value_index)` | **C** | `locale_key` is `NOT NULL` with the `'und'` sentinel; the fachliche `locale` stays nullable and is **not** in the key (§9.3) |
+| `manual_overrides` | `(subject_kind, subject_id, field_key, locale_key)` | **C** | same normalisation (§9.4) |
+| `scrape_runs` | `(id)` | A | `scope_system_id`/`scope_game_id` are nullable but not keys |
+| `scrape_run_items` | `(scrape_run_id, game_id)` | A | |
+| `media_assets` | `(id)` | **A** | the former nullable-column unique constraint is **removed**; slot uniqueness lives in `media_asset_references` (§10.1) |
+| `media_asset_references` | `(subject_kind, subject_id, logical_key)` | A | |
+| `firmware_entries` | `(relative_path)` | A | an index key, not an identity |
+| `firmware_index_state` / `component_index_state` | `(singleton)` | A | `CHECK (singleton = 1)` |
+| `cores` | `(core_id)`; `(component_key)` | A | |
+| `core_selection_overrides` | three partial indexes (`System`/`Game`/`Release`) | **B** | each predicate pins its scope column, and the scope check constraint requires that column for that kind |
+| `core_versions` | `(core_version_id)`; `(component_key, platform, build_id)`; `(core_id, platform, build_id)` | A | `revision`/`artifact_digest` are nullable but not keys |
+| `runtime_versions` | `(runtime_version_id)`; `(component_key, platform, version)` | A | |
+| `managed_components` | `(component_class, component_key, platform, version)` | A | the nullable anchors are governed by the §12.6 check constraint and are not keys |
+| `retroarch_setting_overrides` | three partial indexes (`Global`/`System`/`Game`) | **B** | as above |
+| `core_option_schemas` | `(core_version_id)` | A | |
+| `core_option_definitions` | `(core_version_id, option_key)` | A | |
+| `core_option_overrides` | three partial indexes (`CoreDefaults`/`System`/`Game`) | **B** | as above |
+| `save_states` | `(id)`; `(release_id, core_id, core_version_id, slot)`; `(release_id, core_id, core_version_label, slot) WHERE core_version_id IS NULL`; `(file_relative_path)` | **A**/**B** | the first slot key is all-`NOT NULL` because `slot` uses the empty-string sentinel; the second is partial on `core_version_id IS NULL`, which is what makes its `core_version_label` component meaningful |
+| `sessions` | `(id)`; `(state) WHERE state = 'Active'` | **B** | the single-active-session index is partial over a constant |
+| `search_index` | projection keyed by `game_id` | A | rebuildable |
+
+**No case is left unclassified, and no constraint relies on `NULL` meaning "any".**
+Two rules make the table short:
+
+- where a nullable column genuinely distinguishes rows (a scope, a fingerprint
+  kind, a version binding), the constraint is **partial** and its predicate is the
+  proof; and
+- where a nullable column was part of a *logical* identity with no discriminator to
+  pin it (`locale`), the key uses a **normalised non-null column** instead.
 
 ---
 
@@ -546,7 +653,8 @@ a fachliche entity (invariant 2).
 | `location_kind` | TEXT enum | no | `File` or `ArchiveEntry` |
 | `source_id` | UUIDv7 | no | The source this path is relative to |
 | `relative_path` | TEXT | no | Path **relative to the source root**, verbatim as observed |
-| `archive_entry_path` | TEXT | yes | Entry path inside the archive; required for `ArchiveEntry`, `NULL` for `File` |
+| `archive_content_id` | UUIDv7 | yes | For an `ArchiveEntry` location: **the `ArchiveContainer` this entry lives in**. `NULL` for `File` locations |
+| `archive_entry_path` | TEXT | yes | Entry path inside that container; required for `ArchiveEntry`, `NULL` for `File` |
 | `observed_filename` | TEXT | no | The file name as observed; a label, not an identity |
 | `observed_size` | INTEGER | yes | Last observed size in bytes; `NULL` = not observed |
 | `observed_mtime` | timestamp | yes | Last observed modification time; `NULL` = not observed |
@@ -558,9 +666,31 @@ a fachliche entity (invariant 2).
 **Foreign keys.**
 
 - `content_id → contents.id` — `RESTRICT`.
+- `archive_content_id → contents.id` — `RESTRICT`, nullable (see the check
+  constraint and the decision below).
 - `source_id → library_sources.id` — `RESTRICT`.
 - `last_seen_scan_run_id → scan_runs.id` — `SET NULL`, nullable (provenance only;
   see §19.7).
+
+**Check constraint.** The two archive columns belong to exactly one location kind,
+and `#109` can implement this verbatim:
+
+```sql
+CHECK (
+    CASE location_kind
+        WHEN 'File'         THEN archive_content_id IS NULL
+                                 AND archive_entry_path IS NULL
+        WHEN 'ArchiveEntry' THEN archive_content_id IS NOT NULL
+                                 AND archive_entry_path IS NOT NULL
+    END
+)
+```
+
+`location_kind` is `NOT NULL` and constrained to those two values, so the `CASE`
+always has a branch to take. The rule that `archive_content_id` must reference a
+content of kind `ArchiveContainer` cannot be a foreign key — it is a predicate on
+the *parent row*, not on the reference — so it is a **write-path rule and a required
+integrity test** (§20.3 test 5).
 
 **Unique constraints.**
 
@@ -571,16 +701,42 @@ a fachliche entity (invariant 2).
   `source X / games/foo.rom` at the same time, so a launch would have two
   different answers for one file and reconciliation could not say which content
   it had just observed.
-- `(content_id, source_id, relative_path, archive_entry_path)` for
-  `ArchiveEntry` rows.
-- `(source_id, relative_path, archive_entry_path)` for `ArchiveEntry` rows only:
-  **two contents MUST NOT claim the same entry of the same archive**. Without
-  this rule a re-scan that changed its mind about which entry is playable would
-  leave the losing content pointing at a location that now belongs to another
-  content.
+- **`(content_id, archive_content_id, archive_entry_path)` for `ArchiveEntry`
+  rows — one content has one location record per entry of a given container.**
+  Deliberately **not** keyed by `source_id` or `relative_path`: the container is
+  named by identity (§14.1), so the same entry of the same archive is one location
+  even if the archive itself is observed at two paths, and the key stays valid when
+  the container moves.
+- **`(archive_content_id, archive_entry_path)` for `ArchiveEntry` rows only — two
+  contents MUST NOT claim the same entry of the same container.** Without this rule
+  a re-scan that changed its mind about which entry is playable would leave the
+  losing content pointing at a location that now belongs to another content.
 
 All four are **partial unique indexes over `location_kind`**, because the
-discriminator is what makes each key meaningful.
+discriminator is what makes each key meaningful. Every key column is `NOT NULL`,
+so none of them depends on SQLite's `NULL`-are-distinct behaviour (§3.8).
+
+**Decision — the container relationship lives on the location, not on the
+content.** An earlier revision put `contents.archive_content_id` on the content,
+which made a content belong to exactly one container. That is wrong for the same
+reason a content may have several locations at all: identical payload bytes are one
+content, so a game may legitimately be observed as a loose file *and* inside one or
+more archives at the same time.
+
+```text
+Playable content C   (one identity, whatever the packaging)
+   ├── File location            source X / loose.gba
+   ├── ArchiveEntry location    container A / ROMS/loose.gba
+   └── ArchiveEntry location    container B / ROMS/loose.gba
+```
+
+With the relationship on the location, all three rows point at the same
+`ContentId`, the container is named by identity rather than re-derived from a path,
+and adding a second archive that happens to contain the same payload creates a
+location instead of a duplicate content. `ARCHITECTURE.md` §14.1 defines exactly
+this shape — `ArchiveEntry { archive_id: ContentId, entry_path: String }` is a
+variant of `ContentLocation`, not of `Content` — so the location is also where the
+architecture puts it.
 
 **This is a location constraint, not a path identity.** It constrains *observations
 of files*, not fachliche identity: the content's identity stays its `ContentId`,
@@ -626,10 +782,10 @@ the path only has to be good enough to open the file again.
 not a content: it is inside a file that is itself indexed, and `PRODUCT.md` §10
 does not require BitArchive to keep an inventory of every entry. Only the entries
 BitArchive actually identified are recorded, which also keeps a library scan from
-having to persist a row per file inside every archive. Which archive an entry
+having to persist a row per file inside every archive. Which container an entry
 belongs to is not re-derived from these paths — it is the `archive_content_id`
-identity link on the entry content itself (§6.3), so the relationship survives the
-archive moving, being renamed, or going offline.
+column on the location, so the relationship survives the archive moving, being
+renamed, or going offline.
 
 ### 5.3 Multi-disc and playlists
 
@@ -668,16 +824,15 @@ table:
 | `LaunchContent` variant | This model |
 |---|---|
 | `File(content)` | the `Content` of kind `Content`; its `Present` location supplies source and relative path |
-| `ArchiveEntry { archive, entry }` | `archive` is the `ArchiveContainer` content; `entry` is the entry `Content`, whose `archive_content_id` column **is** that container (§6.3) and whose `EntryList` fingerprint (§7.1) records the entry path. Both halves therefore resolve from identities: no path matching, and no second entry identity |
+| `ArchiveEntry { archive, entry }` | `archive` is the `ArchiveContainer` content; `entry` is the entry `Content`, found through the `content_locations` row whose `archive_content_id` **is** that container and whose `archive_entry_path` is the entry path (§5.2). Both halves resolve from identities: no path matching, and no second entry identity |
 | `ExistingPlaylist(content)` | the `Playlist` content whose location is the user's `.m3u` |
 | `ManagedPlaylist { path, members }` | a `content_derivations` row (§6.6): `content_id` is the managed playlist, `relative_path` is `path`, and the `content_derivation_members` rows are `members` in `member_index` order |
 
 **Decision — no `ArchiveEntryId`.** An `ArchiveEntryId` would be a fourth
 identity for something that is already fully identified by (container content,
-entry path) and whose entry path is recorded as the content's own fingerprint.
+entry path) — both of which the `ArchiveEntry` location carries directly (§5.2).
 Introducing it would add an identity type with no fachliche content, which §3.1
-forbids. The container relationship this table needs is the
-`archive_content_id` identity link of §6.3, not a new type.
+forbids.
 
 ---
 
@@ -836,7 +991,6 @@ reference stable across the rebuild.
 | `release_id` | UUIDv7 | no | The release this content belongs to |
 | `game_id` | UUIDv7 | no | Redundant-by-design parent for the integrity rule below |
 | `content_kind` | TEXT enum | no | `Content`, `ArchiveContainer`, `Playlist` |
-| `archive_content_id` | UUIDv7 | yes | For an entry content: **its container** (`content_kind = 'ArchiveContainer'`). `NULL` for every other content |
 | `format` | TEXT | yes | Normalized format token, e.g. `nes`, `chd`, `cue`, `bin`, `gb`; `NULL` = not classified |
 | `validation_state` | TEXT enum | no | `Unvalidated`, `Valid`, `Suspect`, `Invalid` |
 | `validation_detail` | TEXT | yes | Machine-readable reason for `Suspect`/`Invalid` (`PRODUCT.md` §11); `NULL` = none |
@@ -849,8 +1003,12 @@ reference stable across the rebuild.
   foreign key is what makes "a content's release belongs to the content's game" a
   database fact rather than a hope.
 - `release_id → releases.id` — covered by the composite key above.
-- `archive_content_id → contents.id` — `RESTRICT`, nullable. See the decision
-  below.
+
+**There is deliberately no `archive_content_id` here.** Which container an entry
+was found in is a property of a **location**, not of the content, and it is
+modelled in `content_locations` (§5.2). A content may be present loose and inside
+several archives at once, so a single container column on the content would make
+all but one of those observations unrepresentable. See the decision in §5.2.
 
 **Unique constraints.** `id`. There is **no** unique constraint on
 `(release_id, disc_index)`: a multi-disc release may legitimately hold a disc and
@@ -864,12 +1022,12 @@ fact (§7).
 **Owner.** SQLite. **Lifecycle.** Persistent.
 
 **Retention.** A content disappears with its release, which happens only in the
-**full reset** (§19.3). A library rebuild clears `content_locations` but **keeps**
-the content and its canonical `Payload` fingerprint, because that fingerprint is
-the recognition evidence a re-scan needs to bind a rediscovered payload back to
-this `ContentId` (§19.3). Losing its last location does **not** delete a content
-either: the fingerprint is also what allows BitArchive to recognize it when it
-comes back (`PRODUCT.md` §7.6).
+**full reset** (`PRODUCT.md` §40, §19.3). A library rebuild clears
+`content_locations` but **keeps** the content and its canonical `Payload`
+fingerprint, because that fingerprint is the recognition evidence a re-scan needs
+to bind a rediscovered payload back to this `ContentId` (§19.3). Losing its last
+location does **not** delete a content either: the fingerprint is also what allows
+BitArchive to recognize it when it comes back (`PRODUCT.md` §7.6).
 
 **Invariant protected.** `Release ≠ Content` (invariant 1); one release has many
 contents.
@@ -883,9 +1041,8 @@ alternative — modelling the ZIP as a location of the ROM content — would los
 distinction between "the file BitArchive opens" and "the entry inside it", which
 is exactly what launch content resolution needs (`ARCHITECTURE.md` §14.2, §14.4).
 
-**Decision — an entry content names its container through
-`archive_content_id`, never through a path.** `ARCHITECTURE.md` §14.1 models the
-location as
+**Decision — the entry-to-container link is an identity, and it lives on the
+location.** `ARCHITECTURE.md` §14.1 defines the location as
 
 ```rust
 ArchiveEntry {
@@ -894,23 +1051,19 @@ ArchiveEntry {
 }
 ```
 
-so the container is named by **identity**. A path could not do this job: the
-archive's location is a fact about the file system (§5.2) and changes when the ZIP
-moves or when its source is offline, while the entry-to-container relationship is
-fachlich and must survive both. Reconstituting "which archive does this entry
-belong to?" by matching `relative_path` would make a relationship depend on a
+so the container is named by **identity**, never by a path. A path could not do
+this job: the archive's location is a fact about the file system (§5.2) and changes
+when the ZIP moves or when its source is offline, while the entry-to-container
+relationship must survive both. Reconstituting "which archive does this entry
+belong to?" by matching `relative_path` would make the relationship depend on a
 location, which invariant 2 forbids, and it would silently produce a second,
 possibly different answer after a move.
 
-The rule is one-directional and strictly shaped:
-
-- `archive_content_id` is `NOT NULL` **iff** `content_kind = 'Content'` **and** the
-  content came from inside an archive. The schema MUST enforce this.
-- It MUST reference a content of kind `ArchiveContainer`.
-- It MUST NOT create a cycle: a container never has an `archive_content_id`.
-- The `EntryList` fingerprint of the entry content (§7.1) records the **entry path
-  inside that container**. The entry path therefore still lives where it belongs —
-  with the location and the fingerprint — while the fachliche link is an identity.
+`content_locations` therefore carries both `archive_content_id` (the container,
+`NOT NULL` for `ArchiveEntry`) and `archive_entry_path` (the path inside it,
+`NOT NULL` for `ArchiveEntry`), governed by the check constraint in §5.2. Because
+the link sits on the location, the same playable payload observed loose and in two
+archives is **one content with three locations**, not three contents.
 
 **Decision — no `ArchiveEntryId`.** See §5.4: the `entry` half of
 `LaunchContent::ArchiveEntry` is the entry **content**, so no additional identity
@@ -919,7 +1072,9 @@ type is introduced.
 **Decision — at most one playable entry is imported per archive.** A ZIP with
 zero or several playable entries is *ambiguous* and is recorded as an unsupported
 or unknown file rather than as a release (`PRODUCT.md` §10). BitArchive never
-extracts an archive persistently.
+extracts an archive persistently. Note what this does **not** say: it limits how
+many entries BitArchive *imports from one* archive, not how many archives may
+contain the same playable payload.
 
 ### 6.4 `release_regions`, `release_languages`
 
@@ -1130,7 +1285,8 @@ systems ──1:N──> releases <──N:1── games
                      ▼
              content_locations ──N:1──> library_sources
 
-contents ──0:N──> contents        (archive_content_id: entry → its container)
+contents ──1:N──> content_locations ──0:N──> contents
+                                   (archive_content_id: entry location → its container)
 games ──1:N──> releases ──1:N──> contents ──1:N──> save_states
 ```
 
@@ -1159,13 +1315,24 @@ reappears in another source (`PRODUCT.md` §7.6, §7.7). A fingerprint is eviden
 | `algorithm` | TEXT enum | no | **`Sha256` is the only value in schema v1.** The column exists so a later algorithm can be added without a migration, not to admit one now |
 | `digest` | `BLOB(32)` | no | The 32 raw bytes of the SHA-256 digest |
 | `entry_path` | TEXT | yes | The archive entry this digest belongs to; `NOT NULL` only for `EntryList` rows |
-| `byte_size` | INTEGER | yes | The size the digest covers; `NULL` = not recorded |
+| `byte_size` | INTEGER | yes | The size the digest covers; `NULL` = not recorded. An **invalidation hint only** — it is deliberately not part of any uniqueness rule (see below) |
 | `computed_at` | timestamp | no | When it was computed |
 | `source_scan_run_id` | UUIDv7 | yes | The run that computed it; `NULL` = computed outside a persisted run, or its run was pruned (§19.7) |
 
 **Primary key.** `(content_id, fingerprint_kind, algorithm)` for `Payload` and
 `Container`; `(content_id, fingerprint_kind, algorithm, entry_path)` for
 `EntryList`.
+
+**Check constraint.** `entry_path` is populated for exactly one kind, which is what
+makes the second primary key above effective — `entry_path` is nullable, and a
+nullable component would otherwise leave the `EntryList` key unenforced (§3.5):
+
+```sql
+CHECK ((fingerprint_kind = 'EntryList') = (entry_path IS NOT NULL))
+```
+
+A `Payload` or `Container` row therefore never carries an entry path, and an
+`EntryList` row always does. §20.3 test 33 asserts it.
 
 **Foreign keys.** `content_id → contents.id` — `CASCADE` (a fingerprint
 without its content is meaningless). `source_scan_run_id → scan_runs.id` —
@@ -1174,16 +1341,48 @@ stays valid and usable when the run that computed it has been pruned (§19.7).
 
 **Unique constraints / indexes.**
 
-- **`(algorithm, fingerprint_kind, digest, byte_size)` — UNIQUE. The recognition
-  index.** It answers "have I seen these bytes before?", which is what moved-file
-  recognition, duplicate detection and content matching all need. `byte_size` is
-  part of the key because it is nearly free to compare and it removes almost all
-  hash collisions from consideration before a digest comparison happens.
-  - **UNIQUE, not merely indexed**, and the word matters: it is what makes the
-    digest → content lookup of §19.3 return *one* row or none instead of a choice.
-    Two contents can therefore never both claim the same payload digest; identical
-    files are two locations of one content (`PRODUCT.md` §7.7).
+- **`(algorithm, digest)` WHERE `fingerprint_kind = 'Payload'` — UNIQUE. The
+  recognition key.** This single partial index is what guarantees the property the
+  whole re-identification path rests on:
+
+  ```text
+  Payload / Sha256 / digest abc   →  at most one ContentId
+  ```
+
+  It answers "have I seen these bytes before?", which is what moved-file
+  recognition, duplicate detection and content matching all need. Two contents can
+  therefore never both claim the same payload digest, and identical payload files
+  are two locations of one content (`PRODUCT.md` §7.7).
 - `(content_id)` — reading a content's own fingerprints.
+- `(content_id, fingerprint_kind, algorithm)` — the primary key; reading a
+  content's single `Payload` or `Container` row.
+
+**The recognition key is exactly the lookup key (binding).** §19.3's rescan looks a
+payload up by `(fingerprint_kind = 'Payload', algorithm, digest)` and nothing else,
+so the constraint above covers **precisely** those columns. An earlier revision
+declared `UNIQUE (algorithm, fingerprint_kind, digest, byte_size)` globally and
+looked up on three of those four columns, which guaranteed nothing:
+
+- `byte_size` is **nullable**, and SQLite treats `NULL` values in a unique index as
+  distinct from one another. Two rows
+  `Payload / Sha256 / abc / NULL` could therefore coexist, the lookup would return
+  two contents, and "digest → exactly one `ContentId`" would be false.
+- The constraint was **global**, so it also applied to `EntryList` rows and forbade
+  the same entry bytes appearing in two different archives — which is legitimate:
+  two ZIPs may contain the same playable ROM, and each archive needs its own
+  `EntryList` row for that entry.
+
+The rule is now:
+
+| Fingerprint kind | Uniqueness |
+|---|---|
+| `Payload` | **globally unique** on `(algorithm, digest)`: a payload digest belongs to one content |
+| `Container` | not globally unique: the same archive bytes may be observed as two container contents |
+| `EntryList` | only per `(content_id, entry_path)` via the primary key; **the same entry bytes may occur in many archives** |
+
+`byte_size` stays as an **invalidation hint** (§7.3): it is compared to shortcut a
+re-hash, and it never narrows or widens the recognition identity. §20.3 test 31
+asserts that the lookup columns and the constraint columns are identical.
 
 **Cardinality, stated because two consumers depend on it.**
 
@@ -1445,7 +1644,8 @@ land in a known field, not in a free-form bag.
 | `subject_kind` | TEXT enum | no | `Game`, `Release` |
 | `subject_id` | UUIDv7 | no | The subject's identity; interpretation depends on `subject_kind` |
 | `field_key` | TEXT | no | One of `metadata_fields.field_key` |
-| `locale` | TEXT | yes | BCP-47 tag; `NULL` = language-neutral |
+| `locale` | TEXT | yes | The fachliche locale: a BCP-47 tag, or `NULL` for language-neutral. **Not part of any key** |
+| `locale_key` | TEXT | no | The **storage** locale used by the key: `locale` when set, otherwise the sentinel `und`. See the decision below |
 | `value_index` | INTEGER | no | The value's position within this provider field. **Always set, even for a single-valued field** |
 | `value_text` | TEXT | yes | The value as text |
 | `value_number` | INTEGER | yes | The value when the field is numeric |
@@ -1463,26 +1663,63 @@ resolver's tie-break, so it is defined explicitly rather than implied).**
 - **Valid range:** `0 <= value_index`. Zero-based, because it is a position in a
   list and the first value of a field is the common case.
 - **Meaning:** the identity of *this* value among the several values the same
-  provider returned for the same `(subject, field_key, locale)`. It is not a
+  provider returned for the same `(subject, field_key, locale_key)`. It is not a
   ranking, not a relevance score and not a timestamp.
 - **Deterministic assignment (binding):** for one
-  `(provider_id, subject_kind, subject_id, field_key, locale)`, a write assigns
+  `(provider_id, subject_kind, subject_id, field_key, locale_key)`, a write assigns
   `0, 1, 2, …` in the order the provider adapter yielded the values for that field.
   The order MUST come from the provider's own response order, so the same response
   persisted twice produces the same indices. A refresh replaces the whole set for
   the provider/field/locale it refreshed, so indices never accumulate across
   refreshes.
 - **Cardinality rule:** `metadata_fields.is_multi_valued = 0` means only
-  `value_index = 0` may exist for that `(subject, field, locale)`; a multi-valued
+  `value_index = 0` may exist for that `(subject, field, locale_key)`; a multi-valued
   field may have any number of consecutive indices. The schema MUST enforce the
   single-valued case and the write path enforces consecutiveness.
 - **Not a surrogate for order of discovery:** it deliberately does **not** encode
   "which value arrived first across refreshes". Provenance timing is
   `fetched_at`, and mixing the two would make the key depend on network timing.
 
-**Primary key.** `(provider_id, subject_kind, subject_id, field_key, locale,
-value_index)` — every column of it is defined above, and a provider may
+**Primary key.** `(provider_id, subject_kind, subject_id, field_key, locale_key,
+value_index)` — every column of it is `NOT NULL` (§3.5), and a provider may
 legitimately return several values for a multi-valued field.
+
+**Decision — `locale_key`, because a nullable key column is not a key.** The
+fachliche column `locale` is genuinely nullable: a provider value may be
+language-neutral. Putting it in the primary key would have made the key
+**unenforceable for exactly the language-neutral rows**, because SQLite treats
+`NULL` values in a unique index as distinct and does not forbid `NULL` in a
+composite `PRIMARY KEY` (§3.5). Two identical language-neutral rows could therefore
+coexist, and the resolver could see the same provider value twice.
+
+The chosen representation is a **non-null storage key with a reserved sentinel**:
+
+```text
+locale      TEXT NULL      the fachliche locale; NULL = language-neutral
+locale_key  TEXT NOT NULL  = locale when set, otherwise 'und'
+CHECK (locale_key = COALESCE(locale, 'und'))
+```
+
+- `'und'` is the BCP-47 code for *undetermined*, which is what "language-neutral"
+  is, so the token is honest rather than arbitrary — and it is **reserved**:
+  `-und-` is an ISO 639-2 collective code, so it is not a language anyone
+  requests, and a provider value whose locale is genuinely undefined cannot collide
+  with a user preference for a specific language.
+- **The sentinel is a storage device, not a language.** It is never rendered to the
+  user, never translated, and never matched by a locale preference. The domain type
+  keeps the nullable shape (`Option<Locale>`), and the read path maps `'und'` back
+  to `None` before anything fachlich sees it. Nothing outside the storage layer may
+  treat `locale_key = 'und'` as "the language und".
+- The `CHECK` is what keeps the two columns in step: a writer cannot store a
+  language-neutral row with a locale, or a localised row with the sentinel. §20.3
+  test 32 asserts it.
+- `locale` is kept as a real column rather than being replaced by the sentinel so
+  that the fachliche value stays queryable without decoding a storage convention,
+  and so a future migration can change the convention without touching every
+  reader.
+
+The same normalisation is used by `manual_overrides` (§9.4), and §3.8 classifies
+both keys.
 
 **Foreign keys.** `field_key → metadata_fields.field_key` — `RESTRICT`.
 `scrape_run_id → scrape_runs.id` — `SET NULL`, nullable (provenance only; see
@@ -1522,13 +1759,20 @@ data and the single most protected class A content in the model.
 | `subject_kind` | TEXT enum | no | `Game`, `Release` |
 | `subject_id` | UUIDv7 | no | The subject's identity |
 | `field_key` | TEXT | no | One of `metadata_fields.field_key` |
-| `locale` | TEXT | yes | `NULL` = language-neutral |
+| `locale` | TEXT | yes | The fachliche locale: a BCP-47 tag, or `NULL` for language-neutral. **Not part of any key** |
+| `locale_key` | TEXT | no | The **storage** locale used by the key: `locale` when set, otherwise the sentinel `und` (§9.3) |
 | `value_text` | TEXT | yes | The override value |
 | `value_number` | INTEGER | yes | The override value when numeric |
 | `created_at` | timestamp | no | When the user set it |
 | `updated_at` | timestamp | no | When it was last changed |
 
-**Primary key.** `(subject_kind, subject_id, field_key, locale)`.
+**Primary key.** `(subject_kind, subject_id, field_key, locale_key)` — every column
+`NOT NULL` (§3.5).
+
+**Check constraint.** `CHECK (locale_key = COALESCE(locale, 'und'))`, the same
+normalisation as §9.3 and for the same reason: a nullable `locale` in the key would
+let two identical language-neutral overrides exist, and the second would be
+unreachable or would silently shadow the first.
 
 **Foreign keys.** `field_key → metadata_fields.field_key` — `RESTRICT`.
 
@@ -1536,11 +1780,17 @@ data and the single most protected class A content in the model.
 
 **Owner.** SQLite. **Lifecycle.** Persistent.
 
-**Retention.** Removed only by an explicit user action: resetting the field to
-the provider value, or resetting the library (`PRODUCT.md` §15.11, §40).
+**Retention.** Exactly two things remove a `manual_overrides` row:
 
-> **Rule (binding).** No scan, no scrape, no provider refresh, no migration, and
-> no cleanup routine may delete or overwrite a `manual_overrides` row. A
+```text
+1. the explicit user reset of that field          (PRODUCT.md §15.11)
+2. the full reset                                 (PRODUCT.md §40, §19.3)
+```
+
+> **Rule (binding).** **No scan, no library rebuild, no scrape, no provider
+> refresh, no migration and no cleanup routine may delete or overwrite a
+> `manual_overrides` row.** A library rebuild explicitly **keeps** it (§19.3). A
+> provider refresh may rewrite `provider_values`; it may not touch overrides. A
 > migration that cannot map an override to the current `metadata_fields` set MUST
 > preserve the row and report it, not drop it (invariant 19).
 
@@ -1554,25 +1804,40 @@ improve it. Deleting the override restores the documented priority order.
 
 ### 9.5 Effective metadata resolution
 
-Derived, in this order per `(subject, field_key, requested locale)`:
+Derived, in this order per `(subject, field_key, requested locale)`. The queries
+use `locale_key`, which is the non-null storage form of `locale` (§9.3):
 
 ```text
-1. manual_overrides   where locale = requested locale
-2. manual_overrides   where locale IS NULL                (language-neutral)
-3. provider_values    where locale = requested locale
-4. provider_values    where locale = fallback locale       (PRODUCT.md §15.12)
-5. provider_values    where locale IS NULL
-6. provider_values    where any locale, lowest locale tag  (deterministic tie-break)
+1. manual_overrides   where locale_key = requested
+2. manual_overrides   where locale_key = 'und'            (language-neutral)
+3. provider_values    where locale_key = requested
+4. provider_values    where locale_key = fallback         (PRODUCT.md §15.12)
+5. provider_values    where locale_key = 'und'
+6. provider_values    where any locale_key except 'und',
+                        lowest tag                        (deterministic tie-break)
 7. absent             → the field is simply not shown
 ```
+
+**Why the steps use `locale_key` and not `locale`.** `locale` is `NULL` for
+language-neutral rows, and `NULL` never equals anything in SQL, so
+`WHERE locale = NULL` matches nothing and a step "where `locale` is language-neutral"
+would have to be written as a separate `IS NULL` branch on every query. The
+normalised key makes steps 2 and 5 ordinary equality comparisons and keeps the
+resolver's queries shaped like its specification.
 
 **Rules.**
 
 - Each step is only consulted when the previous one produced nothing.
 - Every step that can return more than one row has a total tie-break: ascending
-  `locale`, then ascending `provider_id`, then ascending `value_index`. Reading
+  `locale_key`, then ascending `provider_id`, then ascending `value_index`. Reading
   the same data twice MUST produce the same effective value
-  (`ARCHITECTURE.md` §36.3).
+  (`ARCHITECTURE.md` §36.3). Steps 1–5 are already unique by their key (§3.8), so
+  the tie-break decides steps 4 and 6 when two locales are equally acceptable.
+- A **preference is never the sentinel.** `'und'` is excluded from the requested and
+  fallback comparisons: a user who prefers German must never be served a
+  language-neutral value *because* it matched, only because it is the documented
+  last resort (step 5). `tools/check_data_model.py` asserts that the resolver
+  excludes the sentinel from steps 1–4.
 - For a **multi-valued** field (`metadata_fields.is_multi_valued = 1`) the
   resolved value is the set of that field's values in ascending `value_index`
   order; the *step* is still chosen by the rules above, and it is the step that
@@ -1702,18 +1967,39 @@ store. **SQLite stores no media bytes** (`ARCHITECTURE.md` §18.1).
 **Foreign keys.** `provider_id → metadata_providers.provider_id` — `RESTRICT`,
 nullable.
 
-**Unique constraints.**
+**Unique constraints.** `id` — the row identity, and the only key this table
+declares.
 
-- `id`.
-- `(media_type, locale, provider_id, content_digest)` — the same logical asset
-  from the same provider with the same bytes is one record. Note that the same
-  bytes may legitimately appear under two locales or two providers, which is why
-  the digest alone is not the key.
-- **`content_digest` is deliberately not unique.** The managed media store is
-  content-addressed (`ARCHITECTURE.md` §18.1), so two records may point at one
-  blob; deduplicating the *file* MUST NOT force deduplicating the *record*, or a
-  release-scoped screenshot and a game-scoped cover of the same image would
-  collapse into one row that can only belong to one of them.
+**Decision — no natural-key unique constraint, because its columns would be
+nullable.** An earlier revision declared
+`UNIQUE (media_type, locale, provider_id, content_digest)`. Three of those four
+columns are nullable (`locale`, `provider_id`, `content_digest`), so under SQLite's
+`NULL`-are-distinct rule it constrained nothing at all for exactly the common rows
+— a user-supplied, locale-neutral asset with no digest yet — and two identical rows
+could coexist. It also could not have expressed what it claimed: the columns are
+nullable *independently*, so a "key" containing them has no single meaning.
+
+The uniqueness that the product actually needs is **which asset occupies a logical
+slot**, and that is already enforced where it belongs, by the primary key of
+`media_asset_references`:
+
+```text
+media_asset_references PRIMARY KEY (subject_kind, subject_id, logical_key)
+    → one asset per slot per subject
+```
+
+Beyond that, duplicate *records* are harmless by design: the managed media store is
+content-addressed (`ARCHITECTURE.md` §18.1), so several records may point at one
+blob, and **`content_digest` is deliberately not unique** — deduplicating the *file*
+MUST NOT force deduplicating the *record*, or a release-scoped screenshot and a
+game-scoped cover of the same image would collapse into one row that can only
+belong to one of them. The blob-level de-duplication happens in the store, not in
+the database.
+
+A partial index cannot repair the old constraint either: with three independently
+nullable components there is no single predicate that makes them all non-`NULL`,
+and inventing one would encode a business rule ("an asset must have a provider and a
+digest") that the model does not hold — a user-provided cover has neither.
 
 **Indexes.** `(media_type)`, `(content_digest)`, `(state)` — the garbage
 collector walks unreferenced available assets.
@@ -2667,8 +2953,8 @@ them; it does not own them.
 | `core_id` | UUIDv7 | no | The core that wrote it |
 | `core_version_id` | UUIDv7 | yes | The concrete core version, when it is known |
 | `core_version_label` | TEXT | yes | The version as observed in the file name/label, when the version cannot be bound to an installed build |
-| `slot` | TEXT | yes | The technical slot/identifier RetroArch uses; `NULL` = not slot-derived |
-| `state_name` | TEXT | yes | The name RetroArch's state is addressed by |
+| `slot` | TEXT | no | The technical slot/identifier RetroArch uses. `NOT NULL`; the empty string means "not slot-derived". See the decision below |
+| `state_name` | TEXT | yes | The name RetroArch's state is addressed by; `NULL` = not recorded |
 | `created_at` | timestamp | no | The state's timestamp as observed |
 | `file_relative_path` | TEXT | no | The state file's location, relative to the RetroArch save-state root |
 | `file_size` | INTEGER | yes | Observed size |
@@ -2695,10 +2981,41 @@ Core-Version`).
 - `(release_id, core_id, core_version_id, slot)` — **one state per slot per
   release per core version.** This is the rule that makes discovery idempotent
   and keeps a re-scan from stacking duplicate rows for the same physical file.
+  Every column is `NOT NULL`, so the key is actually enforced (§3.5).
 - `(release_id, core_id, core_version_label, slot)` where `core_version_id IS
   NULL` — the same rule for states whose core version could not be bound to an
-  installed build.
+  installed build. The partial predicate is what makes `core_version_label`
+  meaningful for exactly those rows; `slot` is `NOT NULL` either way.
 - `(file_relative_path)` — one index row per physical state file.
+
+**Decision — `slot` is `NOT NULL` with an empty-string sentinel, because it is a
+key component.** An earlier revision made `slot` nullable to express "not
+slot-derived". That silently disabled both slot keys for exactly those rows: SQLite
+treats `NULL` as distinct, so two rows with the same release, core, version and a
+`NULL` slot would both have been accepted, and a re-scan could have stacked
+duplicates of the same physical file — the precise failure the key exists to
+prevent (§3.5).
+
+The normalisation is the empty string:
+
+```text
+slot = ''   the state is not addressed by a RetroArch slot (a manual or
+            name-addressed state)
+slot = '2'  RetroArch slot 2
+```
+
+The empty string is chosen because it is provably not a slot name: RetroArch slots
+are digits or names, and a zero-length identifier is neither. Nothing in the model
+interprets the value — it is an opaque identifier compared for equality
+(`ARCHITECTURE.md` §29.5 keeps naming in BitArchive and never renames the file), so
+the sentinel cannot collide with a real slot. `file_relative_path` remains the key
+that identifies the physical file regardless of how the state is addressed.
+
+**Decision — `core_version_label` stays nullable, and the second key is partial.**
+Here the nullable column *does* have a discriminator to pin it: the index applies
+only `WHERE core_version_id IS NULL`, so for the rows it covers the binding is known
+to be absent and the label is the only version evidence there is. That is the
+partial-index case of §3.5, not the unenforced-key case.
 
 **Indexes.**
 
@@ -3224,10 +3541,10 @@ list and no other.
 `content_locations` → `provider_values` → `scan_runs` — and the whole rebuild runs
 in **one transaction**. A rebuild that cleared the index and then failed must not
 leave a half-reset library visible, and a partially cleared index would be worse
-than either end state. No reference cycle has to be broken here: the retained
-tables are the *parents* in every remaining relationship, and the two cycles the
-model does contain (a game's default release, a content's archive container) are
-between retained tables and are therefore untouched.
+than either end state. No reference has to be cleared here: every cleared table is
+a child in each of its remaining relationships, and the retained tables are the
+parents. The mutual `games` ↔ `releases` reference is between two **retained**
+tables and is not touched by a rebuild at all.
 
 `content_fingerprints` is **not** in that sequence: it is the one table the rebuild
 deliberately keeps (see the decision below). `search_index` is a projection and is
@@ -3275,13 +3592,19 @@ result:    GameId / ReleaseId / ContentId stay stable;
            metadata, favorites and statistics remain attached
 ```
 
-*The lookup is unambiguous by construction.* §7.1 makes
-`(algorithm, fingerprint_kind, digest, byte_size)` unique for `Payload` rows, so one
-payload digest maps to exactly one content: the lookup returns one row or none,
-never a choice. And because §7.1's primary key allows one `Payload` row per
-content, "the canonical payload fingerprint" is well defined rather than a
-convention. Two files with identical payloads are therefore two locations of one
-content — which is exactly `PRODUCT.md` §7.7's duplicate rule, not a special case.
+*The lookup is unambiguous by construction.* The lookup uses exactly
+`(fingerprint_kind = 'Payload', algorithm, digest)`, and §7.1 declares a partial
+**UNIQUE** index over exactly those columns. The constraint and the lookup are
+therefore the same key, and the lookup returns one row or none, never a choice. And
+because §7.1's primary key allows one `Payload` row per content, "the canonical
+payload fingerprint" is well defined rather than a convention. Two files with
+identical payloads are therefore two locations of one content — which is exactly
+`PRODUCT.md` §7.7's duplicate rule, not a special case.
+
+Note what the key deliberately does **not** include: `byte_size`. It is nullable,
+SQLite treats `NULL`s in a unique index as distinct, and a constraint containing it
+would not have guaranteed what the lookup assumes. `entry_path` is likewise absent,
+so the same entry bytes may occur in several archives (§7.1).
 
 *What this preserves and what it costs.* The rebuild keeps a bounded amount of
 information — one 32-byte digest per content — in exchange for guaranteeing the
@@ -3296,76 +3619,92 @@ content afterwards.
 state. It is the *only* operation in this model that removes `games`, `releases`,
 `contents`, `sessions` or `save_states` rows, and even it never touches a user file.
 
-The model contains **three deletion cycles**, and a full reset has to break all of
-them before it can delete anything:
+**The order below is verified, not asserted.** It was derived from the declared
+foreign keys and then **executed against a real SQLite database with
+`PRAGMA foreign_keys=ON`**, with one referencing row seeded for every edge, so
+every `RESTRICT` actually bites. `tools/check_data_model.py` re-derives it from the
+foreign keys in this document on every run and fails if the two disagree, so the
+list cannot drift away from the model it claims to satisfy.
+
+**No pointer has to be cleared first.** An earlier revision prefixed this plan with
+`UPDATE games SET default_release_id = NULL` and
+`UPDATE sessions SET content_id = NULL, release_id = NULL`. Both are unnecessary,
+and removing them is what the verification showed:
+
+- `games.default_release_id` is `SET NULL`, so deleting a release nulls the pointer
+  itself. That reference therefore creates no ordering constraint at all; it would
+  only do so if it were `RESTRICT`.
+- `sessions.content_id` **is** `RESTRICT`, but `sessions` is deleted *before*
+  `contents` in the order, so the reference is gone before its target is.
+
+So the rule is simply: **delete child before parent, and one ordering does it.**
+There is **no cycle of `RESTRICT` references in this model**, which is why no
+pointer pre-clearing is needed anywhere. The only mutual reference is
+`games` ↔ `releases`, and it is not a cycle in the ordering sense because one of its
+two directions is `SET NULL`. Clear a nullable pointer explicitly only if a future
+change turns such a reference into `RESTRICT` and makes an ordering impossible; the
+model currently contains none, and `tools/check_data_model.py` re-derives that fact
+from the declared foreign keys on every run.
 
 ```text
-1. games.default_release_id  -> releases.id   and  releases.game_id -> games.id
-2. contents.archive_content_id -> contents.id     (a content's container is a content)
-3. sessions.content_id -> contents.id             (restrictive, so it must be
-                                                   released before contents goes)
-```
-
-None of them is optional and none is an error: a game may name its default release
-while that release names its game, an archive entry must name its container by
-identity (§6.3), and a session records the exact content it launched — all with
-`RESTRICT`, so none of them clears itself. A reset therefore **clears those
-pointers first**, then deletes child-before-parent. The left column is the step;
-each line names the table it deletes, and the steps that clear only pointers say so.
-
-```text
- 1. UPDATE games    SET default_release_id = NULL   (breaks cycle 1)
-    UPDATE sessions SET content_id = NULL,
-                        release_id = NULL            (frees contents)
- 2. DELETE save_states                 (refs releases, cores, core_versions, media_assets)
- 3. DELETE core_option_overrides       (refs core_versions, games, systems)
-    DELETE core_option_definitions     (refs core_versions)
-    DELETE core_option_schemas         (refs core_versions)
-    DELETE retroarch_setting_overrides (refs games, systems)
-    DELETE core_selection_overrides    (refs cores, games, releases, systems)
- 4. DELETE content_derivation_members  (refs content_derivations, contents)
-    DELETE content_derivations         (refs contents)
- 5. DELETE content_fingerprints        (refs contents, scan_runs)
-    DELETE content_locations           (refs contents, library_sources, scan_runs)
-    DELETE contents                    (now unreferenced; archive_content_id went with
-                                        the rows, sessions released them in step 1)
- 6. DELETE release_regions             (refs releases)
-    DELETE release_languages           (refs releases)
-    DELETE releases                    (refs games, systems; games released them in step 1)
- 7. DELETE sessions, games
- 8. DELETE media_asset_references      (refs media_assets)
-    DELETE media_assets                (refs metadata_providers)
- 9. DELETE provider_values             (refs metadata_fields, scrape_runs)
-    DELETE manual_overrides            (refs metadata_fields)
-    DELETE scrape_run_items            (refs games, scrape_runs)
-    DELETE scrape_runs                 (refs games, metadata_providers, systems)
-10. DELETE scan_run_issues             (refs library_sources, scan_runs)
-    DELETE scan_runs                   (refs library_sources)
-    DELETE library_sources             (refs systems)
-11. DELETE managed_components          (refs core_versions, runtime_versions)
-    DELETE core_versions               (refs cores)
+ 1. DELETE core_option_overrides          (refs core_versions, games, systems)
+    DELETE core_option_definitions        (refs core_versions)
+    DELETE core_option_schemas            (refs core_versions)
+ 2. DELETE retroarch_setting_overrides    (refs games, systems)
+    DELETE core_selection_overrides       (refs cores, games, releases, systems)
+ 3. DELETE save_states                    (refs releases, cores, core_versions, media_assets)
+ 4. DELETE content_derivation_members     (refs content_derivations, contents)
+    DELETE content_derivations            (refs contents)
+ 5. DELETE content_fingerprints           (refs contents, scan_runs)
+    DELETE content_locations              (refs contents, library_sources, scan_runs)
+ 6. DELETE sessions                       (refs games, releases, contents, cores,
+                                           core_versions, runtime_versions)
+ 7. DELETE contents                       (refs releases; its locations,
+                                           fingerprints, derivations and sessions
+                                           are gone above)
+ 8. DELETE release_regions                (refs releases)
+    DELETE release_languages              (refs releases)
+    DELETE releases                       (refs games, systems; games released the
+                                           default-release pointer via SET NULL)
+ 9. DELETE scrape_run_items               (refs games, scrape_runs)
+    DELETE scrape_runs                    (refs games, metadata_providers, systems)
+10. DELETE media_asset_references         (refs media_assets)
+    DELETE media_assets                   (refs metadata_providers)
+11. DELETE games                          (default_release_id already NULL;
+                                           scrape_run_items and every override are gone)
+12. DELETE provider_values                (refs metadata_fields, scrape_runs)
+    DELETE manual_overrides               (refs metadata_fields)
+13. DELETE scan_run_issues                (refs library_sources, scan_runs)
+    DELETE scan_runs                      (refs library_sources)
+    DELETE library_sources                (refs systems)
+14. DELETE core_versions                  (refs cores)
     DELETE runtime_versions
     DELETE cores
-12. DELETE systems
-    DELETE metadata_providers          (refs nothing; curated)
-    DELETE metadata_fields             (refs nothing; curated)
-13. DELETE schema_migrations and the database file itself
+15. DELETE managed_components             (refs core_versions, runtime_versions)
+16. DELETE systems
+17. DELETE metadata_providers             (refs nothing; curated)
+    DELETE metadata_fields                (refs nothing; curated)
+18. DELETE schema_migrations and the database file itself
 ```
 
-Every step places a table **after** everything that references it, so no foreign
-key is violated mid-way. The three cycles are why step 1 exists at all and why the
-order takes this shape: `games` cannot go before `releases` (the release still names
-its game) and `releases` cannot go before `games` (the game still names its default
-release) until one of the two directions is cleared; `contents` cannot go while
-another content names it as a container; and it cannot go while a session or a
-derivation still points at it. Step 1 clears exactly those three pointers.
+**Why `games` is deleted so late.** It is referenced by `RESTRICT` from
+`core_option_overrides`, `retroarch_setting_overrides`, `core_selection_overrides`,
+`sessions`, `scrape_run_items` and `scrape_runs`, so it cannot go until all six are
+gone. The previous plan deleted `games` at step 7 and then tried to delete the two
+`scrape_*` tables — which would have failed with
+`FOREIGN KEY constraint failed`. That is the concrete defect this order fixes.
+
+**Why `cores` is deleted after `core_versions`.** `core_versions.core_id` is
+`RESTRICT` and points at `cores`, so the versions go first; `managed_components`
+follows because it only points *at* the versions, and with `SET NULL`.
 
 `firmware_entries`, `firmware_index_state` and `component_index_state` are
 deliberately absent: they are index-only tables that reference nothing and hold no
 identity, so a full reset may truncate them at any point or simply delete the
-database file in step 13. `search_index` is likewise a projection and needs no explicit step.
+database file in step 18. `search_index` is likewise a projection and needs no
+explicit step.
 
-**Rule (binding).** Step 13 is the only step that may touch anything outside the
+**Rule (binding).** Step 18 is the only step that may touch anything outside the
 database, and even it touches **only BitArchive's own data area**.
 `PRODUCT.md` §41 states that BitArchive never deletes the underlying ROM/ISO files,
 and `PRODUCT.md` §40 repeats it for the full reset: ROMs, ISOs and BIOS/firmware
@@ -3528,20 +3867,20 @@ a silent retention rule.
 | 6 | `release_regions` | §6.4 | `(release_id, region)` |
 | 7 | `release_languages` | §6.4 | `(release_id, language)` |
 | 8 | `contents` | §6.3 | `ContentId` |
-| 9 | `content_locations` | §5.2 | none (a location is not an entity) |
+| 9 | `content_locations` | §5.2 | none (a location is not an entity); carries `archive_content_id` → `contents.id` for `ArchiveEntry` rows |
 | 10 | `content_derivations` | §6.6 | `(content_id, kind)` |
 | 11 | `content_derivation_members` | §6.6 | `(content_id, kind, source_content_id)` |
-| 12 | `content_fingerprints` | §7.1 | `(content_id, kind, algorithm[, entry_path])` |
+| 12 | `content_fingerprints` | §7.1 | `(content_id, kind, algorithm[, entry_path])` plus the partial recognition index `(algorithm, digest) WHERE kind = 'Payload'` |
 | 13 | `scan_runs` | §8.1 | `ScanRunId` |
 | 14 | `scan_run_issues` | §8.2 | `(scan_run_id, issue_index)` |
 | 15 | `metadata_fields` | §9.2 | `field_key` |
 | 16 | `metadata_providers` | §9.7 | `provider_id` |
-| 17 | `provider_values` | §9.3 | `(provider_id, subject, field, locale, value_index)` |
-| 18 | `manual_overrides` | §9.4 | `(subject, field, locale)` |
+| 17 | `provider_values` | §9.3 | `(provider_id, subject_kind, subject_id, field_key, locale_key, value_index)` |
+| 18 | `manual_overrides` | §9.4 | `(subject_kind, subject_id, field_key, locale_key)` |
 | 19 | `scrape_runs` | §9.6 | `ScrapeRunId` |
 | 20 | `scrape_run_items` | §9.6 | `(scrape_run_id, game_id)` |
-| 21 | `media_assets` | §10.1 | `MediaAssetId` |
-| 22 | `media_asset_references` | §10.2 | `(subject, logical_key)` |
+| 21 | `media_assets` | §10.1 | `MediaAssetId` (no natural-key unique constraint; see §10.1) |
+| 22 | `media_asset_references` | §10.2 | `(subject_kind, subject_id, logical_key)` |
 | 23 | `firmware_entries` | §11.1 | `(relative_path)` (an index key, not an identity) |
 | 24 | `firmware_index_state` | §11.2 | `singleton` |
 | 25 | `cores` | §12.3 | `CoreId` |
@@ -3588,8 +3927,15 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
    rejects two contents claiming the same `File` path of one source (§5.2).
 4. `contents` rejects a `release_id` whose release belongs to a different
    `game_id` (§6.3).
-5. `contents` rejects an `archive_content_id` that is not an `ArchiveContainer`,
-   and rejects setting it on a container (§6.3).
+5. **Archive locations are shaped correctly** (§5.2): a `File` location with a
+   non-`NULL` `archive_content_id` or `archive_entry_path` is refused; an
+   `ArchiveEntry` location with either one `NULL` is refused; and an
+   `archive_content_id` that does not reference a content of kind
+   `ArchiveContainer` is refused by the write path (the type check is a parent-row
+   predicate, so it cannot be a foreign key).
+   Also: `contents` has **no** `archive_content_id` column at all. The same
+   playable payload observed loose and inside two archives is one content with
+   three locations, not three contents.
 6. `release_regions`/`release_languages` reject a duplicate tag and cascade only
    with their release (§6.4).
 7. `content_derivation_members` stores **several** members for one derivation,
@@ -3667,6 +4013,35 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
     and touches no path outside BitArchive's own data area (§19.3).
 30. Only the **full reset** removes `games`, `releases`, `contents`, `sessions` or
     `save_states` rows, and it removes no file (§19.3).
+31. **The recognition key and the lookup key are the same columns** (§7.1): the
+    partial unique index covers exactly `(algorithm, digest)` for
+    `fingerprint_kind = 'Payload'`, no nullable column is part of it, and a second
+    `Payload` row with the same digest is refused. Assert **0 or 1** matching
+    `ContentId` for any digest — never 2.
+32. **Language-neutral metadata is relationally unique** (§9.3, §9.4): two
+    `provider_values` rows, or two `manual_overrides` rows, that are identical in
+    every fachliche respect including "language-neutral" are refused. Also assert
+    the `CHECK (locale_key = COALESCE(locale, 'und'))` rejects a row whose two
+    locale columns disagree.
+33. **`content_fingerprints.entry_path` is populated for exactly one kind** (§7.1):
+    a `Payload` or `Container` row with an entry path is refused, an `EntryList`
+    row without one is refused, and two `EntryList` rows may share a digest as long
+    as their `(content_id, entry_path)` differs.
+34. **The same entry bytes may occur in several archives** (§7.1): two contents in
+    two different containers may each carry an `EntryList` row with the same
+    digest; no global uniqueness applies to `EntryList`.
+35. **`media_assets` declares no natural-key unique constraint** (§10.1): two asset
+    rows may share a digest, a provider or a locale, and slot uniqueness is
+    enforced by `media_asset_references` alone.
+36. **The documented full-reset order executes with `foreign_keys=ON`** (§19.3):
+    seeding one referencing row per declared edge and deleting in the documented
+    order completes without a foreign-key error, with no pointer pre-clearing.
+    Deleting `games` before `scrape_run_items`/`scrape_runs` MUST fail — that is
+    the regression this test guards.
+37. **No key depends on `NULL` semantics** (§3.5, §3.8): every table with a
+    composite primary key or unique constraint either declares all key columns
+    `NOT NULL`, or carries a check constraint / partial predicate that proves the
+    key component is non-`NULL` for the rows it covers.
 
 #### Structural checks that run against this document
 
