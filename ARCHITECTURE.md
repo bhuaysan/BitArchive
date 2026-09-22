@@ -479,6 +479,23 @@ Eine ältere BitArchive-Version darf eine inkompatibel neuere Datenbank nicht ö
 
 Der gleiche `MigrationRunner` wird bei Restore alter Backups verwendet.
 
+Der Runner folgt dabei drei Regeln:
+
+- **Das Ledger entsteht durch den Runner selbst**, bevor die erste nummerierte
+  Migration läuft, und wird nicht selbst als Migration eingetragen. Deshalb
+  bedeutet „Schema-Version 1" eindeutig *die erste Domänenmigration*: eine
+  Datenbank, die nur die Migrationsinfrastruktur enthält, steht auf Version 0.
+  Das Ledger ist `schema_migrations` (`DATA_MODEL.md` §18.1).
+- **Jede Migration läuft in genau einer Transaktion**, zusammen mit dem
+  Ledger-Eintrag, der sie festhält. Eine fehlgeschlagene Migration ist damit nie
+  teilweise als erfolgreich vermerkt: ihr Eintrag fehlt, nichts von ihr bleibt
+  zurück, und die Datenbank steht auf der höchsten Version, die tatsächlich
+  gelungen ist. Ein erneuter Lauf wiederholt genau die fehlgeschlagene Migration.
+- **Das Ledger speichert einen Digest der Migrationsdefinition** (SHA-256, als
+  Hexadezimaltext). Der Runner vergleicht ihn bei jedem Öffnen und lehnt eine
+  nachträglich bearbeitete, bereits veröffentlichte Migration ab, statt sie
+  stillschweigend anzuwenden (`DATA_MODEL.md` §18.2 Regel 7).
+
 ---
 
 ## 10. Library Sources und Filesystem

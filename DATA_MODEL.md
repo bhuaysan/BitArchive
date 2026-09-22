@@ -4020,6 +4020,15 @@ applied.
 | `applied_at` | timestamp | no | When it was applied |
 | `bitarchive_version` | TEXT | no | The app version that applied it |
 
+`checksum` is the SHA-256 digest of the migration's own definition — version,
+description, and statements — formatted as lowercase hexadecimal text.
+
+The ledger is created by the migration runner itself, before the first numbered
+migration runs, and is **not** itself recorded as a migration. A version number
+therefore has one unambiguous meaning: **schema version 1 is the first domain
+migration**. A database that carries only the migration infrastructure is at
+version 0 and records no applied migration.
+
 **Owner.** SQLite. **Lifecycle.** Persistent. **Retention.** Never pruned; the
 ledger is the history.
 
