@@ -13,6 +13,15 @@
 //!  └── prepare <content> [opts]         → the opt-in developer launch preparation
 //! ```
 //!
+//! # APPLICATION STARTUP
+//!
+//! Starting the desktop UI runs the startup sequence of ARCHITECTURE.md §6.1 as
+//! far as it is implemented: the application paths are determined, the SQLite
+//! database below them is opened and migrated (Issue #34), and only then is the
+//! presentation layer started. See [`bootstrap`]. The database currently carries
+//! no BitArchive table — schema v1 is Issue #109 — so this changes when the
+//! database is opened, and nothing the user sees.
+//!
 //! # LIVE COMPONENT ACQUISITION
 //!
 //! `acquire-retroarch-runtime` and `acquire-core` are the two commands that
@@ -77,6 +86,7 @@
 
 mod acquire_core;
 mod acquire_runtime;
+mod bootstrap;
 mod launch;
 mod prepare;
 
@@ -84,6 +94,7 @@ use std::process::ExitCode;
 
 use acquire_core::AcquireCoreRequest;
 use acquire_runtime::AcquireRequest;
+use bitarchive_platform::AppPaths;
 use launch::LaunchRequest;
 use prepare::PrepareRequest;
 
@@ -112,17 +123,44 @@ fn main() -> ExitCode {
 
             ExitCode::SUCCESS
         }
-        None => match bitarchive_ui::run() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("BitArchive could not start the desktop UI: {error}");
-
-                ExitCode::FAILURE
-            }
-        },
+        None => run_desktop_ui(),
         Some((unknown, _)) => {
             eprintln!("unknown command: {unknown}");
             print_usage();
+
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Brings the application up and starts the desktop UI.
+///
+/// The startup sequence runs in the order ARCHITECTURE.md §6.1 fixes, as far as
+/// it is implemented: the application paths are determined, then SQLite is opened
+/// and migrated, and only then is the presentation layer started. A failure before
+/// the UI is reached is reported and ends the process, because starting the UI
+/// against a database that could not be opened would only move the failure
+/// somewhere it cannot be explained.
+///
+/// The database handle is held for as long as the UI runs. It owns the thread that
+/// holds the connection, so it must outlive everything that will read or write
+/// through it, and dropping it is what closes the database.
+fn run_desktop_ui() -> ExitCode {
+    let paths = AppPaths::default();
+
+    let _database = match bootstrap::open_database(&paths) {
+        Ok(database) => database,
+        Err(error) => {
+            eprintln!("BitArchive could not open its database: {error}");
+
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match bitarchive_ui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("BitArchive could not start the desktop UI: {error}");
 
             ExitCode::FAILURE
         }

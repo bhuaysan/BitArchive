@@ -1,22 +1,37 @@
 //! BitArchive infrastructure layer.
 //!
-//! Infrastructure holds the concrete adapters for the network and the file
-//! system. It sits outside the inner layers and implements the ports the
+//! Infrastructure holds the concrete adapters for the network, the file system,
+//! and the database. It sits outside the inner layers and implements the ports the
 //! application layer declares (ARCHITECTURE.md §2.4, §5.3):
 //!
 //! ```text
 //! UI
 //!  ↓
 //! Application   ← declares ArtifactDownloader, ArtifactExtractor,
-//!  ↓               CoreArchiveExtractor, RuntimeInstaller, CoreInstaller
-//! Domain        ← owns the pinned RuntimeDefinition and CoreDefinition
+//!  ↓               CoreArchiveExtractor, RuntimeInstaller, CoreInstaller,
+//! Domain          and the repository ports
 //!
-//! Infrastructure ← this crate: HTTP, download, staging, installation
+//! Infrastructure ← this crate: SQLite, HTTP, download, staging, installation
 //! Platform       ← the OS-specific bridges those adapters need
 //! ```
 //!
-//! What exists here is the infrastructure of managed component acquisition, for
-//! both component classes:
+//! # The database
+//!
+//! [`Database`] is the SQLite foundation (Issue #34): it opens the one local
+//! database below `AppPaths::database()`, configures it — WAL, foreign keys, a
+//! busy timeout — and applies the forward-only migrations this binary was built
+//! with. It is an opaque handle over a connection that one owned thread uses, so
+//! no caller performs SQLite work on its own thread, and no rusqlite type appears
+//! outside this crate (ARCHITECTURE.md §8).
+//!
+//! It carries no BitArchive table yet: schema v1 is Issue #109 and arrives as the
+//! first migration. See [`Database`] and the module documentation for the
+//! boundary and the versioning rules.
+//!
+//! # Managed component acquisition
+//!
+//! What exists beyond the database is the infrastructure of managed component
+//! acquisition, for both component classes:
 //!
 //! - [`HttpArtifactDownloader`] — fetches a pinned artifact over HTTPS and verifies
 //!   its SHA-256 while it arrives. One implementation serves a runtime image and a
@@ -44,10 +59,12 @@
 //!
 //! Dependencies point inwards (ARCHITECTURE.md §2.4). This crate depends on
 //! [`bitarchive_application`], [`bitarchive_domain`], and the crates its transport,
-//! hashing, and archive reading need — `ureq`, `sha2`, and `zip`. It stays free of:
+//! hashing, archive reading, and database access need — `ureq`, `sha2`, `zip`,
+//! and `rusqlite`. SQLite belongs *here* and is used nowhere else: `rusqlite` is
+//! not a dependency of any other crate, and no rusqlite type appears in this
+//! crate's public API. The crate stays free of:
 //!
 //! - Slint
-//! - SQLite / rusqlite
 //! - Tokio and async runtimes
 //! - [`bitarchive_emulation`], and therefore of `RetroArchBackend`,
 //!   `RetroArchLaunchInput`, core semantics, and content
@@ -83,6 +100,7 @@ mod artifact_extract;
 mod component_store;
 mod core_archive;
 mod core_store;
+mod database;
 mod firmware_inventory;
 mod http_download;
 mod store_layout;
@@ -91,6 +109,7 @@ pub use artifact_extract::AppleDiskImageExtractor;
 pub use component_store::ComponentStore;
 pub use core_archive::ZipCoreArchiveExtractor;
 pub use core_store::CoreStore;
+pub use database::{Database, DatabaseError, SchemaVersion};
 pub use firmware_inventory::FilesystemFirmwareChecker;
 pub use http_download::{HttpArtifactDownloader, user_agent};
 

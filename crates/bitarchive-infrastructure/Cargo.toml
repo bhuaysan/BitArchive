@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 bitarchive-application = { path = "../bitarchive-application" }
 bitarchive-domain = { path = "../bitarchive-domain" }
+rusqlite = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }
 zip = { workspace = true }

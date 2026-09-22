@@ -32,6 +32,14 @@ use bitarchive_domain::runtime::{
 };
 
 mod core_acquisition;
+mod database;
+mod database_support;
+
+/// The scaffolding the crate's tests build on, rather than each other's fixtures.
+///
+/// `pub(crate)` and `cfg(test)`, so it is reachable from every test module in this
+/// crate and from nothing outside it. See the module's own documentation.
+pub(crate) mod support;
 
 /// The executable path inside a modern macOS RetroArch build, as the official
 /// universal artifact lays it out.

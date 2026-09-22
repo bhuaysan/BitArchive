@@ -47,3 +47,19 @@ ureq = "3.4.2"
 # member. Only DEFLATE is enabled, and only through the pure-Rust `zlib-rs` backend,
 # so no C toolchain and no system zlib becomes a build requirement.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# SQLite is BitArchive's local primary database (ARCHITECTURE.md §8.1), and
+# `rusqlite` is the thin access layer over it (§8.2). Only
+# `bitarchive-infrastructure` uses it; no other crate names a rusqlite type.
+#
+# `bundled` on purpose: it compiles a pinned SQLite amalgamation instead of
+# linking whatever the operating system ships, so the engine is part of the
+# committed dependency graph. FTS5 is the reason it matters here — search uses
+# it (ARCHITECTURE.md §36.4) and the bundled build guarantees it, while a system
+# SQLite may have been built without it. The trade-off is that a C compiler
+# becomes a build requirement, which the bundled amalgamation needs and which
+# the rest of the dependency set deliberately avoids.
+#
+# The default set is replaced rather than extended because its only member
+# beyond `cache` selects a WebAssembly SQLite backend for
+# `target_os = "unknown"`, which this desktop application never builds.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
