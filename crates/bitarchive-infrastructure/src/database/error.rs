@@ -77,9 +77,10 @@ pub enum DatabaseError {
     },
     /// The database schema is newer than this application supports.
     ///
-    /// This is the refusal of DATA_MODEL.md §18.3 and ARCHITECTURE.md §9. The
-    /// database was left exactly as it was found: no ledger row and no schema
-    /// object was written.
+    /// This is the refusal of DATA_MODEL.md §18.3 and ARCHITECTURE.md §9. It is
+    /// decided before the first statement that would change the database — a
+    /// refused file keeps its journal mode as well as its rows, because the journal
+    /// mode is written into the file and is not undone by closing the connection.
     SchemaTooNew {
         /// The version recorded in the database.
         database: SchemaVersion,

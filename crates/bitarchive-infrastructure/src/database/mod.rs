@@ -11,12 +11,22 @@
 //!       ↓
 //! Database::open()                      ← this module; the file name is decided here
 //!       ↓
-//! configure                             ← WAL, foreign_keys = ON, busy timeout
+//! configure the connection              ← foreign_keys = ON and the busy timeout
+//!       ↓
+//! check the schema version              ← read-only; a newer database stops here
+//!       ↓
+//! enable WAL                            ← the first statement that changes the file
 //!       ↓
 //! MigrationRunner::apply                ← the migrations this binary was built with
 //!       ↓
 //! Database                              ← an opaque handle, used by repositories
 //! ```
+//!
+//! The check sits between the connection settings and WAL on purpose: the settings
+//! are held in memory and die with the connection, while the journal mode is
+//! written into the database file and outlives the process. A database from a
+//! newer BitArchive version is therefore refused while it is still exactly as its
+//! own version left it (see `executor::open_connection`).
 //!
 //! # What this is not
 //!

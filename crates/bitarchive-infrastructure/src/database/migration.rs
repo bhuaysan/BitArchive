@@ -240,17 +240,16 @@ impl MigrationRunner {
     /// [`DatabaseError::MigrationFailed`] if a migration fails, in which case the
     /// failed migration and its ledger row are both rolled back.
     pub(crate) fn apply(&self, database: &Database) -> Result<SchemaVersion, DatabaseError> {
-        let applied = database.read(applied_schema_version)?;
         let supported = self.supported_schema_version();
 
-        // The refusal comes before the first write. A database this build does not
-        // understand is left exactly as it was found (DATA_MODEL.md §18.3).
-        if applied > supported {
-            return Err(DatabaseError::SchemaTooNew {
-                database: applied,
-                supported,
-            });
-        }
+        // The refusal comes before the first write of this run, and the caller
+        // has already run the same check before allowing the connection to change
+        // the database at all (see `executor::open_connection`). Repeating it here
+        // is what makes `apply` safe to call on its own — a restored or copied
+        // database goes through this path without an open sequence in front of it
+        // (DATA_MODEL.md §18.2 rule 5) — and it costs one read.
+        let applied =
+            database.read(move |connection| check_compatibility(connection, supported))?;
 
         database.write(|transaction| {
             transaction
@@ -312,11 +311,54 @@ impl MigrationRunner {
     }
 }
 
+/// Returns the schema version recorded in `connection`, refusing a database this
+/// build is too old for.
+///
+/// **This function performs no write.** It reads the ledger — or finds none —
+/// and compares the result with `supported`; nothing it does outlives the
+/// connection it was handed. That is the property the whole refusal depends on:
+/// it is called *before* the first statement that changes the database file, so a
+/// database from a newer BitArchive version is refused while still exactly as its
+/// own version left it (DATA_MODEL.md §18.3, Issue #34).
+///
+/// The version is returned rather than only compared, because both callers need
+/// it anyway: the open sequence refuses and moves on, and [`MigrationRunner::apply`]
+/// refuses and then decides which migrations are still missing.
+///
+/// A database with no ledger has no applied migration, which is
+/// [`SchemaVersion::NONE`] and not an error: that is what a fresh database looks
+/// like before the runner creates the ledger, and a database that does not exist
+/// cannot be too new.
+///
+/// # Errors
+///
+/// Returns [`DatabaseError::SchemaTooNew`] when the database is ahead of this
+/// build, and [`DatabaseError::QueryFailed`] when the ledger cannot be read.
+pub(crate) fn check_compatibility(
+    connection: &Connection,
+    supported: SchemaVersion,
+) -> Result<SchemaVersion, DatabaseError> {
+    let applied = applied_schema_version(connection)?;
+
+    if applied > supported {
+        return Err(DatabaseError::SchemaTooNew {
+            database: applied,
+            supported,
+        });
+    }
+
+    Ok(applied)
+}
+
 /// Returns the schema version recorded in `connection`'s ledger.
 ///
 /// A database with no ledger has no applied migration, which is version
 /// [`SchemaVersion::NONE`] and not an error: that is what a fresh database looks
 /// like before the runner creates the ledger.
+///
+/// This is the read behind [`check_compatibility`]; it deliberately does not
+/// compare, so the two concerns — what is recorded, and whether this build
+/// accepts it — stay separable.
 pub(crate) fn applied_schema_version(
     connection: &Connection,
 ) -> Result<SchemaVersion, DatabaseError> {

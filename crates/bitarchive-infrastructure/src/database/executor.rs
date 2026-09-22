@@ -46,7 +46,9 @@ use std::time::Duration;
 use rusqlite::{Connection, Transaction};
 
 use super::error::DatabaseError;
-use super::migration::{MigrationRunner, SchemaVersion, applied_schema_version};
+use super::migration::{
+    MigrationRunner, SchemaVersion, applied_schema_version, check_compatibility,
+};
 use super::migrations::BITARCHIVE_MIGRATIONS;
 
 /// The name of the SQLite database file below the database directory.
@@ -119,7 +121,7 @@ impl Database {
         directory: &Path,
         runner: MigrationRunner,
     ) -> Result<Self, DatabaseError> {
-        let database = Self::start(directory)?;
+        let database = Self::start(directory, runner)?;
 
         // The migration runs on the database thread, before the handle is handed
         // out, so no repository can observe a partially migrated database
@@ -130,15 +132,20 @@ impl Database {
         Ok(database)
     }
 
-    /// Starts the database thread on an opened and configured connection.
-    fn start(directory: &Path) -> Result<Self, DatabaseError> {
+    /// Starts the database thread on an opened, checked, and configured
+    /// connection.
+    ///
+    /// The runner goes with it because the thread needs the supported schema
+    /// version to decide whether the database may be used *before* the connection
+    /// changes anything (see [`open_connection`]).
+    fn start(directory: &Path, runner: MigrationRunner) -> Result<Self, DatabaseError> {
         let directory = directory.to_path_buf();
         let (ready, readiness) = mpsc::channel();
         let (requests, incoming) = mpsc::channel();
 
         let worker = thread::Builder::new()
             .name("bitarchive-database".to_owned())
-            .spawn(move || serve(&directory, &ready, &incoming))
+            .spawn(move || serve(&directory, runner, &ready, &incoming))
             .map_err(|cause| DatabaseError::OpenFailed {
                 cause: cause.to_string(),
             })?;
@@ -263,13 +270,18 @@ impl Drop for Database {
     }
 }
 
-/// Opens and configures the database, then serves requests on it.
+/// Opens, checks, and configures the database, then serves requests on it.
+///
+/// A failure here is reported before anything is served, so a caller either
+/// receives a database that is open, configured, and compatible, or an error and
+/// no handle at all.
 fn serve(
     directory: &Path,
+    runner: MigrationRunner,
     ready: &Sender<Result<(), DatabaseError>>,
     incoming: &Receiver<Request>,
 ) {
-    let mut connection = match open_connection(directory) {
+    let mut connection = match open_connection(directory, runner) {
         Ok(connection) => connection,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -292,9 +304,44 @@ fn serve(
     }
 }
 
-/// Creates the database directory, opens the file below it, and configures the
-/// connection.
-fn open_connection(directory: &Path) -> Result<Connection, DatabaseError> {
+/// Creates the database directory, opens the file below it, checks that this
+/// build may use it, and only then starts changing it.
+///
+/// # The order is the guarantee
+///
+/// These three steps are separate functions *because* they have to run in this
+/// order, and the order is what Issue #34's refusal requires:
+///
+/// ```text
+/// create the directory, open the file   ← creates an empty file if none exists
+///       ↓
+/// configure_connection                  ← per connection, nothing persists
+///       ↓
+/// check the schema version              ← read-only: refuse or continue
+///       ↓
+/// enable_wal                            ← the first change to the file itself
+/// ```
+///
+/// Opening a database that does not exist creates an empty file, and an empty
+/// database cannot be too new. Everything between that and [`enable_wal`] leaves
+/// the file alone: `foreign_keys` and the busy timeout are properties of *this
+/// connection*, held in memory and gone when it closes, and the compatibility
+/// check only reads. The journal mode is the exception — WAL is written into the
+/// database file and outlives the process — so it is the first thing that may
+/// change it, and it waits until the database is known to be one this build
+/// understands.
+///
+/// Doing this the other way round — configuring first and checking afterwards —
+/// would silently rewrite the journal mode of a database from a newer BitArchive
+/// version on the way to refusing it. Refusing to open something is not licence to
+/// modify it.
+///
+/// # One connection, not two
+///
+/// The check and the change run on the *same* connection, so there is no window
+/// between them for another writer to swap the database underneath. A separate
+/// short-lived preflight connection would open exactly that window for no gain.
+fn open_connection(directory: &Path, runner: MigrationRunner) -> Result<Connection, DatabaseError> {
     // The path accessors create nothing (ARCHITECTURE.md §35): the component that
     // is about to write makes the directory, and this is that component.
     std::fs::create_dir_all(directory).map_err(|cause| DatabaseError::OpenFailed {
@@ -307,39 +354,38 @@ fn open_connection(directory: &Path) -> Result<Connection, DatabaseError> {
         }
     })?;
 
-    configure(&connection)?;
+    configure_connection(&connection)?;
+
+    // Refuse before the first persistent change. A database this build does not
+    // understand is left exactly as it was found (DATA_MODEL.md §18.3).
+    check_compatibility(&connection, runner.supported_schema_version())?;
+
+    enable_wal(&connection)?;
 
     Ok(connection)
 }
 
-/// Applies the connection settings every connection needs.
+/// Applies the connection settings every connection needs that do not touch the
+/// database file.
 ///
 /// There is one place where a BitArchive connection is configured, and this is
 /// it: a second connection added later inherits these settings by being opened
 /// through `open_connection`, and cannot accidentally run without them
 /// (ARCHITECTURE.md §8.1).
 ///
+/// Both settings are per connection. `foreign_keys` is a connection flag that
+/// defaults to off and is never stored in the file; the busy timeout is a
+/// connection setting too. Neither survives the connection, which is why this may
+/// run before the compatibility check — see [`open_connection`].
+///
 /// Each setting is read back rather than assumed. A setting that silently did not
 /// take effect would be invisible until it caused a bug somewhere else — a
-/// connection without foreign keys accepts rows that violate the schema, and one
-/// without WAL behaves differently under concurrency — so the open fails here
-/// instead.
-fn configure(connection: &Connection) -> Result<(), DatabaseError> {
+/// connection without foreign keys accepts rows that violate the schema — so the
+/// open fails here instead.
+fn configure_connection(connection: &Connection) -> Result<(), DatabaseError> {
     let open_failure = |cause: rusqlite::Error| DatabaseError::OpenFailed {
         cause: cause.to_string(),
     };
-
-    // WAL is a persistent property of the database file, so this is written to
-    // the file the first time and confirmed on every later open. It is why the
-    // database can be read while a write is in progress, which the scan and
-    // scrape pipelines rely on (ARCHITECTURE.md §8.1).
-    let journal_mode: String = connection
-        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-        .map_err(open_failure)?;
-
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(DatabaseError::JournalModeNotWal { mode: journal_mode });
-    }
 
     // Foreign keys are enforced per connection and are off by default; without
     // this, the references the schema declares would not be checked at all.
@@ -358,6 +404,33 @@ fn configure(connection: &Connection) -> Result<(), DatabaseError> {
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(open_failure)?;
+
+    Ok(())
+}
+
+/// Puts the database file into WAL mode.
+///
+/// This is the first statement of an open that changes the database itself: WAL
+/// is a persistent property of the file, written to it the first time and
+/// confirmed on every later open. It is why the database can be read while a
+/// write is in progress, which the scan and scrape pipelines rely on
+/// (ARCHITECTURE.md §8.1).
+///
+/// It is only ever called once the database has been accepted as one this build
+/// understands, so a database from a newer version keeps the journal mode its own
+/// version chose.
+fn enable_wal(connection: &Connection) -> Result<(), DatabaseError> {
+    let open_failure = |cause: rusqlite::Error| DatabaseError::OpenFailed {
+        cause: cause.to_string(),
+    };
+
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .map_err(open_failure)?;
+
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(DatabaseError::JournalModeNotWal { mode: journal_mode });
+    }
 
     Ok(())
 }

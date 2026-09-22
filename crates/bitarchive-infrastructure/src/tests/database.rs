@@ -1,9 +1,13 @@
 //! The SQLite foundation, exercised against isolated temporary databases.
 //!
-//! Every test here works inside its own temporary directory. Nothing opens
-//! `AppPaths::database()` of the real user, so a test run cannot read, migrate, or
-//! remove a developer's library (ARCHITECTURE.md §45.2), and the tests stay
-//! parallel-safe because no two of them share a file.
+//! Every test here works inside its own [`TempDatabase`], a temporary directory
+//! that removes itself. Nothing opens `AppPaths::database()` of the real user, so
+//! a test run cannot read, migrate, or remove a developer's library
+//! (ARCHITECTURE.md §45.2), and the tests stay parallel-safe because no two of
+//! them share a file. The helper itself is general infrastructure and lives in
+//! [`crate::tests::support::database`], where any test module can reach it; what
+//! is specific to *these* tests — the fixture migrations and the assertions built
+//! on them — stays here.
 //!
 //! The migration runner is driven with **fixture migrations** that live in this
 //! file. They create small dummy tables so that ordering, idempotence, failure,
@@ -17,82 +21,14 @@
 //! rather than that some pragma was requested.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
+use super::support::database::TempDatabase;
 use crate::database::{
-    BITARCHIVE_MIGRATIONS, DATABASE_FILE_NAME, Database, DatabaseError, Migration, MigrationRunner,
+    BITARCHIVE_MIGRATIONS, DATABASE_FILE_NAME, DatabaseError, Migration, MigrationRunner,
     SchemaVersion,
 };
-
-/// A temporary directory that removes itself, and the database below it.
-///
-/// The directory name carries the process id and a counter, so two tests running
-/// at the same time never see each other's files, and a leftover from a killed run
-/// cannot be mistaken for this one's.
-struct TempDatabase {
-    root: PathBuf,
-}
-
-impl TempDatabase {
-    /// Reserves a temporary root that no database has been opened in yet.
-    ///
-    /// The directory is deliberately *not* created here. `AppPaths` creates
-    /// nothing either (ARCHITECTURE.md §35), and leaving the directory absent is
-    /// what lets a test show that opening the database is what creates it.
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-
-        let root = std::env::temp_dir().join(format!(
-            "bitarchive-database-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-
-        // A leftover with this name can only come from a run that was killed
-        // before its `Drop`; clearing it keeps a rerun from reading stale state.
-        let _ = fs::remove_dir_all(&root);
-
-        Self { root }
-    }
-
-    /// Returns the database directory, which is what `AppPaths::database()` is.
-    fn directory(&self) -> &Path {
-        &self.root
-    }
-
-    /// Returns the path of the database file inside the database directory.
-    fn file(&self) -> PathBuf {
-        self.root.join(DATABASE_FILE_NAME)
-    }
-
-    /// Opens the database with the shipped migration catalogue.
-    fn open(&self) -> Result<Database, DatabaseError> {
-        Database::open(self.directory())
-    }
-
-    /// Opens the database with a test's own migration catalogue.
-    fn open_with(&self, runner: MigrationRunner) -> Result<Database, DatabaseError> {
-        Database::open_with(self.directory(), runner)
-    }
-
-    /// Opens the file directly, without the foundation, to inspect what is stored.
-    ///
-    /// A refused or failed database cannot be queried through [`Database`], and
-    /// these tests have to look at what is actually on disk to prove that nothing
-    /// changed.
-    fn inspect(&self) -> Connection {
-        Connection::open(self.file()).expect("the database file must be readable")
-    }
-}
-
-impl Drop for TempDatabase {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
 /// The first fixture migration: one table, and one row so that a re-run of a
 /// later migration is observable.
@@ -437,6 +373,76 @@ fn a_refused_database_is_not_modified() {
         before.1.len(),
         2,
         "the ledger must still record exactly the two migrations that were applied"
+    );
+}
+
+/// Refusing a newer database leaves its journal mode — and everything else —
+/// exactly as it was.
+///
+/// This is the regression test for the order of an open. WAL is a property of the
+/// *file*, not of a connection, so a build that configures its connection before
+/// asking whether it may use the database rewrites the journal mode of a database
+/// from a newer BitArchive version on the way to rejecting it. Comparing
+/// `sqlite_master` and the ledger cannot see that, because the journal mode is
+/// stored in the database header.
+///
+/// The database here is left in `DELETE` mode on purpose, standing in for one
+/// whose own version chose a different journal mode. It must still be in `DELETE`
+/// mode after being refused.
+#[test]
+fn a_refused_database_keeps_its_journal_mode() {
+    let temporary = TempDatabase::new();
+
+    drop(
+        temporary
+            .open_with(runner(FIXTURES_WITHOUT_THE_BROKEN_ONE))
+            .expect("the fixture migrations must apply"),
+    );
+
+    let before = {
+        let connection = temporary.inspect();
+
+        // Switching out of WAL is itself persistent, and it can only be done while
+        // this is the only connection on the database — which is why the handle
+        // above was dropped first.
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+            .expect("the journal mode must be changeable");
+
+        assert_eq!(
+            mode.to_ascii_lowercase(),
+            "delete",
+            "the test must start from a journal mode that is not WAL, otherwise it \
+             could not tell a rewrite from a no-op"
+        );
+
+        (mode, schema_objects(&connection), ledger_rows(&connection))
+    };
+
+    // The same file, met by a build that only knows migration 1.
+    let error = temporary
+        .open_with(runner(FIXTURES_ONE_ONLY))
+        .expect_err("a database from a newer build must not open");
+
+    assert!(
+        matches!(error, DatabaseError::SchemaTooNew { .. }),
+        "expected the newer-schema refusal, got {error:?}"
+    );
+
+    let after = {
+        let connection = temporary.inspect();
+
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("the pragma must be queryable");
+
+        (mode, schema_objects(&connection), ledger_rows(&connection))
+    };
+
+    assert_eq!(
+        after, before,
+        "a refused database must be left exactly as it was found — its journal mode \
+         included, because that one is written to the file and outlives the process"
     );
 }
 
