@@ -1256,6 +1256,226 @@ else:
     ok("no passage bounds EntryList cardinality")
 
 # --------------------------------------------------------------------------- #
+# 16f. content_locations has exactly two deletion operations, and neither is an
+#      observation. §19.4 must not present the source removal as the only one.
+# --------------------------------------------------------------------------- #
+banner("14f. content_locations retention: two deletions, no observation (§19.4)")
+
+s194 = DATA[DATA.index('### 19.4 '):DATA.index('### 19.5 ')]
+
+# (a) the two explicit operations are named, each with its own scope. The needles
+#     are matched against the whitespace-normalised section, so hard-wrapping and
+#     the block-quote markers do not decide whether a rule is present.
+s194_flat = re.sub(r'>\s*', '', norm(s194))
+for needle, label in (
+        ("An ordinary missing or unreachable observation never deletes a "
+         "`content_locations` row.", "observation deletes nothing"),
+        ("A source removal is the one targeted deletion.",
+         "source removal named as a deletion"),
+        ("A library rebuild is the separate whole-index reset.",
+         "library rebuild named as the other deletion"),
+        ("It clears **all**", "the rebuild clears all rows, not one source's"),
+        ("specified by §19.3", "the rebuild clear points at §19.3"),
+        ("deleted in exactly those two explicit operations, and by no third one.",
+         "exactly two operations, no third")):
+    if needle not in s194_flat:
+        fail(f"§19.4 does not state that {label} (needle {needle!r} not found)")
+    else:
+        ok(f"§19.4: {label}")
+
+# (b) the round-6 defect: calling the source removal the only deletion that can ever
+#     affect content_locations, which contradicts §19.3's whole-index clear.
+ONLY_CLAIMS = [
+    r'only\s+(?:the\s+)?(?:one\s+)?deletion[^.\n]{0,80}content_locations',
+    r'only\s+deletion\s+that[^.\n]{0,80}content_locations',
+    r'the\s+only\s+[^.\n]{0,40}\bthat\s+touches?\s+`?content_locations',
+    r'content_locations[^.\n]{0,80}\bonly\s+deletion\b',
+    r'no\s+other\s+operation[^.\n]{0,80}\bdelet\w+[^.\n]{0,40}content_locations',
+    r'content_locations[^.\n]{0,60}\bnever\s+cleared\b',
+    r'\bnever\s+clears?\s+`?content_locations',
+]
+only_hits = [m.group(0) for p in ONLY_CLAIMS
+             for m in re.finditer(p, s194_flat, re.I)]
+if only_hits:
+    for h in only_hits:
+        fail(f"§19.4 claims the source removal (or a single operation) is the only "
+             f"deletion that affects content_locations — …{h[:120]}… — but §19.3 "
+             f"clears ALL content_locations in a library rebuild")
+else:
+    ok("§19.4 does not present one operation as the only content_locations deletion")
+
+# (c) an observation may never delete a row: missing, unreachable, offline and
+#     "not found" are states. Checked in §19.4 and in the retention summary.
+#
+#     Only the deletion verb itself may decide this: "the row is deleted and
+#     `last_seen_at` is not advanced" is a defect even though the sentence contains a
+#     "not", and "never deleted" is fine even though the verb is there. Each table
+#     row is judged on its own, so the maintenance-queue row of §19.7 cannot speak
+#     for the retention row next to it.
+STATE_WORDS = r'missing|unreachable|not found|offline|permission[- ]denied|' \
+              r'not seen|reappears|is gone|no longer present|absent'
+
+DELETION_VERB = re.compile(
+    r'\b(?:delet\w+|remov\w+|clears?|cleared|drops?|dropped)\b', re.I)
+# A negation counts only when it sits on the verb itself: immediately before it
+# ("never deletes", "does not delete the row") or immediately after the participle
+# with nothing but a pronoun in between ("is not deleted", "are never deleted").
+# A negation that merely shares the clause ("is deleted and `last_seen_at` is not
+# advanced") does not excuse the claim.
+NEGATION = r'(?:not|never|no|neither|nor|does\s*n[o\']?t|do\s*n[o\']?t|' \
+           r'without|cannot|can\s*not)'
+NEG_BEFORE = re.compile(NEGATION + r'[\s`*_)\]\w]{0,20}$', re.I)
+NEG_AFTER = re.compile(r'^(?:[\s`*_.,)\]]{0,4}' + NEGATION + r'\b|'
+                       r'[\s`*_.,)\]]{1,4}(?:it|them|the\s+rows?|the\s+row)\s+'
+                       + NEGATION + r'\b)', re.I)
+
+
+def negated_deletion(sentence, verb):
+    """True when negation sits on the deletion verb, not merely in the sentence."""
+    before = sentence[max(0, verb.start() - 40):verb.start()]
+    if NEG_BEFORE.search(before):
+        return True
+    return bool(NEG_AFTER.match(sentence[verb.end():]))
+
+
+def table_rows(section):
+    """The rows of every Markdown table in a section, as cell lists.
+
+    A row is one statement even though its state and its effect sit in different
+    cells — "A location is not seen … | … the row is deleted" claims that a missing
+    observation deletes a row. The rows are recovered from the raw lines, because
+    neighbouring rows must not be merged into one statement.
+    """
+    rows = []
+    for line in section.split('\n'):
+        line = line.strip()
+        if not line.startswith('|'):
+            continue
+        row = line.strip('|').strip()
+        if not row or set(row) <= set('-| '):
+            continue        # the `|---|---|` separator
+        rows.append([c.strip() for c in row.split('|')])
+    return rows
+
+
+def clauses(unit):
+    """Clauses of a statement: a state and a deletion must share one.
+
+    "`Missing` is a state, not a deletion. A source removal deletes that source's
+    `File` rows only" is two independent statements, and only the second one talks
+    about deleting. Semicolons, commas and coordinating conjunctions separate them —
+    but a table row is never split on its cell separator, because the state in one
+    cell and the effect in the next are one statement ("A location is not seen …
+    | … the row is deleted").
+    """
+    return [c.strip() for c in re.split(r'[;,]|\band\b|\bbut\b|\bso\b|\btherefore\b',
+                                        unit, flags=re.I) if c.strip()]
+
+
+# The actor of a deletion is named in the sentence that states it: "a source
+# removal deletes …", "a library rebuild clears …", "only the full reset removes …".
+# Without such an actor, a clause inside a statement about something missing or
+# unreachable may not delete anything.
+DELETE_ACTOR = re.compile(
+    r'source removal|library rebuild|full reset|per-user|garbage collect\w*|'
+    r'provider refresh|\bprun\w+|reset\b|maintenance|scaveng\w+|sweep\w*|'
+    r'reconciliation pass|discovery pass|\bcascade\w*', re.I)
+
+
+def deletion_clauses(cell_or_sentence):
+    """Clauses that contain a deletion verb, as (clause, verb) pairs.
+
+    A `deletion` as a noun is not a deletion verb: `Only after a successful file
+    deletion; Missing is a state` describes a state, not an operation.
+    """
+    out = []
+    for clause in clauses(cell_or_sentence):
+        for m in DELETION_VERB.finditer(clause):
+            if re.fullmatch(r'deletions?', m.group(0), re.I):
+                continue
+            out.append((clause, m))
+    return out
+
+
+def observation_deletion(parts):
+    """The deletion clauses of a statement whose actor is not named.
+
+    A statement may legitimately delete (`a source removal deletes the File rows`,
+    `a library rebuild clears the table`). What may not delete is an observation:
+    a statement that talks about something being missing, unreachable or offline and
+    names no actor for the deletion.
+    """
+    text = ' '.join(parts)
+    if DELETE_ACTOR.search(text):
+        return []
+    return [clause for clause, _verb in deletion_clauses(text)
+            if not any(negated_deletion(clause, v)
+                       for _c, v in deletion_clauses(clause))]
+
+
+def covered_by_negation(parts):
+    """True when the statement explicitly says a deletion does not happen."""
+    return any(negated_deletion(clause, verb)
+               for clause, verb in deletion_clauses(' '.join(parts)))
+
+
+deleting_states = []
+for section_name, body in (('§19.4', s194),
+                           ('§19.7', DATA[DATA.index('### 19.7 '):DATA.index('### 19.8 ')])):
+    # Tables: one statement per row, judged across its cells.
+    for cells in table_rows(body):
+        row_text = ' ; '.join(cells)
+        if not re.search(STATE_WORDS, row_text, re.I):
+            continue
+        bad = observation_deletion(cells)
+        if bad and not covered_by_negation(cells):
+            deleting_states.append((section_name, row_text.strip()))
+    # Prose: one statement per sentence.
+    for block in paragraphs(body):
+        if block.lstrip().startswith('|'):
+            continue        # handled as rows above
+        for sentence in re.split(r'(?<=[.!?])\s+', norm(block)):
+            if not re.search(STATE_WORDS, sentence, re.I):
+                continue
+            if observation_deletion([sentence]):
+                deleting_states.append((section_name, sentence.strip()))
+if deleting_states:
+    for name, s in sorted(set(deleting_states)):
+        fail(f"{name}: a missing/unreachable/offline observation is described as "
+             f"deleting a row — …{norm(s)[:150]}…")
+else:
+    ok("no section lets a missing/unreachable/offline observation delete a row")
+
+# (d) the three cases must be enumerated together somewhere, so no two of them can
+#     be merged silently again: §19.4's binding rule and §20.3 test 46.
+for needle, label in (
+        ("An ordinary missing or unreachable observation never deletes",
+         "§19.4 separates the observation case"),
+        ("A source removal is the one targeted deletion",
+         "§19.4 names the source removal"),
+        ("A library rebuild is the separate whole-index reset",
+         "§19.4 names the rebuild"),
+        ("`content_locations` has exactly two deletion operations, and neither is an\n"
+         "    observation",
+         "§20.3 test 46 asserts the three cases stay distinct")):
+    if needle not in DATA:
+        fail(f"the three content_locations cases are not enumerated together: {label}")
+    else:
+        ok(f"the three cases are enumerated: {label}")
+
+# (e) §19.7 must still say the same three things (and is not reformulated if it does).
+s197_flat = norm(DATA[DATA.index('### 19.7 '):DATA.index('### 19.8 ')])
+for needle, label in (
+        ("`Missing` is a state, not a deletion", "the state is not a deletion"),
+        ("deletes that source's `File` rows only", "source removal deletes File rows only"),
+        ("a library rebuild clears the table", "the rebuild clears the table")):
+    if needle not in s197_flat:
+        fail(f"§19.7 retention summary does not state that {label} "
+             f"(needle {needle!r} not found)")
+    else:
+        ok(f"§19.7: {label}")
+
+# --------------------------------------------------------------------------- #
 # 17. Markdown structure and traceability to ARCHITECTURE.md.
 # --------------------------------------------------------------------------- #
 banner("15. Markdown structure and ARCHITECTURE.md traceability")

@@ -4463,12 +4463,26 @@ their deletion state by state (§19.5).
 | An `ArchiveContainer` loses its last `File` location | Its `ArchiveEntry` location row is **kept** and becomes unreachable, never deleted: the container has no present copy, so the entry is "not found" like any other location, and the playable `ContentId` is untouched (§19.2) |
 | The file reappears | The next scan sets `state = 'Present'` and advances `last_seen_at`; because the identity was never dropped, all metadata and statistics are still attached |
 
-> **Rule (binding).** A missing content never deletes a game, a release, or a
-> content, and neither does a library rebuild. Only the **full reset** removes
-> those rows, and even it touches nothing outside BitArchive's own data area
-> (§19.3). "Unreachable" is an observation state, and it never removes an
-> `ArchiveEntry` location either: the only deletion that touches `content_locations`
-> at all removes the `File` rows of one removed source (§19.2).
+> **Rule (binding) — three cases, and they are not interchangeable.**
+>
+> 1. **An ordinary missing or unreachable observation never deletes a
+>    `content_locations` row.** A location that is not seen, a source that is
+>    offline, and an `ArchiveContainer` whose last `File` location is gone all
+>    change a **state**, never the row count: the row stays and is reported as
+>    `Missing`, unreachable or "not found", and the `ContentId` survives
+>    (§19.4 table above).
+> 2. **A source removal is the one targeted deletion.** It deletes only the `File`
+>    locations belonging to the explicitly removed source
+>    (`location_kind = 'File' AND source_id = X`) and **never** deletes an
+>    `ArchiveEntry` location (§19.2).
+> 3. **A library rebuild is the separate whole-index reset.** It clears **all**
+>    `content_locations` rows — not one source's `File` rows — and then re-scans, as
+>    specified by §19.3 (`PRODUCT.md` §40).
+>
+> So `content_locations` is deleted in exactly those two explicit operations, and by
+> no third one. A missing content never deletes a game, a release, or a content
+> either, and neither does a library rebuild: only the **full reset** removes those
+> rows, and even it touches nothing outside BitArchive's own data area (§19.3).
 
 ### 19.5 Deleting a Save State
 
@@ -4924,10 +4938,28 @@ Each rule below is stated as a test that MUST fail when the rule is broken:
     physical identity and the compatibility dimensions are not keys. There is no
     `state_name`, no sentinel, and no `UNIQUE` constraint over
     `(release, core, version, slot)`.
+46. **`content_locations` has exactly two deletion operations, and neither is an
+    observation** (§19.2, §19.3, §19.4). Test 43 asserts the source-removal case and
+    test 29 the rebuild table; this test asserts that the three cases stay distinct,
+    because merging any two of them is the defect that has to fail:
+
+    | Operation | Effect on `content_locations` |
+    |---|---|
+    | an ordinary missing or unreachable observation | **no row is deleted** — the row stays and its `state` changes (`Missing`, unreachable, "not found") |
+    | a source removal | deletes the `File` rows with `source_id = X` and **no** `ArchiveEntry` row |
+    | a library rebuild | clears **all** `content_locations` rows and re-scans |
+
+    Assert all three: a reconciliation pass that marks a location `Missing` leaves
+    the row count unchanged; the source removal of X deletes exactly its `File`
+    rows; and the rebuild's clear leaves the table empty while every
+    `GameId`/`ReleaseId`/`ContentId` and every `Payload` fingerprint survives. In
+    particular, **no** operation may delete an `ArchiveEntry` location except the
+    library rebuild's whole-index clear, and no passage may claim that source
+    removal is the only operation that deletes a location.
 
 #### Structural checks that run against this document
 
-Tests 1–45 above are assertions schema v1 and the repository ports must satisfy at
+Tests 1–46 above are assertions schema v1 and the repository ports must satisfy at
 run time. A subset of the *document's own* consistency is checkable statically, and
 it is checked by a script in the repository so that the review findings that
 motivated it — a foreign key naming a column its own table does not own, a
@@ -4954,6 +4986,8 @@ The script verifies, against `DATA_MODEL.md` alone:
 | **no section orders several `archive_entry_path` values, and no entry-path tie-break is described as a legitimate state** | the round-5 defect: §5.4 resolving an impossible ambiguity by "smallest `archive_entry_path`" instead of relying on the constraint |
 | **§19.2's binding source-removal rule deletes `File` locations only and forbids deleting an `ArchiveEntry` location** | the round-5 defect: the same section both deleting `content_locations` of the source and stating that a source removal MUST NOT delete a `content_locations` row |
 | **the `EntryList` fingerprint key still contains `entry_path`**, so an archive's fingerprint record is not reduced to one row | the round-5 near-miss: copying the location rule onto `content_fingerprints` and allowing only one `EntryList` per archive |
+| **§19.4 names exactly two deletion operations for `content_locations`** — the source removal of §19.2 and the whole-index clear of §19.3 — and states that no observation deletes a row | the round-6 defect: §19.4 calling the source removal "the only deletion that touches `content_locations` at all", which contradicts the library rebuild |
+| **no passage lets a missing, unreachable or offline observation delete a `content_locations` row** | the round-6 near-miss: turning "not found" into a deletion |
 | **`ARCHITECTURE.md` contains no `ArchiveEntryId`** and its `LaunchContent` matches this document | a source-of-truth contradiction surviving a change |
 | every key is declared as a `UNIQUE` tuple, not as free prose | a constraint that no `CREATE TABLE` could be derived from |
 | every PK/UNIQUE key column is a defined column | a unique constraint on a column nobody declared |
@@ -4973,8 +5007,8 @@ workflow as those checks** (`Rust quality` runs `python3 tools/check_data_model.
 as its own step, `.github/workflows/ci.yml`), so the document cannot drift on a
 branch whose CI is green.
 
-**The round-5 rules were verified to fail on their own mutations.** Each was applied
-to a scratch copy and reverted, never committed:
+**The round-5 and round-6 rules were verified to fail on their own mutations.** Each
+was applied to a scratch copy and reverted, never committed:
 
 | Mutation | Expected |
 |---|---|
@@ -4982,6 +5016,8 @@ to a scratch copy and reverted, never committed:
 | the entry-path component is put back into the `ArchiveEntry` key — in §5.2, in §20.1 alone, or in §3.8 alone | FAIL |
 | §5.4 lets one `(archive, content)` pair own several entry paths again and resolves them by ordering the paths | FAIL |
 | the `EntryList` key loses `entry_path`, so an archive could hold only one fingerprint | FAIL |
+| §19.4 calls the source removal the only deletion that can ever affect `content_locations`, excluding the library rebuild | FAIL |
+| §19.4 says a missing or unreachable observation may delete an `ArchiveEntry` row | FAIL |
 | unmutated document (positive control) | PASS |
 
 ### 20.4 Open points this document deliberately does not decide
